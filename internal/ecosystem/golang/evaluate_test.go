@@ -165,7 +165,6 @@ func TestEvaluate(t *testing.T) {
 				Binary: binRel, Module: module, Version: version, CVE: cve, GoID: goID,
 				Packages:     []string{"golang.org/x/net/http2"},
 				Granularity:  "package",
-				Stripped:     true,
 				Status:       StatusLinked,
 				Reachability: reachStripped,
 			},
@@ -238,6 +237,12 @@ func TestEvaluate(t *testing.T) {
 			}
 
 			got := evaluate(context.Background(), ec, cve, tt.adv)
+
+			// Every Go finding carries Stripped, so asserting it in each row
+			// would be noise; the interesting thing is that it tracks the
+			// binary, which is what the pointer makes possible to distinguish
+			// from an OS finding that omits the field entirely.
+			tt.want.Stripped = &tt.stripped
 
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("evaluate() mismatch\n got: %+v\nwant: %+v", got, tt.want)

@@ -109,9 +109,19 @@ func (p *Plugin) InventoryImage(ctx context.Context, img *target.Image, subjects
 	bins := binscan.FindGoBinaries(root)
 	p.Logf("Found %d Go binaries.", len(bins))
 
-	modules, err := p.wantedModules(subjects)
-	if err != nil {
-		return nil, err
+	modules, all := p.wantedModules(subjects)
+	if all {
+		// An image with no Go code in it has nothing to enumerate, so --all over
+		// a distro image passes through quietly. An image that does carry Go
+		// binaries is the opposite case: reporting nothing would present code
+		// this plugin never looked at as clean.
+		if len(bins) > 0 {
+			return nil, fmt.Errorf("golang: this image has %d Go binaries, and listing every module linked into them is not supported yet; name one with --package golang:PATH", len(bins))
+		}
+		return nil, nil
+	}
+	if len(modules) == 0 {
+		return nil, nil // nothing was aimed at this plugin
 	}
 	return p.group(root, bins, modules), nil
 }
@@ -158,18 +168,20 @@ func (p *Plugin) group(root string, bins []binscan.Binary, modules []string) []e
 	return out
 }
 
-// wantedModules resolves subjects to the module paths to look for.
+// wantedModules resolves subjects to the module paths to look for, and reports
+// separately whether one of them asked for everything.
 //
-// A subject with neither a name nor a purl means "everything", which this
-// plugin cannot yet answer for an image: enumerating every dependency of every
-// binary is a different and much larger scan. Rejecting it is deliberate —
-// returning an empty inventory instead would render as an image with no Go
-// dependencies at all.
-func (p *Plugin) wantedModules(subjects []ecosystem.Subject) ([]string, error) {
+// The two ways this comes back with no modules are different and have to stay
+// different. No subject aimed here at all -- `--package deb:openssl` -- means Go
+// was never asked, and the honest answer is an empty inventory. A subject that
+// *was* aimed here and names everything -- `--all` -- is a question this plugin
+// cannot answer: enumerating every dependency of every binary is a different and
+// much larger scan, and answering it with silence would render unexamined code
+// as clean. The caller decides which of those it is looking at.
+func (p *Plugin) wantedModules(subjects []ecosystem.Subject) (modules []string, all bool) {
 	seen := map[string]bool{}
-	var out []string
 	for _, s := range subjects {
-		if !ecosystem.MatchEcosystem(p, s.Ecosystem) && s.Ecosystem != "" {
+		if s.Ecosystem != "" && !ecosystem.MatchEcosystem(p, s.Ecosystem) {
 			continue
 		}
 		name := s.Name
@@ -177,18 +189,16 @@ func (p *Plugin) wantedModules(subjects []ecosystem.Subject) ([]string, error) {
 			name, _ = parsePURL(s.PURL)
 		}
 		if name == "" {
-			return nil, fmt.Errorf("golang: scanning every module in an image is not supported yet; name a module")
+			all = true
+			continue
 		}
 		name = NormalizeModule(name)
 		if !seen[name] {
 			seen[name] = true
-			out = append(out, name)
+			modules = append(modules, name)
 		}
 	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("golang: no module selected")
-	}
-	return out, nil
+	return modules, all
 }
 
 // AnalyzeImage implements ecosystem.ImageAnalyzer.
@@ -226,6 +236,7 @@ func (p *Plugin) AnalyzeImage(ctx context.Context, img *target.Image, items []ec
 				binaryRel: bin.rel,
 				module:    item.Component.Name,
 				version:   item.Component.Version,
+				purl:      item.Component.PURL,
 				stripped:  stripped,
 				syms:      syms,
 				govuln:    govuln,
@@ -254,9 +265,15 @@ func (p *Plugin) DetectSource(_ context.Context, src *target.Source) (bool, erro
 
 // AnalyzeSource implements ecosystem.SourceAnalyzer.
 func (p *Plugin) AnalyzeSource(ctx context.Context, src *target.Source, subjects []ecosystem.Subject, requested []string) ([]ecosystem.Finding, error) {
-	modules, err := p.wantedModules(subjects)
-	if err != nil {
-		return nil, err
+	modules, all := p.wantedModules(subjects)
+	if all {
+		// govulncheck source mode does enumerate -- it reports every vulnerable
+		// module in the graph -- but this plugin's finding shape is per-module,
+		// so the enumeration has nowhere to go yet.
+		return nil, fmt.Errorf("golang: scanning every module in a source tree is not supported yet; name one with --package golang:PATH")
+	}
+	if len(modules) == 0 {
+		return nil, nil
 	}
 
 	stmts, err := source.Scan(ctx, src, p.GoVersion, p.Logf)
@@ -316,6 +333,7 @@ func sourceFinding(module, moduleVersion string, moduleSeen bool, id string, st 
 	f := ecosystem.Finding{
 		Module:  module,
 		Version: moduleVersion,
+		PURL:    purl(module, moduleVersion),
 		CVE:     id,
 		Method:  "govulncheck-source",
 	}
@@ -336,6 +354,7 @@ func sourceFinding(module, moduleVersion string, moduleSeen bool, id string, st 
 	}
 	f.GoID = st.GoID
 	f.Version = st.Version
+	f.PURL = purl(module, f.Version)
 	switch {
 	case st.Status == "affected":
 		f.Status = ecosystem.StatusReachable

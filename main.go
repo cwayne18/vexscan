@@ -308,8 +308,10 @@ func statusLabel(s analyze.Status) string {
 	}
 }
 
-func strippedNote(stripped bool) string {
-	if stripped {
+// strippedNote annotates a binary that carries no symbol table. Nil means the
+// question does not apply: an OS package is not a Go binary.
+func strippedNote(stripped *bool) string {
+	if stripped != nil && *stripped {
 		return " (stripped)"
 	}
 	return ""

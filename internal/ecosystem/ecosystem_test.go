@@ -189,8 +189,16 @@ func TestFindingAffected(t *testing.T) {
 // statements, so a field that quietly changes name or disappears breaks
 // consumers downstream of this tool.
 func TestFindingJSONShape(t *testing.T) {
+	// A Go finding as the orchestrator publishes it: the v1 spellings are still
+	// there, with the ecosystem-neutral names carrying the same values.
 	t.Run("go finding", func(t *testing.T) {
+		notStripped := false
 		f := Finding{
+			Ecosystem:   "golang",
+			ID:          "CVE-2023-39325",
+			Package:     "golang.org/x/net",
+			Location:    "/usr/bin/app",
+			PURL:        "pkg:golang/golang.org%2Fx%2Fnet@v0.17.0",
 			Binary:      "/usr/bin/app",
 			Module:      "golang.org/x/net",
 			Version:     "v0.17.0",
@@ -198,6 +206,7 @@ func TestFindingJSONShape(t *testing.T) {
 			GoID:        "GO-2023-2102",
 			Packages:    []string{"golang.org/x/net/http2"},
 			Granularity: "package",
+			Stripped:    &notStripped,
 			Status:      StatusLinked,
 			LLM:         &llm.Verdict{Exploitable: "likely", Confidence: "high", Rationale: "why"},
 			// Reachability feeds the LLM prompt and must stay out of the
@@ -208,25 +217,31 @@ func TestFindingJSONShape(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := `{"binary":"/usr/bin/app","module":"golang.org/x/net","version":"v0.17.0","cve":"CVE-2023-39325","go_id":"GO-2023-2102","packages":["golang.org/x/net/http2"],"granularity":"package","stripped":false,"status":"linked","llm":{"exploitable":"likely","confidence":"high","rationale":"why"}}`
+		want := `{"ecosystem":"golang","id":"CVE-2023-39325","package":"golang.org/x/net","location":"/usr/bin/app","purl":"pkg:golang/golang.org%2Fx%2Fnet@v0.17.0","binary":"/usr/bin/app","module":"golang.org/x/net","version":"v0.17.0","cve":"CVE-2023-39325","go_id":"GO-2023-2102","packages":["golang.org/x/net/http2"],"granularity":"package","stripped":false,"status":"linked","llm":{"exploitable":"likely","confidence":"high","rationale":"why"}}`
 		if string(b) != want {
 			t.Errorf("\n got: %s\nwant: %s", b, want)
 		}
 	})
 
-	t.Run("minimal finding keeps stripped and omits the rest", func(t *testing.T) {
-		b, err := json.Marshal(Finding{Module: "m", Version: "v", CVE: "c", Status: StatusNotPresent})
+	// An OS finding omits stripped entirely rather than publishing false. The
+	// question does not apply to a shared library, and a hardcoded false reads
+	// as an answer.
+	t.Run("an os finding omits the go-only fields", func(t *testing.T) {
+		b, err := json.Marshal(Finding{
+			Ecosystem: "os", ID: "c", Package: "m",
+			Module: "m", Version: "v", CVE: "c", Status: StatusNotPresent,
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := `{"module":"m","version":"v","cve":"c","stripped":false,"status":"not_present"}`
+		want := `{"ecosystem":"os","id":"c","package":"m","module":"m","version":"v","cve":"c","status":"not_present"}`
 		if string(b) != want {
 			t.Errorf("\n got: %s\nwant: %s", b, want)
 		}
 	})
 
 	t.Run("evidence appears only when present", func(t *testing.T) {
-		f := Finding{Module: "m", Version: "v", CVE: "c", Status: StatusLinked, Evidence: []Evidence{
+		f := Finding{ID: "c", Package: "m", Module: "m", Version: "v", CVE: "c", Status: StatusLinked, Evidence: []Evidence{
 			{Origin: "elf-needed-closure", Detail: "reachable from /usr/bin/app"},
 			{Origin: "elf-needed-closure", Detail: "dlopen present", Blocking: true},
 		}}
@@ -234,7 +249,7 @@ func TestFindingJSONShape(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := `{"module":"m","version":"v","cve":"c","stripped":false,"status":"linked","evidence":[{"origin":"elf-needed-closure","detail":"reachable from /usr/bin/app"},{"origin":"elf-needed-closure","detail":"dlopen present","blocking":true}]}`
+		want := `{"id":"c","package":"m","module":"m","version":"v","cve":"c","status":"linked","evidence":[{"origin":"elf-needed-closure","detail":"reachable from /usr/bin/app"},{"origin":"elf-needed-closure","detail":"dlopen present","blocking":true}]}`
 		if string(b) != want {
 			t.Errorf("\n got: %s\nwant: %s", b, want)
 		}

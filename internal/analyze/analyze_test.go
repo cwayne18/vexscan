@@ -494,3 +494,39 @@ func TestRegistryCapabilities(t *testing.T) {
 		t.Errorf("source analyzers = %s, want golang", ids(source))
 	}
 }
+
+// The v1 field names and their ecosystem-neutral counterparts carry the same
+// values, and they do so because one is copied from the other rather than
+// because two plugins both remembered to fill them in.
+func TestStampMirrorsIdentityOntoTheNeutralNames(t *testing.T) {
+	got := stamp("golang", []Finding{{
+		Binary: "/usr/bin/app", Module: "golang.org/x/net", CVE: "CVE-2023-39325",
+	}})[0]
+
+	for _, c := range []struct{ name, got, want string }{
+		{"ecosystem", got.Ecosystem, "golang"},
+		{"id", got.ID, got.CVE},
+		{"package", got.Package, got.Module},
+		{"location", got.Location, got.Binary},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s = %q, want %q", c.name, c.got, c.want)
+		}
+	}
+}
+
+// An OS finding has no binary, and location must stay absent rather than
+// becoming an empty string a consumer has to special-case.
+func TestStampLeavesLocationUnsetWhenThereIsNoBinary(t *testing.T) {
+	got := stamp("os", []Finding{{Module: "openssl", CVE: "CVE-2024-5535"}})[0]
+	if got.Location != "" {
+		t.Errorf("location = %q, want empty", got.Location)
+	}
+	b, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), `"location"`) {
+		t.Errorf("location should be omitted, got %s", b)
+	}
+}

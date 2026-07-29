@@ -284,8 +284,14 @@ type Evidence struct {
 // Finding is the per-location, per-advisory result.
 //
 // The JSON shape is the tool's published output. Fields are added, never
-// renamed or removed, and the Go-specific ones stay for compatibility even
-// though other ecosystems leave them empty.
+// renamed or removed, so the Go-only spellings below stay even though every
+// other ecosystem leaves them empty.
+//
+// Identity is therefore written twice. ID/Package/Location are the
+// ecosystem-neutral names new consumers should read; CVE/Module/Binary are the
+// same values under the names gomod-vex published, kept so existing `jq`
+// pipelines keep working. The orchestrator copies one onto the other rather
+// than asking plugins to fill in both, so they cannot drift.
 type Finding struct {
 	// Ecosystem is the plugin that produced this finding ("golang", "os").
 	// Plugins do not set it -- the orchestrator stamps every finding with the
@@ -293,14 +299,33 @@ type Finding struct {
 	// claim to be another.
 	Ecosystem string `json:"ecosystem,omitempty"`
 
-	Binary        string       `json:"binary,omitempty"`
-	Module        string       `json:"module"`
-	Version       string       `json:"version"`
-	CVE           string       `json:"cve"`
-	GoID          string       `json:"go_id,omitempty"`
-	Packages      []string     `json:"packages,omitempty"`
-	Granularity   string       `json:"granularity,omitempty"` // package | module
-	Stripped      bool         `json:"stripped"`
+	// ID is the advisory, under the id the caller asked about. Same value as
+	// CVE.
+	ID string `json:"id"`
+	// Package is the component's name in its ecosystem's terms: a Go module
+	// path, an OS source package. Same value as Module.
+	Package string `json:"package"`
+	// Location is the path inside the target the finding is about, empty when
+	// the finding is about the whole target. Same value as Binary.
+	Location string `json:"location,omitempty"`
+	// PURL is the component's package URL, and the key a future vendor-VEX
+	// layer will match statements on. Plugins set this one; nothing else can.
+	PURL string `json:"purl,omitempty"`
+
+	Binary      string   `json:"binary,omitempty"`
+	Module      string   `json:"module"`
+	Version     string   `json:"version"`
+	CVE         string   `json:"cve"`
+	GoID        string   `json:"go_id,omitempty"`
+	Packages    []string `json:"packages,omitempty"`
+	Granularity string   `json:"granularity,omitempty"` // package | module
+
+	// Stripped is a pointer because it is a Go-only fact with three states: a
+	// binary with symbols, a binary without, and an OS package that is not a
+	// binary at all. A plain bool would report every deb in the image as
+	// unstripped.
+	Stripped *bool `json:"stripped,omitempty"`
+
 	Status        Status       `json:"status"`
 	Method        string       `json:"method,omitempty"`
 	Justification string       `json:"justification,omitempty"`

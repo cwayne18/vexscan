@@ -43,6 +43,7 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 	f := ecosystem.Finding{
 		Module:  c.Name,
 		Version: c.Version,
+		PURL:    c.PURL,
 		CVE:     req.ID,
 	}
 

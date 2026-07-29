@@ -14,6 +14,7 @@ type evalCtx struct {
 	binaryRel string
 	module    string
 	version   string
+	purl      string
 	stripped  bool
 	syms      *binscan.Symbols
 	// govuln returns the ids govulncheck binary mode marked not_affected. It is
@@ -28,12 +29,14 @@ type evalCtx struct {
 // orchestrator adds that overlay afterwards, using Reachability, so a run
 // without --llm and a run with it agree on every status.
 func evaluate(_ context.Context, ec evalCtx, id string, adv *osv.Advisory) ecosystem.Finding {
+	stripped := ec.stripped
 	f := ecosystem.Finding{
 		Binary:   ec.binaryRel,
 		Module:   ec.module,
 		Version:  ec.version,
+		PURL:     ec.purl,
 		CVE:      id,
-		Stripped: ec.stripped,
+		Stripped: &stripped,
 	}
 	if adv == nil {
 		f.Status = ecosystem.StatusUndetermined

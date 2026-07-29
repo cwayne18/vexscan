@@ -86,12 +86,20 @@ type Options struct {
 	Logf func(format string, args ...any)
 }
 
+// SchemaVersion is the version of the JSON Result shape.
+//
+// 1 was gomod-vex: Go only, one module per run. 2 adds the ecosystem-neutral
+// finding identity, the per-ecosystem outcome list, and OS package findings.
+// Every version-1 field is still present and still means what it meant.
+const SchemaVersion = 2
+
 // Result is the full analysis output.
 type Result struct {
-	Target   string    `json:"target"` // image ref or repo
-	Mode     string    `json:"mode"`   // "image" | "repo"
-	Module   string    `json:"module"`
-	Findings []Finding `json:"findings"`
+	SchemaVersion int       `json:"schema_version"`
+	Target        string    `json:"target"` // image ref or repo
+	Mode          string    `json:"mode"`   // "image" | "repo"
+	Module        string    `json:"module"`
+	Findings      []Finding `json:"findings"`
 
 	// Ecosystems records how each plugin fared. It exists so a failure is
 	// never indistinguishable from a clean result: a plugin that found a
@@ -191,7 +199,7 @@ func runImage(ctx context.Context, opts Options) (*Result, error) {
 	analyzers := ecosystem.ImageAnalyzers(registryFor(opts).All())
 	subjects := subjectsFor(opts)
 	resolver := newResolver()
-	result := &Result{Target: opts.Image, Mode: "image", Module: opts.Module}
+	result := &Result{SchemaVersion: SchemaVersion, Target: opts.Image, Mode: "image", Module: opts.Module}
 
 	// One ecosystem failing does not stop the others, but it is never silent:
 	// the failure is logged, recorded in the result, and -- when it leaves the
@@ -293,7 +301,7 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 
 	analyzers := ecosystem.SourceAnalyzers(registryFor(opts).All())
 	subjects := subjectsFor(opts)
-	result := &Result{Target: opts.Repo, Mode: "repo", Module: opts.Module}
+	result := &Result{SchemaVersion: SchemaVersion, Target: opts.Repo, Mode: "repo", Module: opts.Module}
 
 	applied := 0
 	for _, a := range analyzers {
@@ -476,15 +484,20 @@ func merge(sets []map[string]*osv.Advisory) map[string]*osv.Advisory {
 	return out
 }
 
-// stamp records which plugin produced each finding.
+// stamp records which plugin produced each finding, and mirrors the Go-only
+// identity fields onto their ecosystem-neutral names.
 //
-// The orchestrator does this rather than the plugins, so that the field is a
-// fact about what ran instead of a claim a plugin makes about itself. It is
-// what routes a finding to the right LLM prompt, and what lets a reader tell
-// the two halves of a mixed report apart.
+// The orchestrator does this rather than the plugins, so that Ecosystem is a
+// fact about what ran instead of a claim a plugin makes about itself, and so
+// that the two spellings of a finding's identity cannot drift: one plugin
+// forgetting to fill in Package would publish a finding about nothing.
 func stamp(id string, findings []Finding) []Finding {
 	for i := range findings {
-		findings[i].Ecosystem = id
+		f := &findings[i]
+		f.Ecosystem = id
+		f.ID = f.CVE
+		f.Package = f.Module
+		f.Location = f.Binary
 	}
 	return findings
 }

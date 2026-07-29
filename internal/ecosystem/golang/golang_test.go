@@ -49,9 +49,9 @@ func TestWantedModules(t *testing.T) {
 	p := New(Options{})
 
 	t.Run("by name", func(t *testing.T) {
-		got, err := p.wantedModules([]ecosystem.Subject{{Name: "golang.org/x/net"}})
-		if err != nil {
-			t.Fatal(err)
+		got, all := p.wantedModules([]ecosystem.Subject{{Name: "golang.org/x/net"}})
+		if all {
+			t.Error("a named subject does not ask for everything")
 		}
 		if want := []string{"golang.org/x/net"}; !reflect.DeepEqual(got, want) {
 			t.Errorf("got %v, want %v", got, want)
@@ -66,10 +66,7 @@ func TestWantedModules(t *testing.T) {
 	})
 
 	t.Run("by purl", func(t *testing.T) {
-		got, err := p.wantedModules([]ecosystem.Subject{{PURL: "pkg:golang/golang.org%2Fx%2Fnet@v0.17.0"}})
-		if err != nil {
-			t.Fatal(err)
-		}
+		got, _ := p.wantedModules([]ecosystem.Subject{{PURL: "pkg:golang/golang.org%2Fx%2Fnet@v0.17.0"}})
 		if want := []string{"golang.org/x/net"}; !reflect.DeepEqual(got, want) {
 			t.Errorf("got %v, want %v", got, want)
 		}
@@ -83,32 +80,53 @@ func TestWantedModules(t *testing.T) {
 	})
 
 	t.Run("subjects for another ecosystem are ignored", func(t *testing.T) {
-		got, err := p.wantedModules([]ecosystem.Subject{
+		got, all := p.wantedModules([]ecosystem.Subject{
 			{Ecosystem: "os", Name: "openssl"},
 			{Ecosystem: "golang", Name: "golang.org/x/net"},
 		})
-		if err != nil {
-			t.Fatal(err)
+		if all {
+			t.Error("a subject aimed at another plugin does not ask this one for everything")
 		}
 		if want := []string{"golang.org/x/net"}; !reflect.DeepEqual(got, want) {
 			t.Errorf("got %v, want %v", got, want)
 		}
 	})
 
-	// Enumerating every dependency of every binary is a different, much larger
-	// scan. Refusing is deliberate: returning an empty inventory would render
-	// as an image with no Go dependencies at all.
-	t.Run("scan-everything is refused, not silently empty", func(t *testing.T) {
-		if _, err := p.wantedModules([]ecosystem.Subject{{}}); err == nil {
-			t.Error("expected an error for a subject that matches everything")
+	// The two empty results have to stay distinguishable: "asked for
+	// everything" is a question this plugin cannot answer, while "never asked"
+	// is an honest empty inventory.
+	t.Run("scan-everything reports itself", func(t *testing.T) {
+		got, all := p.wantedModules([]ecosystem.Subject{{}})
+		if !all {
+			t.Error("a subject with no name asks for everything")
+		}
+		if len(got) != 0 {
+			t.Errorf("got %v, want no named modules", got)
 		}
 	})
 
-	t.Run("no subject at all is an error", func(t *testing.T) {
-		if _, err := p.wantedModules(nil); err == nil {
-			t.Error("expected an error when nothing was selected")
+	t.Run("no subject at all selects nothing", func(t *testing.T) {
+		got, all := p.wantedModules(nil)
+		if all || len(got) != 0 {
+			t.Errorf("got %v, all=%v; want nothing selected", got, all)
 		}
 	})
+}
+
+// Refusing to enumerate is deliberate: an empty inventory would render as an
+// image with no Go dependencies at all. But an image with no Go code in it has
+// nothing to enumerate, so --all over a distro image has to pass quietly.
+func TestScanEverythingIsRefusedOnlyWhenThereIsGoCode(t *testing.T) {
+	p := New(Options{Logf: func(string, ...any) {}})
+	img := &target.Image{FS: target.NewDirFS(t.TempDir())}
+
+	got, err := p.InventoryImage(context.Background(), img, []ecosystem.Subject{{}})
+	if err != nil {
+		t.Fatalf("--all over an image with no Go binaries should pass quietly: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %v, want an empty inventory", got)
+	}
 }
 
 // fakeBinary builds a binscan.Binary with synthesized build info, so the
