@@ -1,4 +1,4 @@
-// Package gist uploads a gomod-vex report to a GitHub gist so results can be
+// Package gist uploads a vexscan report to a GitHub gist so results can be
 // shared with a single URL. It uses the same GITHUB_TOKEN / GH_TOKEN that the
 // --llm path relies on, so it works inside the container image without the gh
 // CLI.
@@ -64,7 +64,7 @@ type createResponse struct {
 // returns its html_url.
 func (c *Client) Create(ctx context.Context, filename, description, content string, public bool) (string, error) {
 	if strings.TrimSpace(filename) == "" {
-		filename = "gomod-vex-report.txt"
+		filename = "vexscan-report.txt"
 	}
 	// The GitHub API rejects files whose content is empty.
 	if content == "" {

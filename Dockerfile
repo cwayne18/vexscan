@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-# gomod-vex supports two modes with different runtime needs:
+# vexscan supports two modes with different runtime needs:
 #   * image mode -> skopeo + a prebuilt govulncheck (binary scanning, no source)
 #   * repo mode  -> git + a Go toolchain; govulncheck is built and run on demand
 #     via `go run` from inside the target module so it always matches the Go
@@ -16,12 +16,12 @@ ARG TARGETARCH
 ENV CGO_ENABLED=0
 WORKDIR /src
 
-# Cache modules first (gomod-vex has no external deps, so this is just go.mod).
+# Cache modules first (vexscan has no external deps, so this is just go.mod).
 COPY go.mod ./
 RUN go mod download
 
 COPY . .
-RUN GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/gomod-vex .
+RUN GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/vexscan .
 
 # Prebuilt govulncheck for image (binary) mode. Repo mode does not use this; it
 # builds govulncheck on demand with the toolchain the target module requires.
@@ -36,11 +36,11 @@ FROM golang:${GO_VERSION}-bookworm
 RUN apt-get update \
     && apt-get install -y --no-install-recommends skopeo git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=build /out/gomod-vex /usr/local/bin/gomod-vex
+COPY --from=build /out/vexscan /usr/local/bin/vexscan
 COPY --from=build /out/govulncheck /usr/local/bin/govulncheck
 
-LABEL org.opencontainers.image.source="https://github.com/cwayne18/gomod-vex" \
+LABEL org.opencontainers.image.source="https://github.com/cwayne18/vexscan" \
       org.opencontainers.image.description="Check whether Go-module CVEs are actually present/exploitable in a container image or source repo" \
       org.opencontainers.image.licenses="MIT"
 
-ENTRYPOINT ["gomod-vex"]
+ENTRYPOINT ["vexscan"]

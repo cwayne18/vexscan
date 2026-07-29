@@ -1,6 +1,6 @@
-# gomod-vex
+# vexscan
 
-`gomod-vex` checks whether a given CVE in a Go module is **actually present and
+`vexscan` checks whether a given CVE in a Go module is **actually present and
 reachable**, rather than merely being listed as a dependency. Point it at either:
 
 - a **container image** (`--image`) — inspects the shipped Go binaries, or
@@ -14,7 +14,7 @@ parsing a Trivy scan report, you point it directly at a target, a module, and
 
 Package/CVE scanners flag a module as vulnerable whenever the *module* is a
 dependency, even if the linker dead-code-eliminated the vulnerable *package* or
-the vulnerable functions are never reachable. `gomod-vex` distinguishes those
+the vulnerable functions are never reachable. `vexscan` distinguishes those
 cases so you can produce accurate [VEX](https://www.cisa.gov/resources-tools/resources/minimum-requirements-vulnerability-exploitability-exchange-vex)
 statements.
 
@@ -22,7 +22,7 @@ statements.
 
 ### Image mode (`--image`)
 
-For every Go binary in the image that links the target module, `gomod-vex`:
+For every Go binary in the image that links the target module, `vexscan`:
 
 1. **Resolves the vulnerable packages** from the [OSV](https://osv.dev) Go
    database, keyed by module + the version embedded in the binary's build info.
@@ -61,11 +61,11 @@ Go standard-library CVEs are supported in both modes — pass `--module stdlib`
 # Image mode: the Go version comes from each binary's build info, and pclntab
 # tells you which vulnerable stdlib packages (net/http, crypto/x509, ...) are
 # actually linked into each binary.
-gomod-vex --image myorg/app:latest --module stdlib --cves CVE-2025-22870
+vexscan --image myorg/app:latest --module stdlib --cves CVE-2025-22870
 
 # Repo mode: govulncheck reports stdlib reachability. Results depend on the Go
 # toolchain used, so pin it with --go-version to target a specific release.
-gomod-vex --repo github.com/rancher/rancher --module stdlib --go-version 1.24.0
+vexscan --repo github.com/rancher/rancher --module stdlib --go-version 1.24.0
 ```
 
 In repo mode the stdlib version analyzed is the one of the Go toolchain that
@@ -73,7 +73,7 @@ runs govulncheck. `GOTOOLCHAIN=auto` only ever *upgrades*, so without
 `--go-version` a repo is scanned with the newest locally-available toolchain
 (inside the container image, the base Go version). Pin `--go-version` to assess
 a particular release. Note that a pinned older toolchain may be too old to build
-the latest `govulncheck`; pair it with `GOMODVEX_GOVULNCHECK_VERSION` (e.g.
+the latest `govulncheck`; pair it with `VEXSCAN_GOVULNCHECK_VERSION` (e.g.
 `v1.1.4`) if `go run` reports a version requirement.
 
 ### LLM exploitability check (optional, `--llm`)
@@ -84,18 +84,31 @@ gives an advisory `likely` / `unlikely` / `unknown` exploitability verdict.
 
 GitHub Models enforces a low per-minute burst limit, so a scan that assesses
 many CVEs can hit `429 Too Many Requests` (sometimes phrased as a Terms of
-Service / "scraping" notice — that is GitHub's secondary rate limit). `gomod-vex`
+Service / "scraping" notice — that is GitHub's secondary rate limit). `vexscan`
 mitigates this by:
 
 - **caching verdicts** per CVE — in image mode the same CVE linked into many
   binaries is assessed once and reused;
 - **spacing out requests** (default 1s between calls); tune or disable this with
-  `GOMODVEX_LLM_MIN_INTERVAL` (a Go duration, e.g. `2s`, or `0` to disable);
+  `VEXSCAN_LLM_MIN_INTERVAL` (a Go duration, e.g. `2s`, or `0` to disable);
 - **retrying** `429`/`5xx` with backoff, honoring the server's `Retry-After`
   (up to two minutes) so a rate-limit window is actually outlasted.
 
 A failed assessment is non-fatal: the finding is still reported (e.g. `LINKED`),
 just without an LLM verdict.
+
+### Environment variables
+
+`vexscan` was previously released as `gomod-vex`. Its own variables are now
+prefixed `VEXSCAN_`, and the corresponding `GOMODVEX_` names are still honored
+as a fallback so existing CI configuration keeps working:
+
+| Variable | Legacy name | Purpose |
+|---|---|---|
+| `VEXSCAN_LLM_MIN_INTERVAL` | `GOMODVEX_LLM_MIN_INTERVAL` | Minimum spacing between `--llm` API calls (Go duration; `0` disables) |
+| `VEXSCAN_GOVULNCHECK_VERSION` | `GOMODVEX_GOVULNCHECK_VERSION` | Pin the govulncheck module version used by `--repo` |
+
+`GITHUB_TOKEN` / `GH_TOKEN` are unchanged.
 
 ## Requirements
 
@@ -116,26 +129,26 @@ just without an LLM verdict.
 ## Install
 
 ```sh
-go install github.com/cwayne18/gomod-vex@latest
+go install github.com/cwayne18/vexscan@latest
 ```
 
 Or build from source:
 
 ```sh
-git clone https://github.com/cwayne18/gomod-vex
-cd gomod-vex
-go build -o gomod-vex .
+git clone https://github.com/cwayne18/vexscan
+cd vexscan
+go build -o vexscan .
 ```
 
 ### Container image (GHCR)
 
 A self-contained image bundling `skopeo`, `git`, `govulncheck` and a Go
 toolchain (so both image and repo modes work) is published to
-[`ghcr.io/cwayne18/gomod-vex`](https://github.com/cwayne18/gomod-vex/pkgs/container/gomod-vex)
+[`ghcr.io/cwayne18/vexscan`](https://github.com/cwayne18/vexscan/pkgs/container/vexscan)
 on every push to `main` and every `v*` tag:
 
 ```sh
-docker run --rm ghcr.io/cwayne18/gomod-vex:latest \
+docker run --rm ghcr.io/cwayne18/vexscan:latest \
   --image rancher/hardened-coredns:v1.14.6 \
   --module golang.org/x/net --cves CVE-2023-39325
 ```
@@ -143,21 +156,21 @@ docker run --rm ghcr.io/cwayne18/gomod-vex:latest \
 Pass a token through the environment to enable `--llm`:
 
 ```sh
-docker run --rm -e GITHUB_TOKEN ghcr.io/cwayne18/gomod-vex:latest \
+docker run --rm -e GITHUB_TOKEN ghcr.io/cwayne18/vexscan:latest \
   --image myorg/myapp:latest --module golang.org/x/crypto --llm
 ```
 
 ## Usage
 
 ```sh
-gomod-vex --image REF  --module PATH [--cves LIST] [flags]   # image mode
-gomod-vex --repo  REPO --module PATH [--cves LIST] [flags]   # repo mode
+vexscan --image REF  --module PATH [--cves LIST] [flags]   # image mode
+vexscan --repo  REPO --module PATH [--cves LIST] [flags]   # repo mode
 ```
 
 Check two specific `x/net` CVEs in an image:
 
 ```sh
-gomod-vex \
+vexscan \
   --image rancher/hardened-kubernetes:v1.30.1-rke2r1 \
   --module golang.org/x/net \
   --cves CVE-2023-39325,CVE-2023-44487
@@ -166,7 +179,7 @@ gomod-vex \
 Check a CVE against a source repo via reachability analysis:
 
 ```sh
-gomod-vex \
+vexscan \
   --repo github.com/rancher/rancher \
   --module golang.org/x/net \
   --cves CVE-2023-45288
@@ -181,7 +194,7 @@ Check every advisory known for `x/crypto`, as JSON, with the LLM layer:
 
 ```sh
 export GITHUB_TOKEN=...    # a token with models:read
-gomod-vex \
+vexscan \
   --image myorg/myapp:latest \
   --module golang.org/x/crypto \
   --llm --format json
@@ -241,7 +254,7 @@ granularity instead; these are coarser, so validate before transferring.
   `govulncheck` via `go run` from inside the target module with
   `GOTOOLCHAIN=auto`, so Go automatically fetches a newer toolchain when the
   scanned module requires one. Override the govulncheck version with
-  `GOMODVEX_GOVULNCHECK_VERSION` if needed.
+  `VEXSCAN_GOVULNCHECK_VERSION` if needed.
 
 ## License
 

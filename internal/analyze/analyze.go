@@ -1,4 +1,4 @@
-// Package analyze orchestrates the gomod-vex pipeline: extract an image, find
+// Package analyze orchestrates the vexscan pipeline: extract an image, find
 // its Go binaries, resolve vulnerable packages from OSV, and decide for each
 // requested CVE whether the vulnerable code is present / reachable, optionally
 // consulting an LLM for the genuinely-linked survivors.
@@ -11,11 +11,11 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/cwayne18/gomod-vex/internal/binscan"
-	"github.com/cwayne18/gomod-vex/internal/image"
-	"github.com/cwayne18/gomod-vex/internal/llm"
-	"github.com/cwayne18/gomod-vex/internal/osv"
-	"github.com/cwayne18/gomod-vex/internal/source"
+	"github.com/cwayne18/vexscan/internal/binscan"
+	"github.com/cwayne18/vexscan/internal/image"
+	"github.com/cwayne18/vexscan/internal/llm"
+	"github.com/cwayne18/vexscan/internal/osv"
+	"github.com/cwayne18/vexscan/internal/source"
 )
 
 // Status classifies a (binary/repo, CVE) pair.
@@ -114,7 +114,7 @@ func runImage(ctx context.Context, opts Options) (*Result, error) {
 		opts.Arch = "amd64"
 	}
 
-	dest, err := os.MkdirTemp("", "gomod-vex-fs-")
+	dest, err := os.MkdirTemp("", "vexscan-fs-")
 	if err != nil {
 		return nil, err
 	}

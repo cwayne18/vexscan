@@ -1,3 +1,3 @@
-module github.com/cwayne18/gomod-vex
+module github.com/cwayne18/vexscan
 
 go 1.23

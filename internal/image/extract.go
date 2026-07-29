@@ -45,7 +45,7 @@ func (e *Extractor) Extract(ctx context.Context, image, dest string) error {
 		return fmt.Errorf("skopeo not found on PATH: %w", err)
 	}
 
-	raw, err := os.MkdirTemp("", "gomod-vex-oci-")
+	raw, err := os.MkdirTemp("", "vexscan-oci-")
 	if err != nil {
 		return err
 	}

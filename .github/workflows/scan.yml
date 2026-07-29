@@ -114,8 +114,8 @@ jobs:
           sudo swapon /swapfile
           free -h
 
-      - name: Build gomod-vex
-        run: go build -o gomod-vex .
+      - name: Build vexscan
+        run: go build -o vexscan .
 
       - name: Prepare source (pre-build)
         # Some repos don't compile from a clean checkout because they generate
@@ -166,5 +166,5 @@ jobs:
           if [ "$LLM" = "true" ]; then
             args+=(--llm)
           fi
-          echo "Running: gomod-vex ${args[*]}"
-          ./gomod-vex "${args[@]}"
+          echo "Running: vexscan ${args[*]}"
+          ./vexscan "${args[@]}"

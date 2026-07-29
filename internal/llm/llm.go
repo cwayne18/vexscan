@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/cwayne18/vexscan/internal/envx"
 )
 
 // DefaultEndpoint is the GitHub Models OpenAI-compatible inference endpoint.
@@ -29,7 +31,7 @@ const DefaultModel = "openai/gpt-4o"
 // DefaultMinInterval is the default minimum spacing between API requests. GitHub
 // Models applies a low per-minute burst limit; spacing requests out keeps a
 // multi-binary scan from tripping the secondary (abuse) rate limit. Override
-// with GOMODVEX_LLM_MIN_INTERVAL (a Go duration such as "2s" or "0" to disable).
+// with VEXSCAN_LLM_MIN_INTERVAL (a Go duration such as "2s" or "0" to disable).
 const DefaultMinInterval = time.Second
 
 // maxRetryWait caps how long a single backoff wait can be, including a
@@ -97,9 +99,9 @@ func NewClient(model, token string) (*Client, error) {
 }
 
 // minIntervalFromEnv resolves the request spacing, honoring an optional
-// GOMODVEX_LLM_MIN_INTERVAL override.
+// VEXSCAN_LLM_MIN_INTERVAL override.
 func minIntervalFromEnv() time.Duration {
-	v := strings.TrimSpace(os.Getenv("GOMODVEX_LLM_MIN_INTERVAL"))
+	v := envx.Get("LLM_MIN_INTERVAL")
 	if v == "" {
 		return DefaultMinInterval
 	}

@@ -17,6 +17,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/cwayne18/vexscan/internal/envx"
 )
 
 // Statement is one parsed govulncheck OpenVEX statement.
@@ -52,7 +54,7 @@ func CloneAndScan(ctx context.Context, repoArg, ref, subPath, goVersion string, 
 		return govulncheckSource(ctx, workdir, goVersion)
 	}
 
-	dir, err := os.MkdirTemp("", "gomod-vex-src-")
+	dir, err := os.MkdirTemp("", "vexscan-src-")
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +187,7 @@ type product struct {
 }
 
 // defaultGovulncheckVersion is the module version of govulncheck built and run
-// via `go run`. Override with GOMODVEX_GOVULNCHECK_VERSION.
+// via `go run`. Override with VEXSCAN_GOVULNCHECK_VERSION.
 const defaultGovulncheckVersion = "latest"
 
 func govulncheckSource(ctx context.Context, workdir, goVersion string) ([]Statement, error) {
@@ -196,14 +198,14 @@ func govulncheckSource(ctx context.Context, workdir, goVersion string) ([]Statem
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
 
-	version := os.Getenv("GOMODVEX_GOVULNCHECK_VERSION")
+	version := envx.Get("GOVULNCHECK_VERSION")
 	if version == "" {
 		version = defaultGovulncheckVersion
 	}
 
 	// Build and run govulncheck through `go run` from inside the target module
 	// rather than invoking a fixed govulncheck binary. This makes source mode
-	// robust to modules that require a newer Go than the one gomod-vex ships
+	// robust to modules that require a newer Go than the one vexscan ships
 	// with, and avoids two related failure modes:
 	//   * a prebuilt govulncheck rejecting a module whose go.mod needs a newer
 	//     Go ("go.mod requires go >= 1.26.0 (running go 1.25 ...)"), and

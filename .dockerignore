@@ -1,7 +1,7 @@
 .git
 .github
 dist
-gomod-vex
+vexscan
 *.out
 *.log
 README.md

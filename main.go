@@ -1,4 +1,4 @@
-// Command gomod-vex checks whether specific CVEs in a Go module are actually
+// Command vexscan checks whether specific CVEs in a Go module are actually
 // present in the binaries shipped inside a container image, using pclntab
 // presence tests and govulncheck, with an optional LLM exploitability check.
 package main
@@ -13,8 +13,8 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/cwayne18/gomod-vex/internal/analyze"
-	"github.com/cwayne18/gomod-vex/internal/gist"
+	"github.com/cwayne18/vexscan/internal/analyze"
+	"github.com/cwayne18/vexscan/internal/gist"
 )
 
 func main() {
@@ -126,11 +126,11 @@ func uploadGist(ctx context.Context, res *analyze.Result, rendered, format strin
 	if err != nil {
 		return "", err
 	}
-	filename := "gomod-vex-report.txt"
+	filename := "vexscan-report.txt"
 	if format == "json" {
-		filename = "gomod-vex-report.json"
+		filename = "vexscan-report.json"
 	}
-	desc := fmt.Sprintf("gomod-vex %s report for %s (module %s)", res.Mode, res.Target, res.Module)
+	desc := fmt.Sprintf("vexscan %s report for %s (module %s)", res.Mode, res.Target, res.Module)
 	return client.Create(ctx, filename, desc, rendered, public)
 }
 
@@ -166,7 +166,7 @@ func parseCVEs(flagVal, file string) []string {
 
 func renderText(res *analyze.Result) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "gomod-vex report (%s) for %s\n", res.Mode, res.Target)
+	fmt.Fprintf(&b, "vexscan report (%s) for %s\n", res.Mode, res.Target)
 	fmt.Fprintf(&b, "module: %s\n\n", res.Module)
 
 	if len(res.Findings) == 0 {
@@ -240,27 +240,27 @@ func strippedNote(stripped bool) string {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `gomod-vex - check whether Go-module CVEs are actually present in an image or source repo
+	fmt.Fprint(os.Stderr, `vexscan - check whether Go-module CVEs are actually present in an image or source repo
 
 Usage:
-  gomod-vex --image REF   --module PATH [--cves LIST] [flags]
-  gomod-vex --repo  REPO  --module PATH [--cves LIST] [flags]
+  vexscan --image REF   --module PATH [--cves LIST] [flags]
+  vexscan --repo  REPO  --module PATH [--cves LIST] [flags]
 
 Examples:
   # Container image (pclntab + govulncheck binary mode)
-  gomod-vex --image rancher/hardened-kubernetes:v1.30.1 --module golang.org/x/net \
+  vexscan --image rancher/hardened-kubernetes:v1.30.1 --module golang.org/x/net \
     --cves CVE-2023-39325,CVE-2023-44487
 
   # Source repo (govulncheck source-mode reachability)
-  gomod-vex --repo github.com/rancher/rancher --module golang.org/x/net \
+  vexscan --repo github.com/rancher/rancher --module golang.org/x/net \
     --cves CVE-2023-39325
 
   # Standard library CVEs (module "stdlib")
-  gomod-vex --image myorg/app:latest --module stdlib --cves CVE-2025-22870
-  gomod-vex --repo github.com/rancher/rancher --module stdlib --go-version 1.24.0
+  vexscan --image myorg/app:latest --module stdlib --cves CVE-2025-22870
+  vexscan --repo github.com/rancher/rancher --module stdlib --go-version 1.24.0
 
   # Share the report as a public gist (needs GITHUB_TOKEN/GH_TOKEN with gist scope)
-  gomod-vex --image rancher/hardened-kubernetes:v1.30.1 --module golang.org/x/net \
+  vexscan --image rancher/hardened-kubernetes:v1.30.1 --module golang.org/x/net \
     --cves CVE-2023-39325 --gist
 
 Flags:
