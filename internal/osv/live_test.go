@@ -3,6 +3,7 @@ package osv
 import (
 	"context"
 	"os"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -49,10 +50,9 @@ func TestLiveEcosystemStrings(t *testing.T) {
 		{"ID=alpaquita\nVERSION_ID=23\n", "Alpaquita:23", "openssl"},
 		{"ID=openEuler\nVERSION_ID=\"24.03\"\nVERSION=\"24.03 (LTS)\"\n", "openEuler:24.03-LTS", "glibc"},
 		// SUSE spells openssl "openssl-1_1" / "openssl-3"; glibc is stable
-		// across their product line. SLE itself is deliberately absent: its
-		// ecosystem carries a support-phase suffix os-release does not record,
-		// so Ecosystem refuses it. See TestSLEIsAmbiguousNotUnknown.
+		// across their product line.
 		{"ID=opensuse-leap\nVERSION_ID=\"15.6\"\nPRETTY_NAME=\"openSUSE Leap 15.6\"\n", "openSUSE:Leap 15.6", "glibc"},
+		{"ID=sles\nVERSION_ID=\"15.7\"\nPRETTY_NAME=\"SUSE Linux Enterprise Server 15 SP7\"\n", "SUSE", "glibc"},
 	}
 
 	client := NewClient()
@@ -99,5 +99,63 @@ func TestLiveInvalidEcosystemIsRejected(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "invalid ecosystem") {
 		t.Errorf("unexpected error for a misspelled ecosystem: %v", err)
+	}
+}
+
+// TestLiveSLESProductNarrowing is the regression test for the SLES 15 SP7 gzip
+// case: the bare family has to find the advisory, and the release filter has
+// to drop the other products' records without dropping that one.
+//
+// Both halves are load-bearing and they fail in opposite directions. Without
+// the bare family nothing is found at all; without the filter a fully patched
+// image reports as vulnerable forever, because SLE 16 fixes gzip at a version
+// SLE 15 will never ship.
+func TestLiveSLESProductNarrowing(t *testing.T) {
+	if os.Getenv("VEXSCAN_LIVE_OSV") == "" {
+		t.Skip("set VEXSCAN_LIVE_OSV=1 to query api.osv.dev")
+	}
+
+	rel, err := ParseOSRelease(strings.NewReader(
+		"ID=sles\nVERSION_ID=\"15.7\"\nPRETTY_NAME=\"SUSE Linux Enterprise Server 15 SP7\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eco, err := rel.Ecosystem()
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := rel.ProductRelease()
+	if release != "15 SP7" {
+		t.Fatalf("ProductRelease() = %q", release)
+	}
+
+	client := NewClient()
+	ctx := context.Background()
+
+	// The version SP7 shipped before the fix. gzip is in the Basesystem
+	// module, so this is the exact lookup that used to be impossible to make.
+	const vulnerable = "1.10-150200.10.1"
+	adv, err := client.Query(ctx, Ref{Ecosystem: eco, Release: release, Name: "gzip", Version: vulnerable})
+	if err != nil {
+		t.Fatalf("querying gzip@%s: %v", vulnerable, err)
+	}
+	if _, ok := adv["SUSE-SU-2026:3269-1"]; !ok {
+		got := make([]string, 0, len(adv))
+		for id := range adv {
+			got = append(got, id)
+		}
+		sort.Strings(got)
+		t.Errorf("SUSE-SU-2026:3269-1 not found for gzip@%s; got %v", vulnerable, got)
+	}
+
+	// The version that advisory fixes. Every record still returned by the bare
+	// family belongs to another product, so the filter must leave nothing.
+	const patched = "1.10-150200.13.1"
+	adv, err = client.Query(ctx, Ref{Ecosystem: eco, Release: release, Name: "gzip", Version: patched})
+	if err != nil {
+		t.Fatalf("querying gzip@%s: %v", patched, err)
+	}
+	for id := range adv {
+		t.Errorf("patched gzip@%s still reports %s; the release filter let another product through", patched, id)
 	}
 }

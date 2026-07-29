@@ -26,12 +26,6 @@ type Release struct {
 // with no ecosystem finds nothing and reads exactly like a clean image.
 var ErrUnknownDistro = errors.New("no OSV ecosystem is known for this distribution")
 
-// ErrAmbiguousDistro is returned when OSV does carry the distribution, but the
-// ecosystem string depends on something os-release does not record -- SUSE's
-// support phase, currently. Like ErrUnknownDistro this stops the scan; the
-// caller is expected to offer an explicit override.
-var ErrAmbiguousDistro = errors.New("this distribution's OSV ecosystem cannot be determined from os-release")
-
 // ParseOSRelease reads the os-release(5) key=value format.
 func ParseOSRelease(r io.Reader) (Release, error) {
 	var rel Release
@@ -92,7 +86,7 @@ func ParseOSRelease(r io.Reader) (Release, error) {
 //	openEuler       "-LTS" when LTS       openEuler:24.03-LTS
 //	openSUSE        product name from PRETTY_NAME
 //	Red Hat         bare -- see below
-//	SLE             not derivable -- see below
+//	SLE             bare + ProductRelease narrowing -- see below
 func (rel Release) Ecosystem() (string, error) {
 	switch id := strings.ToLower(strings.TrimSpace(rel.ID)); id {
 	case "debian":
@@ -172,21 +166,23 @@ func (rel Release) Ecosystem() (string, error) {
 		return "openSUSE:Leap " + v, nil
 
 	case "sles", "sled", "sles_sap", "sle-micro", "sle_hpc":
-		// SUSE keys enterprise products on the marketing name *including the
-		// support-phase suffix*: glibc advisories for SLES 15 SP4 are filed
-		// under "SUSE:Linux Enterprise Server 15 SP4-LTSS", and the unsuffixed
-		// "SUSE:Linux Enterprise Server 15 SP4" returns nothing at all. The
-		// suffix follows the product's lifecycle date and subscription, not
-		// anything recorded in os-release, so it cannot be derived here.
+		// Bare, for the same reason Red Hat is bare, but the specifics are
+		// worse. A SUSE affected-entry ecosystem is not the product a user
+		// thinks they are running: on SLE 15 the base packages are filed
+		// against the *module* that ships them, so gzip on SLES 15 SP7 lives
+		// under "SUSE:Linux Enterprise Module for Basesystem 15 SP7". Neither
+		// "SUSE:Linux Enterprise Server 15 SP7" nor its "-LTSS" spelling
+		// carries that record -- both answer HTTP 200 with nothing. Which
+		// module ships a given package is nowhere in os-release, so no product
+		// string derived here could be right for more than a fraction of an
+		// image's packages.
 		//
-		// Guessing the base name would answer "no advisories" for every SLE
-		// image past general support -- which is most of the images anyone
-		// scans. Refusing is the only honest option; --osv-ecosystem lets a
-		// user who knows their support phase name it outright.
-		return "", fmt.Errorf("osv: %w: %s (%q) -- SUSE keys advisories on the support phase "+
-			"(e.g. %q, %q), which os-release does not record; name it with --osv-ecosystem",
-			ErrAmbiguousDistro, rel.ID, rel.PrettyName,
-			"SUSE:Linux Enterprise Server 15 SP4-LTSS", "SUSE:Linux Enterprise Micro 5.5")
+		// The bare family matches every SUSE record whatever its product, so
+		// the advisory is found at all; ProductRelease then narrows the answer
+		// back to this image's release. Filtering after the query works
+		// because the affected entry states its own product, while guessing
+		// before the query has nothing to go on.
+		return "SUSE", nil
 
 	default:
 		return "", fmt.Errorf("osv: %w: ID=%q (known: %s)", ErrUnknownDistro, rel.ID, strings.Join(KnownDistroIDs(), ", "))
@@ -234,6 +230,83 @@ func suseFromPrettyName(pretty string) (string, bool) {
 	}
 	return "", false
 }
+
+// ProductRelease is the release token an affected entry must carry for this
+// image, or "" when no narrowing applies.
+//
+// It exists for the bare-family ecosystems, where a query matches records from
+// every product the vendor ships. That over-matching is not benign for SUSE:
+// gzip is fixed at 1.10-150200.13.1 on SLE 15 and at 1.13-160000.3.1 on SLE
+// 16, so a *fully patched* SLES 15 SP7 image still matches the SLE 16 record,
+// and no amount of patching will ever clear it. Version comparison cannot sort
+// this out, because the two products' version lines never converge.
+//
+// The token is the trailing version part of the product name -- "15 SP7" for
+// SLES 15 SP7, "5.5" for SLE Micro 5.5 -- which is the one component every
+// spelling of a product shares, module and support-phase suffix included.
+func (rel Release) ProductRelease() string {
+	switch strings.ToLower(strings.TrimSpace(rel.ID)) {
+	case "sles", "sled", "sles_sap", "sle-micro", "sle_hpc":
+	default:
+		return ""
+	}
+	if tok := releaseToken(rel.PrettyName); tok != "" {
+		return tok
+	}
+	// PRETTY_NAME is absent or unparseable. VERSION_ID is "15.7" for SLES 15
+	// SP7 and "5.5" for SLE Micro 5.5 -- the same number, two spellings -- and
+	// only the SP-era enterprise products (12 and 15) use the SP form.
+	v := strings.TrimSpace(rel.VersionID)
+	maj, min, ok := strings.Cut(v, ".")
+	if !ok || min == "" {
+		return v
+	}
+	if maj == "12" || maj == "15" {
+		return maj + " SP" + min
+	}
+	return v
+}
+
+// releaseToken returns a product name's trailing version part: everything from
+// the first digit-leading word onward, so "SUSE Linux Enterprise Server 15 SP7"
+// yields "15 SP7".
+func releaseToken(pretty string) string {
+	fields := strings.Fields(pretty)
+	for i, f := range fields {
+		if f != "" && f[0] >= '0' && f[0] <= '9' {
+			return strings.Join(fields[i:], " ")
+		}
+	}
+	return ""
+}
+
+// MatchesProductRelease reports whether an OSV affected-entry ecosystem string
+// names a product of the given release.
+//
+// eco is the full affected-entry spelling ("SUSE:Linux Enterprise Module for
+// Basesystem 15 SP7"); release is a ProductRelease token ("15 SP7"). The
+// support-phase suffix is dropped before comparing, because it distinguishes
+// subscriptions rather than releases: an image running 15 SP4 is described by
+// the "15 SP4-LTSS" records whether or not its owner holds that subscription.
+func MatchesProductRelease(eco, release string) bool {
+	if release == "" {
+		return true
+	}
+	if _, rest, ok := strings.Cut(eco, ":"); ok {
+		eco = rest
+	}
+	eco = strings.TrimSpace(eco)
+	for _, phase := range supportPhases {
+		if trimmed, ok := strings.CutSuffix(eco, phase); ok {
+			eco = trimmed
+			break
+		}
+	}
+	return eco == release || strings.HasSuffix(eco, " "+release)
+}
+
+// supportPhases are the subscription suffixes SUSE appends to a product name.
+var supportPhases = []string{"-LTSS", "-ESPOS", "-TERADATA"}
 
 func (rel Release) versioned(family string, trim func(string) string) (string, error) {
 	v, err := rel.require(trim)

@@ -191,34 +191,33 @@ PRETTY_NAME="openSUSE Tumbleweed"`,
 			want: "openSUSE:Tumbleweed",
 		},
 		{
-			name: "sles is refused rather than guessed",
+			// The obvious answer, "SUSE:Linux Enterprise Server 15 SP5",
+			// carries no records, and neither does its "-LTSS" spelling: SUSE
+			// files base packages against the *module* that ships them. Only
+			// the bare family matches, and ProductRelease narrows it back.
+			name: "sles is the bare family",
 			osrel: `NAME="SLES"
 VERSION="15-SP5"
 VERSION_ID="15.5"
 PRETTY_NAME="SUSE Linux Enterprise Server 15 SP5"
 ID="sles"`,
-			// The obvious answer, "SUSE:Linux Enterprise Server 15 SP5",
-			// returns nothing: SLES 15 SP5 advisories are filed under
-			// "...15 SP5-LTSS". The suffix tracks the product's support phase,
-			// which os-release does not record, so every SLE image past
-			// general support would silently scan clean.
-			wantErr: "cannot be determined from os-release",
+			want: "SUSE",
 		},
 		{
-			name: "sles for SAP is refused too",
+			name: "sles for SAP is the bare family too",
 			osrel: `NAME="SLES_SAP"
 VERSION_ID="12.5"
 PRETTY_NAME="SUSE Linux Enterprise Server for SAP Applications 12 SP5"
 ID="sles_sap"`,
-			wantErr: "--osv-ecosystem",
+			want: "SUSE",
 		},
 		{
-			name: "sle micro is refused for the same reason",
+			name: "sle micro is the bare family too",
 			osrel: `NAME="SLE Micro"
 VERSION_ID="5.5"
 PRETTY_NAME="SUSE Linux Enterprise Micro 5.5"
 ID="sle-micro"`,
-			wantErr: "cannot be determined from os-release",
+			want: "SUSE",
 		},
 		{
 			name: "mageia",
@@ -296,18 +295,95 @@ VERSION_ID="9"`,
 	}
 }
 
-func TestSLEIsAmbiguousNotUnknown(t *testing.T) {
-	rel, err := ParseOSRelease(strings.NewReader(
-		"ID=sles\nVERSION_ID=\"15.5\"\nPRETTY_NAME=\"SUSE Linux Enterprise Server 15 SP5\"\n"))
-	if err != nil {
-		t.Fatal(err)
+func TestSLEProductRelease(t *testing.T) {
+	tests := []struct {
+		name  string
+		osrel string
+		want  string
+	}{
+		{
+			name:  "service pack from the pretty name",
+			osrel: "ID=sles\nVERSION_ID=\"15.7\"\nPRETTY_NAME=\"SUSE Linux Enterprise Server 15 SP7\"\n",
+			want:  "15 SP7",
+		},
+		{
+			// Micro spells its release with a dot, not an SP.
+			name:  "dotted release",
+			osrel: "ID=sle-micro\nVERSION_ID=\"5.5\"\nPRETTY_NAME=\"SUSE Linux Enterprise Micro 5.5\"\n",
+			want:  "5.5",
+		},
+		{
+			name:  "sap applications keeps only the trailing version",
+			osrel: "ID=sles_sap\nVERSION_ID=\"12.5\"\nPRETTY_NAME=\"SUSE Linux Enterprise Server for SAP Applications 12 SP5\"\n",
+			want:  "12 SP5",
+		},
+		{
+			// The SP spelling has to be reconstructed when PRETTY_NAME is gone.
+			name:  "falls back to VERSION_ID",
+			osrel: "ID=sles\nVERSION_ID=\"15.7\"\n",
+			want:  "15 SP7",
+		},
+		{
+			name:  "sixteen is dotted, not an SP",
+			osrel: "ID=sles\nVERSION_ID=\"16.0\"\nPRETTY_NAME=\"SUSE Linux Enterprise Server 16.0\"\n",
+			want:  "16.0",
+		},
+		{
+			// Every other distribution names its release in the query itself.
+			name:  "not applied to other distributions",
+			osrel: "ID=debian\nVERSION_ID=\"12\"\n",
+			want:  "",
+		},
 	}
-	_, err = rel.Ecosystem()
-	if !errors.Is(err, ErrAmbiguousDistro) {
-		t.Fatalf("error is not ErrAmbiguousDistro: %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rel, err := ParseOSRelease(strings.NewReader(tt.osrel))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := rel.ProductRelease(); got != tt.want {
+				t.Errorf("ProductRelease() = %q, want %q", got, tt.want)
+			}
+		})
 	}
-	if errors.Is(err, ErrUnknownDistro) {
-		t.Error("SLE is carried by OSV; it must not report as an unknown distribution")
+}
+
+func TestMatchesProductRelease(t *testing.T) {
+	const release = "15 SP7"
+	tests := []struct {
+		eco  string
+		want bool
+	}{
+		// The one that matters: gzip on SLES 15 SP7 is filed against the
+		// module that ships it, not against the server product.
+		{"SUSE:Linux Enterprise Module for Basesystem 15 SP7", true},
+		{"SUSE:Linux Enterprise Server 15 SP7", true},
+		{"SUSE:Linux Enterprise Server 15 SP7-LTSS", true},
+		{"SUSE:Linux Enterprise High Performance Computing 15 SP7-ESPOS", true},
+
+		// A different release of the same product line. These are what make a
+		// fully patched SP7 image look vulnerable forever: SLE 16 fixes gzip
+		// at 1.13, a version SLE 15 will never ship.
+		{"SUSE:Linux Enterprise Server 16.0", false},
+		{"SUSE:Linux Enterprise Server 15 SP4-LTSS", false},
+		{"SUSE:Linux Micro 6.2", false},
+		{"SUSE:Linux Enterprise Micro 5.5", false},
+
+		// "5 SP7" must not match "15 SP7" on a suffix comparison.
+		{"SUSE:Linux Enterprise Server 5 SP7", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.eco, func(t *testing.T) {
+			if got := MatchesProductRelease(tt.eco, release); got != tt.want {
+				t.Errorf("MatchesProductRelease(%q, %q) = %v, want %v", tt.eco, release, got, tt.want)
+			}
+		})
+	}
+
+	// An empty release narrows nothing, which is what every non-SUSE
+	// ecosystem relies on.
+	if !MatchesProductRelease("Debian:12", "") {
+		t.Error("an empty release must match everything")
 	}
 }
 

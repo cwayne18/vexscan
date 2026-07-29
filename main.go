@@ -239,18 +239,40 @@ func renderInventory(inv *analyze.InventoryResult) string {
 
 	if len(inv.Databases) == 0 {
 		b.WriteString("\nNo dpkg, apk or rpm database found.\n")
-		return b.String()
+	} else {
+		fmt.Fprintf(&b, "packages:  %d\n", inv.Packages())
+		for _, db := range inv.Databases {
+			fmt.Fprintf(&b, "\n%s (%d packages, %s)\n", db.Format, len(db.Packages), db.DB)
+			for _, p := range db.Packages {
+				// The queried names are shown because they are the part a user is
+				// most likely to want to check: OSV keys Debian and Alpine on the
+				// source package, not the one the database lists.
+				names := strings.Join(p.OSVNames(), ", ")
+				fmt.Fprintf(&b, "  %-32s %-28s %-8s %s\n", p.Name, p.Version, p.Arch, names)
+			}
+		}
 	}
 
-	fmt.Fprintf(&b, "packages:  %d\n", inv.Packages())
-	for _, db := range inv.Databases {
-		fmt.Fprintf(&b, "\n%s (%d packages, %s)\n", db.Format, len(db.Packages), db.DB)
-		for _, p := range db.Packages {
-			// The queried names are shown because they are the part a user is
-			// most likely to want to check: OSV keys Debian and Alpine on the
-			// source package, not the one the database lists.
-			names := strings.Join(p.OSVNames(), ", ")
-			fmt.Fprintf(&b, "  %-32s %-28s %-8s %s\n", p.Name, p.Version, p.Arch, names)
+	for _, l := range inv.Languages {
+		fmt.Fprintf(&b, "\n%s (%d packages, %s)\n", l.Format, len(l.Packages), strings.Join(l.Roots, ", "))
+		for _, p := range l.Packages {
+			// The import names are shown next to the project name because their
+			// divergence is the whole reason this reader exists: PyYAML installs
+			// "yaml", and a reader checking a finding needs to see the mapping
+			// the graph will be rooted on. A "?" marks a guess rather than
+			// something the distribution's own metadata stated.
+			imports := strings.Join(p.ImportNames, ", ")
+			if !p.ImportNamesKnown {
+				imports += " (guessed)"
+			}
+			files := fmt.Sprintf("%d files", len(p.Files))
+			if !p.FilesKnown {
+				files += " (no manifest)"
+			}
+			fmt.Fprintf(&b, "  %-32s %-16s %-20s %s\n", p.Name, p.Version, files, imports)
+		}
+		for _, m := range l.Unreadable {
+			fmt.Fprintf(&b, "  ! unreadable manifest %s\n", m)
 		}
 	}
 	return b.String()

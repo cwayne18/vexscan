@@ -138,6 +138,12 @@ type Component struct {
 	// Ecosystem is the OSV ecosystem string ("Go", "Debian:12", "PyPI").
 	Ecosystem string
 
+	// Release narrows a bare-family Ecosystem to one product release, and is
+	// empty unless the ecosystem needs it. Only SUSE does today: its query has
+	// to be the bare family to match anything, so the product an advisory
+	// applies to can only be checked after the fact. See osv.Ref.Release.
+	Release string
+
 	// Name is the package name *as OSV keys it*. For deb and rpm that is the
 	// source package, not the binary package the database lists — getting this
 	// backwards produces both false negatives and false positives, so plugins
@@ -181,7 +187,7 @@ type Component struct {
 // Key identifies a component for advisory resolution. Components sharing a key
 // need only one OSV lookup between them.
 func (c Component) Key() string {
-	return c.Ecosystem + "|" + c.Name + "|" + c.Version
+	return c.Ecosystem + "|" + c.Release + "|" + c.Name + "|" + c.Version
 }
 
 // WorkItem pairs a component with the advisories to decide on.

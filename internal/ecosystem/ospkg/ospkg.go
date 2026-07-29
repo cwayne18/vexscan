@@ -38,7 +38,8 @@ type Plugin struct {
 
 	// Ecosystem overrides the OSV ecosystem string derived from os-release. It
 	// is the escape hatch for the distributions whose ecosystem os-release does
-	// not determine -- SUSE keys advisories on the support phase.
+	// not determine -- SUSE files base packages against the module that ships
+	// them, which os-release does not record.
 	Ecosystem string
 
 	// Mine reports that this plugin wants advisory prose mined for it. It only
@@ -136,6 +137,7 @@ type prepared struct {
 	img *target.Image
 
 	ecosystem string
+	release   string // narrows a bare-family ecosystem; see osv.Release.ProductRelease
 	distro    string // os-release ID, for the purl namespace
 	dbs       []pkgdb.Result
 
@@ -215,6 +217,12 @@ func (p *Plugin) prepare(img *target.Image) (*prepared, error) {
 		pr.ecosystem = eco
 	}
 	pr.distro = strings.ToLower(rel.ID)
+	// Only meaningful when the ecosystem was derived: a user who named the
+	// ecosystem outright with --osv-ecosystem has already said which product
+	// they mean, and narrowing that further could only subtract from it.
+	if p.Ecosystem == "" && relErr == nil {
+		pr.release = rel.ProductRelease()
+	}
 
 	dbs, err := pkgdb.Read(img.FS)
 	if err != nil {
@@ -289,6 +297,7 @@ func (pr *prepared) component(pkg pkgdb.Package) ecosystem.Component {
 	version := osvVersion(pr.ecosystem, pkg)
 	return ecosystem.Component{
 		Ecosystem: pr.ecosystem,
+		Release:   pr.release,
 		Name:      names[0],
 		AltNames:  names[1:],
 		Version:   version,

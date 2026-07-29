@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"github.com/cwayne18/vexscan/internal/image"
+	"github.com/cwayne18/vexscan/internal/langdb"
 	"github.com/cwayne18/vexscan/internal/osv"
 	"github.com/cwayne18/vexscan/internal/pkgdb"
 	"github.com/cwayne18/vexscan/internal/target"
@@ -23,6 +24,14 @@ type InventoryResult struct {
 	Mode      string         `json:"mode"` // always "image"
 	OS        *OSInfo        `json:"os,omitempty"`
 	Databases []pkgdb.Result `json:"databases"`
+
+	// Languages are the installed distributions of the language ecosystems
+	// that ship inside images: Python's site-packages, Node's node_modules.
+	// They are kept separate from Databases because they overlap: Debian's
+	// python3-yaml deb installs the same files a PyPI inventory reports under
+	// "pyyaml", and merging the two would hide that both advisory namespaces
+	// apply.
+	Languages []langdb.Result `json:"languages,omitempty"`
 }
 
 // OSInfo is the distribution identity read from /etc/os-release.
@@ -36,11 +45,24 @@ type OSInfo struct {
 	EcosystemError string `json:"ecosystem_error,omitempty"`
 }
 
-// Packages counts everything the inventory found.
+// Packages counts the OS packages the inventory found.
 func (r *InventoryResult) Packages() int {
 	n := 0
 	for _, db := range r.Databases {
 		n += len(db.Packages)
+	}
+	return n
+}
+
+// LanguagePackages counts the installed language distributions.
+//
+// It is kept apart from Packages rather than added to it because the two
+// overlap -- the same files can be one deb and one PyPI distribution -- so a
+// single total would be a number that counts some code twice and means nothing.
+func (r *InventoryResult) LanguagePackages() int {
+	n := 0
+	for _, l := range r.Languages {
+		n += len(l.Packages)
 	}
 	return n
 }
@@ -102,7 +124,32 @@ func Inventory(ctx context.Context, opts Options) (*InventoryResult, error) {
 	for _, db := range dbs {
 		logf("  %s: %d packages from %s", db.Format, len(db.Packages), db.DB)
 	}
+
+	langs, err := langdb.Scan(img.FS)
+	if err != nil {
+		// Same reasoning as above: a site-packages directory that was found and
+		// could not be listed would render as an image with no Python in it.
+		return nil, fmt.Errorf("reading language packages: %w", err)
+	}
+	res.Languages = langs
+
+	for _, l := range langs {
+		logf("  %s: %d packages from %d %s", l.Format, len(l.Packages), len(l.Roots), rootWord(l.Format))
+		for _, m := range l.Unreadable {
+			// Not fatal, but never silent: a distribution whose manifest would
+			// not parse is one whose absence must not be asserted later.
+			logf("    ! unreadable manifest %s", m)
+		}
+	}
 	return res, nil
+}
+
+// rootWord names what a language's roots are, for log lines.
+func rootWord(f langdb.Format) string {
+	if f == langdb.FormatNPM {
+		return "node_modules trees"
+	}
+	return "site-packages directories"
 }
 
 // readOSInfo parses /etc/os-release and maps it to an OSV ecosystem.

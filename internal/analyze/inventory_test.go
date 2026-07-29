@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cwayne18/vexscan/internal/langdb"
 	"github.com/cwayne18/vexscan/internal/pkgdb"
 	"github.com/cwayne18/vexscan/internal/target"
 )
@@ -62,13 +63,15 @@ func TestReadOSInfo(t *testing.T) {
 			wantEcosystem: "Alpine:v3.19",
 		},
 		{
-			// SLE refuses rather than guessing, and the refusal has to reach
-			// the output: a silently-unnamed ecosystem scans as clean.
-			name: "sle-is-reported-not-swallowed",
+			// SLE resolves to the bare family. A derived product name would be
+			// wrong for most of the image -- SUSE files base packages against
+			// the module that ships them -- so the narrowing happens against
+			// the affected entries after the query instead.
+			name: "sle-is-the-bare-family",
 			files: map[string]string{
 				"/etc/os-release": "ID=\"sles\"\nVERSION_ID=\"15.5\"\nPRETTY_NAME=\"SUSE Linux Enterprise Server 15 SP5\"\n",
 			},
-			wantErrFragment: "--osv-ecosystem",
+			wantEcosystem: "SUSE",
 		},
 		{
 			name: "unknown-distro",
@@ -127,6 +130,28 @@ func TestInventoryPackageCount(t *testing.T) {
 	}
 	if got := (&InventoryResult{}).Packages(); got != 0 {
 		t.Errorf("Packages() on an empty inventory = %d", got)
+	}
+}
+
+func TestInventoryCountsLanguagesSeparately(t *testing.T) {
+	// The two counts must not be summed: a python3-yaml deb and the pyyaml
+	// distribution it installs are the same files under two names, so a single
+	// total would double-count them.
+	inv := &InventoryResult{
+		Databases: []pkgdb.Result{{Format: pkgdb.FormatDeb, Packages: make([]pkgdb.Package, 88)}},
+		Languages: []langdb.Result{
+			{Format: langdb.FormatPyPI, Packages: make([]langdb.Package, 12)},
+			{Format: langdb.FormatNPM, Packages: make([]langdb.Package, 900)},
+		},
+	}
+	if got := inv.Packages(); got != 88 {
+		t.Errorf("Packages() = %d, want 88 (OS packages only)", got)
+	}
+	if got := inv.LanguagePackages(); got != 912 {
+		t.Errorf("LanguagePackages() = %d, want 912", got)
+	}
+	if got := (&InventoryResult{}).LanguagePackages(); got != 0 {
+		t.Errorf("LanguagePackages() on an empty inventory = %d", got)
 	}
 }
 

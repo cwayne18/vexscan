@@ -49,6 +49,13 @@ type Ref struct {
 	Ecosystem string
 	Name      string
 	Version   string
+
+	// Release narrows a bare-family ecosystem to a single product release. It
+	// is empty for every ecosystem whose query already names its release, and
+	// when set an advisory survives only if one of its affected entries names
+	// a product of that release. See Release.ProductRelease for why SUSE
+	// cannot be handled in the query itself.
+	Release string
 }
 
 func (r Ref) String() string {
@@ -152,6 +159,10 @@ type vuln struct {
 	Affected []struct {
 		Package struct {
 			Name string `json:"name"`
+			// Ecosystem is the *product* this entry applies to, which for a
+			// bare-family query is finer-grained than the ecosystem asked for:
+			// a "SUSE" query returns entries reading "SUSE:Linux Micro 6.2".
+			Ecosystem string `json:"ecosystem"`
 		} `json:"package"`
 		EcosystemSpecific struct {
 			Imports []struct {
@@ -365,6 +376,9 @@ func normalizeVersion(ref Ref) string {
 func buildMap(ref Ref, vulns []vuln) map[string]*Advisory {
 	out := map[string]*Advisory{}
 	for _, v := range vulns {
+		if !appliesToRelease(ref, v) {
+			continue
+		}
 		adv := advisoryFor(ref, v)
 		for _, key := range append([]string{v.ID}, v.Aliases...) {
 			if key == "" {
@@ -378,6 +392,24 @@ func buildMap(ref Ref, vulns []vuln) map[string]*Advisory {
 		}
 	}
 	return out
+}
+
+// appliesToRelease reports whether an advisory names a product of ref.Release.
+//
+// An advisory with no affected entry at all is kept: /v1/querybatch answers
+// with bare ids and the hydration that follows can fail, and dropping an
+// advisory because its detail is missing would report an image as clean on the
+// strength of a failed fetch.
+func appliesToRelease(ref Ref, v vuln) bool {
+	if ref.Release == "" || len(v.Affected) == 0 {
+		return true
+	}
+	for _, aff := range v.Affected {
+		if MatchesProductRelease(aff.Package.Ecosystem, ref.Release) {
+			return true
+		}
+	}
+	return false
 }
 
 func advisoryFor(ref Ref, v vuln) *Advisory {

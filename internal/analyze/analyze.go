@@ -505,7 +505,7 @@ func (r *advisoryResolver) prefetch(ctx context.Context, components []ecosystem.
 		queue[key] = true
 		spans = append(spans, span{key, len(refs), len(refs) + len(names)})
 		for _, n := range names {
-			refs = append(refs, osv.Ref{Ecosystem: c.Ecosystem, Name: n, Version: c.Version})
+			refs = append(refs, osv.Ref{Ecosystem: c.Ecosystem, Release: c.Release, Name: n, Version: c.Version})
 		}
 	}
 	// One ref is the same round trip either way, and going through the batch
@@ -547,7 +547,7 @@ func (r *advisoryResolver) advisories(ctx context.Context, c ecosystem.Component
 
 	var results []map[string]*osv.Advisory
 	for _, name := range queryNames(c) {
-		ref := osv.Ref{Ecosystem: c.Ecosystem, Name: name, Version: c.Version}
+		ref := osv.Ref{Ecosystem: c.Ecosystem, Release: c.Release, Name: name, Version: c.Version}
 		got, err := r.client.Query(ctx, ref)
 		if err != nil {
 			logf("  ! OSV query failed for %s: %v", ref, err)
