@@ -124,6 +124,20 @@ type Component struct {
 	// map it during inventory rather than leaving it to the orchestrator.
 	Name string
 
+	// AltNames are further names to query OSV under, beyond Name.
+	//
+	// This exists because "which name does the advisory database key this
+	// package on" has no consistent answer, even within one package format.
+	// Debian and Alpine file against the source package, Red Hat and AlmaLinux
+	// against the binary package, and Rocky Linux -- a rebuild of Red Hat --
+	// against the source package like its upstream does not. Querying both
+	// costs one extra entry in a batch request; picking the wrong single name
+	// reports a vulnerable package as clean.
+	//
+	// The advisories from every name are merged into one set, so an advisory
+	// filed under both names produces one finding, not two.
+	AltNames []string
+
 	// Version is the version string OSV can compare.
 	Version string
 

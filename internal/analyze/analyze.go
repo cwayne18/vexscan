@@ -244,6 +244,8 @@ func newResolver() *advisoryResolver {
 
 // workItems pairs each component with its advisories and the requested ids.
 func (r *advisoryResolver) workItems(ctx context.Context, components []ecosystem.Component, requested []string, logf func(string, ...any)) []ecosystem.WorkItem {
+	r.prefetch(ctx, components, logf)
+
 	out := make([]ecosystem.WorkItem, 0, len(components))
 	for _, c := range components {
 		out = append(out, ecosystem.WorkItem{
@@ -253,6 +255,63 @@ func (r *advisoryResolver) workItems(ctx context.Context, components []ecosystem
 		})
 	}
 	return out
+}
+
+// prefetch resolves every uncached component in one batched round trip.
+//
+// A whole-image inventory is hundreds of packages, and each of those is one or
+// two OSV names; a query apiece is several minutes of sequential HTTP for a
+// scan that should take seconds. Batching is therefore a prerequisite for OS
+// package support rather than a tuning knob.
+//
+// Failure is not fatal and not silent: the batch is abandoned with a message
+// and each component falls back to its own query, so one unlucky request
+// cannot zero out the advisory set for an entire image — which would render as
+// a clean report.
+func (r *advisoryResolver) prefetch(ctx context.Context, components []ecosystem.Component, logf func(string, ...any)) {
+	// span records where one component's refs sit in the flattened request, so
+	// the answers can be folded back together afterwards.
+	type span struct {
+		key        string
+		start, end int
+	}
+
+	var (
+		refs  []osv.Ref
+		spans []span
+		queue = map[string]bool{}
+	)
+	for _, c := range components {
+		key := c.Key()
+		if _, done := r.cache[key]; done || queue[key] || c.Ecosystem == "" {
+			continue
+		}
+		names := queryNames(c)
+		if len(names) == 0 {
+			continue
+		}
+		queue[key] = true
+		spans = append(spans, span{key, len(refs), len(refs) + len(names)})
+		for _, n := range names {
+			refs = append(refs, osv.Ref{Ecosystem: c.Ecosystem, Name: n, Version: c.Version})
+		}
+	}
+	// One ref is the same round trip either way, and going through the batch
+	// endpoint for it would change the request every existing Go-mode scan
+	// makes for no gain.
+	if len(refs) < 2 {
+		return
+	}
+
+	logf("Resolving advisories for %d components (%d OSV queries)...", len(spans), len(refs))
+	got, err := r.client.QueryBatch(ctx, refs)
+	if err != nil {
+		logf("  ! OSV batch query failed (%v); falling back to one query per component", err)
+		return
+	}
+	for _, s := range spans {
+		r.cache[s.key] = merge(got[s.start:s.end])
+	}
 }
 
 // advisories resolves one component, caching by key so several binaries linking
@@ -273,15 +332,50 @@ func (r *advisoryResolver) advisories(ctx context.Context, c ecosystem.Component
 		r.cache[c.Key()] = adv
 		return adv
 	}
-	ref := osv.Ref{Ecosystem: c.Ecosystem, Name: c.Name, Version: c.Version}
-	got, err := r.client.Query(ctx, ref)
-	if err != nil {
-		logf("  ! OSV query failed for %s: %v", ref, err)
-	} else {
-		adv = got
+
+	var results []map[string]*osv.Advisory
+	for _, name := range queryNames(c) {
+		ref := osv.Ref{Ecosystem: c.Ecosystem, Name: name, Version: c.Version}
+		got, err := r.client.Query(ctx, ref)
+		if err != nil {
+			logf("  ! OSV query failed for %s: %v", ref, err)
+			continue
+		}
+		results = append(results, got)
 	}
+	adv = merge(results)
 	r.cache[c.Key()] = adv
 	return adv
+}
+
+// queryNames is the component's OSV names, primary first, deduplicated.
+func queryNames(c ecosystem.Component) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, n := range append([]string{c.Name}, c.AltNames...) {
+		if n != "" && !seen[n] {
+			seen[n] = true
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// merge folds the per-name advisory sets into one.
+//
+// First name wins on a conflict. The records are the same either way -- the
+// only ref-dependent field is the Go import path list, and Go components have
+// exactly one name -- so this only settles which copy is kept.
+func merge(sets []map[string]*osv.Advisory) map[string]*osv.Advisory {
+	out := map[string]*osv.Advisory{}
+	for _, set := range sets {
+		for id, adv := range set {
+			if _, ok := out[id]; !ok {
+				out[id] = adv
+			}
+		}
+	}
+	return out
 }
 
 // newLLM builds the assessment client, or returns nil when --llm is off.
