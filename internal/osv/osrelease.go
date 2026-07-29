@@ -206,6 +206,17 @@ func KnownDistroIDs() []string {
 	return ids
 }
 
+// Families lists the OSV ecosystem families Ecosystem can produce, without
+// their version suffixes. It is what --ecosystem accepts for OS packages, and
+// it lives beside the mapping so the two cannot drift apart.
+func Families() []string {
+	return []string{
+		"AlmaLinux", "Alpaquita", "Alpine", "Azure Linux", "Chainguard",
+		"Debian", "Mageia", "MinimOS", "Red Hat", "Rocky Linux", "SUSE",
+		"Ubuntu", "Wolfi", "openEuler", "openSUSE",
+	}
+}
+
 // suseFromPrettyName turns "SUSE Linux Enterprise Server 15 SP5" into
 // "SUSE:Linux Enterprise Server 15 SP5" and "openSUSE Leap 15.6" into
 // "openSUSE:Leap 15.6" -- the vendor prefix becomes the ecosystem family and

@@ -263,36 +263,3 @@ func TestPackagePresentDoesNotLeakFromParent(t *testing.T) {
 		t.Error("child package .../ssh/agent must not match on a parent-only binary")
 	}
 }
-
-func TestResolveRequests(t *testing.T) {
-	advA := &osv.Advisory{ID: "GO-2023-0001", Aliases: []string{"CVE-2023-0001"}}
-	advB := &osv.Advisory{ID: "GO-2023-0002", Aliases: []string{"CVE-2023-0002"}}
-	advMap := map[string]*osv.Advisory{
-		"GO-2023-0001":  advA,
-		"CVE-2023-0001": advA,
-		"GO-2023-0002":  advB,
-		"CVE-2023-0002": advB,
-	}
-
-	t.Run("filter mode keeps unmapped ids so they report as undetermined", func(t *testing.T) {
-		got := resolveRequests([]string{"CVE-2023-0001", "CVE-9999-9999"}, advMap)
-		want := []request{
-			{id: "CVE-2023-0001", adv: advA},
-			{id: "CVE-9999-9999", adv: nil},
-		}
-		if !reflect.DeepEqual(got, want) {
-			t.Errorf("resolveRequests() = %+v, want %+v", got, want)
-		}
-	})
-
-	t.Run("all mode dedupes aliases to one request per advisory, sorted by GO id", func(t *testing.T) {
-		got := resolveRequests(nil, advMap)
-		want := []request{
-			{id: "GO-2023-0001", adv: advA},
-			{id: "GO-2023-0002", adv: advB},
-		}
-		if !reflect.DeepEqual(got, want) {
-			t.Errorf("resolveRequests() = %+v, want %+v", got, want)
-		}
-	})
-}

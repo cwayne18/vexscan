@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/cwayne18/vexscan/internal/llm"
+	"github.com/cwayne18/vexscan/internal/osv"
 	"github.com/cwayne18/vexscan/internal/target"
 )
 
@@ -259,4 +260,37 @@ func mustSelect(t *testing.T, r *Registry, selectors []string) []Plugin {
 		t.Fatalf("Select(%v): %v", selectors, err)
 	}
 	return ps
+}
+
+func TestWorkItemRequests(t *testing.T) {
+	advA := &osv.Advisory{ID: "GO-2023-0001", Aliases: []string{"CVE-2023-0001"}}
+	advB := &osv.Advisory{ID: "GO-2023-0002", Aliases: []string{"CVE-2023-0002"}}
+	advMap := map[string]*osv.Advisory{
+		"GO-2023-0001":  advA,
+		"CVE-2023-0001": advA,
+		"GO-2023-0002":  advB,
+		"CVE-2023-0002": advB,
+	}
+
+	t.Run("filter mode keeps unmapped ids so they report as undetermined", func(t *testing.T) {
+		got := WorkItem{Advisories: advMap, Requested: []string{"CVE-2023-0001", "CVE-9999-9999"}}.Requests()
+		want := []Request{
+			{ID: "CVE-2023-0001", Advisory: advA},
+			{ID: "CVE-9999-9999", Advisory: nil},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("Requests() = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("all mode dedupes aliases to one request per advisory, sorted by id", func(t *testing.T) {
+		got := WorkItem{Advisories: advMap}.Requests()
+		want := []Request{
+			{ID: "GO-2023-0001", Advisory: advA},
+			{ID: "GO-2023-0002", Advisory: advB},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("Requests() = %+v, want %+v", got, want)
+		}
+	})
 }

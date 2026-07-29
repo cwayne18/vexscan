@@ -9,38 +9,6 @@ import (
 	"github.com/cwayne18/vexscan/internal/osv"
 )
 
-type request struct {
-	id  string
-	adv *osv.Advisory
-}
-
-// resolveRequests turns the requested-id list (or "all") into concrete advisory
-// lookups. In filter mode every requested id is returned, with a nil advisory
-// when OSV has no mapping — such an id must still produce a finding, recorded
-// undetermined, or a --cves scan would silently drop the ids it could not map
-// and the omission would read as "not affected". In "all" mode every distinct
-// advisory is returned keyed by its canonical GO id.
-func resolveRequests(ids []string, advMap map[string]*osv.Advisory) []request {
-	if len(ids) > 0 {
-		out := make([]request, 0, len(ids))
-		for _, id := range ids {
-			out = append(out, request{id: id, adv: advMap[id]})
-		}
-		return out
-	}
-	seen := map[string]bool{}
-	var out []request
-	for _, adv := range advMap {
-		if seen[adv.ID] {
-			continue
-		}
-		seen[adv.ID] = true
-		out = append(out, request{id: adv.ID, adv: adv})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].id < out[j].id })
-	return out
-}
-
 // evalCtx is everything evaluate needs about one binary.
 type evalCtx struct {
 	binaryRel string

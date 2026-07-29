@@ -473,12 +473,24 @@ func TestSubjectsFor(t *testing.T) {
 	}
 }
 
-func TestRegistryHasBothGoCapabilities(t *testing.T) {
+func TestRegistryCapabilities(t *testing.T) {
 	plugins := registryFor(Options{}).All()
-	if len(ecosystem.ImageAnalyzers(plugins)) != 1 {
-		t.Error("the Go plugin must be an image analyzer")
+
+	ids := func(list []string) string { return strings.Join(list, ",") }
+	var image, source []string
+	for _, p := range ecosystem.ImageAnalyzers(plugins) {
+		image = append(image, p.ID())
 	}
-	if len(ecosystem.SourceAnalyzers(plugins)) != 1 {
-		t.Error("the Go plugin must be a source analyzer")
+	for _, p := range ecosystem.SourceAnalyzers(plugins) {
+		source = append(source, p.ID())
+	}
+
+	// Go analyzes from either end. OS packages only exist in an image: there
+	// is no source checkout of "the distribution's openssl".
+	if ids(image) != "golang,os" {
+		t.Errorf("image analyzers = %s, want golang,os", ids(image))
+	}
+	if ids(source) != "golang" {
+		t.Errorf("source analyzers = %s, want golang", ids(source))
 	}
 }

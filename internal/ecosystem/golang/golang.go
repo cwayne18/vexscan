@@ -199,7 +199,7 @@ func (p *Plugin) AnalyzeImage(ctx context.Context, img *target.Image, items []ec
 		if !ok {
 			return nil, fmt.Errorf("golang: component %s was not produced by this plugin", item.Component.Key())
 		}
-		requests := resolveRequests(item.Requested, item.Advisories)
+		requests := item.Requests()
 
 		for _, bin := range st.binaries {
 			syms, err := binscan.LoadSymbols(bin.path)
@@ -232,7 +232,7 @@ func (p *Plugin) AnalyzeImage(ctx context.Context, img *target.Image, items []ec
 				logf:      p.Logf,
 			}
 			for _, req := range requests {
-				out = append(out, evaluate(ctx, ec, req.id, req.adv))
+				out = append(out, evaluate(ctx, ec, req.ID, req.Advisory))
 			}
 		}
 	}

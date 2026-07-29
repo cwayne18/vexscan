@@ -17,10 +17,13 @@ import (
 
 	"github.com/cwayne18/vexscan/internal/ecosystem"
 	"github.com/cwayne18/vexscan/internal/ecosystem/golang"
+	"github.com/cwayne18/vexscan/internal/ecosystem/ospkg"
+	"github.com/cwayne18/vexscan/internal/elfgraph"
 	"github.com/cwayne18/vexscan/internal/image"
 	"github.com/cwayne18/vexscan/internal/llm"
 	"github.com/cwayne18/vexscan/internal/osv"
 	"github.com/cwayne18/vexscan/internal/source"
+	"github.com/cwayne18/vexscan/internal/target"
 )
 
 // The finding vocabulary lives in internal/ecosystem, which is what the plugins
@@ -51,6 +54,15 @@ type Options struct {
 	OS      string
 	Arch    string
 
+	// Roots are extra entrypoints for the OS plugin's shared-library closure,
+	// for an image whose real command comes from outside its config.
+	Roots []string
+	// DlopenPolicy decides whether a reachable dlopen blocks conclusions.
+	DlopenPolicy elfgraph.DlopenPolicy
+	// Ecosystem overrides the OSV ecosystem derived from the image's
+	// os-release, for the distributions os-release does not determine.
+	Ecosystem string
+
 	// GoVersion optionally pins the Go toolchain for repo-mode analysis
 	// (e.g. "1.24.0"). Mainly useful with --module stdlib, whose findings depend
 	// on the toolchain version.
@@ -70,6 +82,23 @@ type Result struct {
 	Mode     string    `json:"mode"`   // "image" | "repo"
 	Module   string    `json:"module"`
 	Findings []Finding `json:"findings"`
+
+	// Ecosystems records how each plugin fared. It exists so a failure is
+	// never indistinguishable from a clean result: a plugin that found a
+	// package database and could not read it reports the error here and
+	// contributes no findings at all.
+	Ecosystems []ecosystem.EcosystemResult `json:"ecosystems,omitempty"`
+}
+
+// Failed reports whether any ecosystem could not complete, which makes the
+// findings an incomplete account of the target.
+func (r *Result) Failed() bool {
+	for _, e := range r.Ecosystems {
+		if e.Error != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // Run dispatches to image or source-repo analysis.
@@ -93,14 +122,19 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	return nil, fmt.Errorf("one of --image or --repo is required")
 }
 
-// registryFor builds the plugin set for a run. Go is the only ecosystem today;
-// the OS, PyPI and npm plugins register here.
+// registryFor builds the plugin set for a run. PyPI and npm register here.
 func registryFor(opts Options) *ecosystem.Registry {
 	return ecosystem.NewRegistry(
 		golang.New(golang.Options{
 			VersionOverride: opts.Version,
 			GoVersion:       opts.GoVersion,
 			Logf:            opts.Logf,
+		}),
+		ospkg.New(ospkg.Options{
+			Roots:        opts.Roots,
+			DlopenPolicy: opts.DlopenPolicy,
+			Ecosystem:    opts.Ecosystem,
+			Logf:         opts.Logf,
 		}),
 	)
 }
@@ -147,35 +181,81 @@ func runImage(ctx context.Context, opts Options) (*Result, error) {
 	resolver := newResolver()
 	result := &Result{Target: opts.Image, Mode: "image", Module: opts.Module}
 
-	applied := 0
+	// One ecosystem failing does not stop the others, but it is never silent:
+	// the failure is logged, recorded in the result, and -- when it leaves the
+	// run with nothing at all to report -- returned as an error, so that an
+	// unreadable package database can never be mistaken for a clean image.
+	applied, failed := 0, 0
 	for _, a := range analyzers {
-		ok, err := a.DetectImage(ctx, img)
-		if err != nil {
-			return nil, fmt.Errorf("%s: detect: %w", a.ID(), err)
-		}
-		if !ok {
-			continue
+		er, findings := runAnalyzer(ctx, a, img, subjects, resolver, opts.CVEs, logf)
+		if er == nil {
+			continue // did not apply
 		}
 		applied++
-
-		components, err := a.InventoryImage(ctx, img, subjects)
-		if err != nil {
-			return nil, fmt.Errorf("%s: inventory: %w", a.ID(), err)
+		if er.Error != "" {
+			failed++
+			logf("  ! %s: %s", a.ID(), er.Error)
 		}
-
-		findings, err := a.AnalyzeImage(ctx, img, resolver.workItems(ctx, components, opts.CVEs, logf))
-		if err != nil {
-			return nil, fmt.Errorf("%s: analyze: %w", a.ID(), err)
-		}
+		result.Ecosystems = append(result.Ecosystems, *er)
 		result.Findings = append(result.Findings, findings...)
 	}
 	if applied == 0 {
 		return nil, fmt.Errorf("no ecosystem could analyze %s", opts.Image)
 	}
+	if failed == applied {
+		return nil, fmt.Errorf("every ecosystem failed on %s; see the log above", opts.Image)
+	}
 
 	llmOverlay(ctx, llmClient, result.Findings, "", logf)
 	sortFindings(result.Findings)
 	return result, nil
+}
+
+// runAnalyzer runs one plugin's three phases, returning nil when the plugin
+// does not apply to the image at all.
+func runAnalyzer(ctx context.Context, a ecosystem.ImageAnalyzer, img *target.Image, subjects []ecosystem.Subject, resolver *advisoryResolver, cves []string, logf func(string, ...any)) (*ecosystem.EcosystemResult, []Finding) {
+	er := &ecosystem.EcosystemResult{ID: a.ID()}
+
+	ok, err := a.DetectImage(ctx, img)
+	if err != nil {
+		// A detection that failed is not a detection that said no. Recording
+		// it as "this plugin does not apply" would drop the ecosystem from the
+		// report entirely.
+		er.Error = fmt.Sprintf("detect: %v", err)
+		return er, nil
+	}
+	if !ok {
+		return nil, nil
+	}
+
+	components, err := a.InventoryImage(ctx, img, subjects)
+	if err != nil {
+		er.Error = fmt.Sprintf("inventory: %v", err)
+		return er, nil
+	}
+	er.Components = len(components)
+	er.Ecosystems = distinctEcosystems(components)
+
+	findings, err := a.AnalyzeImage(ctx, img, resolver.workItems(ctx, components, cves, logf))
+	if err != nil {
+		er.Error = fmt.Sprintf("analyze: %v", err)
+		return er, nil
+	}
+	return er, findings
+}
+
+// distinctEcosystems reports the concrete OSV ecosystems an inventory produced.
+func distinctEcosystems(components []ecosystem.Component) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, c := range components {
+		if c.Ecosystem != "" && !seen[c.Ecosystem] {
+			seen[c.Ecosystem] = true
+			out = append(out, c.Ecosystem)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // runRepo checks out a git repository and hands it to every source analyzer.
@@ -437,6 +517,12 @@ func sortFindings(findings []Finding) {
 		a, b := findings[i], findings[j]
 		if a.Binary != b.Binary {
 			return a.Binary < b.Binary
+		}
+		// OS findings have no binary of their own, so without the module (the
+		// package name, for those) every ecosystem's findings would interleave
+		// in advisory order.
+		if a.Module != b.Module {
+			return a.Module < b.Module
 		}
 		return a.CVE < b.CVE
 	})

@@ -10,6 +10,7 @@ package ecosystem
 
 import (
 	"context"
+	"sort"
 	"strings"
 
 	"github.com/cwayne18/vexscan/internal/llm"
@@ -178,6 +179,41 @@ type WorkItem struct {
 	// still produce a finding, recorded undetermined — otherwise a --cves scan
 	// silently drops the ids it could not map, which reads as "not affected".
 	Requested []string
+}
+
+// Request is one advisory to decide on, paired with the id the caller asked
+// about -- which may be a CVE or GHSA alias rather than the record's own id.
+type Request struct {
+	ID       string
+	Advisory *osv.Advisory
+}
+
+// Requests turns a WorkItem's requested-id list into concrete lookups.
+//
+// In filter mode every requested id is returned, with a nil advisory when OSV
+// has no mapping: such an id must still produce a finding, recorded
+// undetermined, or a --cves scan would silently drop the ids it could not map
+// and the omission would read as "not affected". With no ids requested, every
+// distinct advisory is returned under its canonical OSV id.
+func (w WorkItem) Requests() []Request {
+	if len(w.Requested) > 0 {
+		out := make([]Request, 0, len(w.Requested))
+		for _, id := range w.Requested {
+			out = append(out, Request{ID: id, Advisory: w.Advisories[id]})
+		}
+		return out
+	}
+	seen := map[string]bool{}
+	var out []Request
+	for _, adv := range w.Advisories {
+		if seen[adv.ID] {
+			continue
+		}
+		seen[adv.ID] = true
+		out = append(out, Request{ID: adv.ID, Advisory: adv})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
 }
 
 // Evidence is one recorded observation behind a finding.
