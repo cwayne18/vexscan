@@ -241,7 +241,7 @@ func runAnalyzer(ctx context.Context, a ecosystem.ImageAnalyzer, img *target.Ima
 		er.Error = fmt.Sprintf("analyze: %v", err)
 		return er, nil
 	}
-	return er, findings
+	return er, stamp(a.ID(), findings)
 }
 
 // distinctEcosystems reports the concrete OSV ecosystems an inventory produced.
@@ -292,7 +292,7 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
-		result.Findings = append(result.Findings, findings...)
+		result.Findings = append(result.Findings, stamp(a.ID(), findings)...)
 	}
 	// No analyzer recognizing the tree must not read as a clean scan: an empty
 	// findings array is indistinguishable from "checked, nothing wrong".
@@ -458,6 +458,19 @@ func merge(sets []map[string]*osv.Advisory) map[string]*osv.Advisory {
 	return out
 }
 
+// stamp records which plugin produced each finding.
+//
+// The orchestrator does this rather than the plugins, so that the field is a
+// fact about what ran instead of a claim a plugin makes about itself. It is
+// what routes a finding to the right LLM prompt, and what lets a reader tell
+// the two halves of a mixed report apart.
+func stamp(id string, findings []Finding) []Finding {
+	for i := range findings {
+		findings[i].Ecosystem = id
+	}
+	return findings
+}
+
 // newLLM builds the assessment client, or returns nil when --llm is off.
 func newLLM(opts Options) (*llm.Client, error) {
 	if !opts.UseLLM {
@@ -495,6 +508,7 @@ func llmOverlay(ctx context.Context, client *llm.Client, findings []Finding, loc
 			binary = location
 		}
 		v, err := client.Assess(ctx, llm.Request{
+			Ecosystem: f.Ecosystem,
 			CVE:       f.CVE,
 			Module:    f.Module,
 			Version:   f.Version,

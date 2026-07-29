@@ -242,6 +242,12 @@ type Evidence struct {
 // renamed or removed, and the Go-specific ones stay for compatibility even
 // though other ecosystems leave them empty.
 type Finding struct {
+	// Ecosystem is the plugin that produced this finding ("golang", "os").
+	// Plugins do not set it -- the orchestrator stamps every finding with the
+	// analyzer it came from, so no plugin can forget to and no plugin can
+	// claim to be another.
+	Ecosystem string `json:"ecosystem,omitempty"`
+
 	Binary        string       `json:"binary,omitempty"`
 	Module        string       `json:"module"`
 	Version       string       `json:"version"`

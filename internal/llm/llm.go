@@ -1,7 +1,15 @@
-// Package llm asks a GitHub Models chat model whether a CVE that is genuinely
-// linked into a binary is plausibly exploitable in that context. It is an
-// optional, advisory layer on top of the deterministic pclntab / govulncheck
-// analysis.
+// Package llm asks a GitHub Models chat model two questions about a CVE that
+// the deterministic analysis has already decided is genuinely present: whether
+// it is plausibly exploitable in context (Assess), and which checkable
+// identifiers the advisory text names (Mine).
+//
+// Both are optional and advisory. Assess never sets a status -- it attaches an
+// opinion to a finding that already has one. Mine produces nothing but
+// candidate strings, and the caller must validate them against something it
+// can observe before any of them supports a conclusion; an unvalidatable hint
+// is indistinguishable from a hallucination, so validation is what makes a
+// wrong answer inert rather than dangerous. That validation deliberately lives
+// with the caller that has the facts to do it, not here.
 package llm
 
 import (
@@ -46,8 +54,13 @@ type Verdict struct {
 	Rationale   string `json:"rationale"`
 }
 
-// Request describes one CVE to assess in the context of a specific binary.
+// Request describes one CVE to assess in the context of a specific location.
 type Request struct {
+	// Ecosystem is the plugin that produced the finding ("golang", "os"). It
+	// selects the system prompt and is part of the cache key: the same CVE
+	// against a Go module and against an OS package are different questions.
+	Ecosystem string
+
 	CVE       string
 	Module    string
 	Version   string
@@ -71,6 +84,7 @@ type Client struct {
 
 	cacheMu sync.Mutex
 	cache   map[string]*Verdict
+	hints   map[string]*Hints
 }
 
 // NewClient builds a Client. The token is read from GITHUB_TOKEN (or GH_TOKEN)
@@ -95,6 +109,7 @@ func NewClient(model, token string) (*Client, error) {
 		Token:       token,
 		MinInterval: minIntervalFromEnv(),
 		cache:       make(map[string]*Verdict),
+		hints:       make(map[string]*Hints),
 	}, nil
 }
 
@@ -133,12 +148,73 @@ type chatResponse struct {
 	} `json:"error"`
 }
 
-const systemPrompt = `You are a security analyst assessing Go dependency vulnerabilities (VEX triage).
+// goPrompt is the original prompt, kept verbatim. Changing a word of it would
+// move every Go verdict the tool has ever produced, so new ecosystems get new
+// prompts rather than a shared one that has been generalized into vagueness.
+const goPrompt = `You are a security analyst assessing Go dependency vulnerabilities (VEX triage).
 You are given a CVE whose vulnerable package has been confirmed to be linked into (and possibly reachable from) a shipped Go binary.
 Judge how plausibly the vulnerability is actually EXPLOITABLE in a typical deployment of this binary.
 Consider: whether the vulnerable functions are likely invoked with attacker-controlled input, network exposure, and typical usage of the package.
 Respond with ONLY a JSON object, no prose, of the form:
 {"exploitable":"likely|unlikely|unknown","confidence":"low|medium|high","rationale":"one or two sentences"}`
+
+// osPrompt asks the same question about an OS package.
+//
+// The evidence behind an OS finding is weaker than behind a Go one and the
+// prompt says so: "linked" here means the dynamic linker would load a library
+// the package installs, which is a much lower bar than a symbol surviving
+// dead-code elimination. The prompt also names the reasons an installed,
+// loaded library is routinely not exploitable -- a CLI tool nothing invokes, a
+// codec path the image never exercises -- because those are the cases the
+// deterministic layer cannot see and the whole reason to ask at all.
+const osPrompt = `You are a security analyst assessing operating-system package vulnerabilities in a container image (VEX triage).
+You are given a CVE against an installed OS package (deb, rpm or apk) whose shared libraries the dynamic linker would load when the image runs.
+Judge how plausibly the vulnerability is actually EXPLOITABLE in a typical deployment of this image.
+Consider: whether the vulnerable code path is reachable from the image's own workload rather than only from a command-line tool that happens to be installed, whether the input it parses could be attacker-controlled, and whether exploitation requires local access, a specific configuration, or a non-default feature.
+Note that a library being loaded says nothing about which of its functions are called.
+Respond with ONLY a JSON object, no prose, of the form:
+{"exploitable":"likely|unlikely|unknown","confidence":"low|medium|high","rationale":"one or two sentences"}`
+
+// promptFor selects the system prompt for an ecosystem.
+//
+// The empty ecosystem is Go: that is what every caller meant before this
+// function existed, and a caller that forgets to set the field should get the
+// old behavior rather than a generic prompt that quietly changes its verdicts.
+func promptFor(ecosystem string) string {
+	switch strings.ToLower(ecosystem) {
+	case "os":
+		return osPrompt
+	default:
+		return goPrompt
+	}
+}
+
+// userMessage states the facts for one assessment.
+//
+// The Go wording is preserved exactly, for the same reason as the prompt. The
+// OS wording differs only in its labels: "Module" and "Binary" are the wrong
+// nouns for a package installed into an image, and a prompt that uses the
+// wrong noun invites the model to answer about the wrong thing.
+func userMessage(r Request) string {
+	reach := r.Reachable
+	if reach == "" {
+		reach = "unknown"
+	}
+	if strings.EqualFold(r.Ecosystem, "os") {
+		where := r.Binary
+		if where == "" {
+			where = "the image"
+		}
+		return fmt.Sprintf(
+			"CVE: %s\nPackage: %s %s\nImage: %s\nStatic analysis says the vulnerable code is: %s\nAssess exploitability.",
+			r.CVE, r.Module, r.Version, where, reach,
+		)
+	}
+	return fmt.Sprintf(
+		"CVE: %s\nModule: %s@%s\nVulnerable packages: %s\nBinary: %s\nStatic analysis says the vulnerable code is: %s\nAssess exploitability.",
+		r.CVE, r.Module, r.Version, strings.Join(r.Packages, ", "), r.Binary, reach,
+	)
+}
 
 // Assess returns the model's verdict for a single CVE. Identical requests
 // (same CVE, module, version, packages and reachability) are served from an
@@ -150,26 +226,31 @@ func (c *Client) Assess(ctx context.Context, r Request) (*Verdict, error) {
 		return v, nil
 	}
 
-	reach := r.Reachable
-	if reach == "" {
-		reach = "unknown"
+	raw, err := c.chat(ctx, promptFor(r.Ecosystem), userMessage(r))
+	if err != nil {
+		return nil, err
 	}
-	user := fmt.Sprintf(
-		"CVE: %s\nModule: %s@%s\nVulnerable packages: %s\nBinary: %s\nStatic analysis says the vulnerable code is: %s\nAssess exploitability.",
-		r.CVE, r.Module, r.Version, strings.Join(r.Packages, ", "), r.Binary, reach,
-	)
+	v, err := parseVerdict(raw)
+	if err != nil {
+		return nil, err
+	}
+	c.store(key, v)
+	return v, nil
+}
 
-	reqBody := chatRequest{
+// chat sends one system/user exchange and returns the model's reply text,
+// retrying the failures that are worth retrying.
+func (c *Client) chat(ctx context.Context, system, user string) (string, error) {
+	body, err := json.Marshal(chatRequest{
 		Model:       c.Model,
 		Temperature: 0,
 		Messages: []chatMessage{
-			{Role: "system", Content: systemPrompt},
+			{Role: "system", Content: system},
 			{Role: "user", Content: user},
 		},
-	}
-	body, err := json.Marshal(reqBody)
+	})
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
 	const maxAttempts = 6
@@ -180,7 +261,7 @@ func (c *Client) Assess(ctx context.Context, r Request) (*Verdict, error) {
 		if err != nil {
 			lastErr = err
 			if !sleepBeforeRetry(ctx, attempt, maxAttempts, 0) {
-				return nil, err
+				return "", err
 			}
 			continue
 		}
@@ -200,25 +281,20 @@ func (c *Client) Assess(ctx context.Context, r Request) (*Verdict, error) {
 			if isRetryable(res.StatusCode) && sleepBeforeRetry(ctx, attempt, maxAttempts, retryAfter(res)) {
 				continue
 			}
-			return nil, lastErr
+			return "", lastErr
 		}
 		if decodeErr != nil {
-			return nil, fmt.Errorf("github models: could not parse response: %s", snippet(raw))
+			return "", fmt.Errorf("github models: could not parse response: %s", snippet(raw))
 		}
 		if cr.Error != nil && cr.Error.Message != "" {
-			return nil, fmt.Errorf("github models: %s", cr.Error.Message)
+			return "", fmt.Errorf("github models: %s", cr.Error.Message)
 		}
 		if len(cr.Choices) == 0 {
-			return nil, fmt.Errorf("github models: empty response")
+			return "", fmt.Errorf("github models: empty response")
 		}
-		v, err := parseVerdict(cr.Choices[0].Message.Content)
-		if err != nil {
-			return nil, err
-		}
-		c.store(key, v)
-		return v, nil
+		return cr.Choices[0].Message.Content, nil
 	}
-	return nil, lastErr
+	return "", lastErr
 }
 
 // cacheKey canonicalizes a Request for verdict caching. It deliberately omits
@@ -227,7 +303,7 @@ func (c *Client) Assess(ctx context.Context, r Request) (*Verdict, error) {
 func cacheKey(r Request) string {
 	pkgs := append([]string(nil), r.Packages...)
 	sort.Strings(pkgs)
-	return strings.Join([]string{r.CVE, r.Module, r.Version, strings.Join(pkgs, ","), r.Reachable}, "|")
+	return strings.Join([]string{r.Ecosystem, r.CVE, r.Module, r.Version, strings.Join(pkgs, ","), r.Reachable}, "|")
 }
 
 func (c *Client) cached(key string) *Verdict {
