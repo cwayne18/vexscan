@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/cwayne18/vexscan/internal/ecosystem"
+	"github.com/cwayne18/vexscan/internal/modgraph"
 )
 
 // Methods name the deterministic test behind a status, and appear in the
@@ -17,6 +18,9 @@ const (
 	// MethodNoCode: the distribution is installed but its own manifest lists no
 	// importable code.
 	MethodNoCode = "pydist-no-code"
+	// MethodGraph: the static import graph, rooted at what the image runs, was
+	// resolved and consulted.
+	MethodGraph = "py-import-graph"
 )
 
 // pyCodeExts are the file extensions that carry executable Python.
@@ -32,15 +36,18 @@ var pyCodeExts = map[string]bool{
 // evaluator holds what every finding for one component needs.
 type evaluator struct {
 	st *state
+
+	// g is the import closure, or nil when no component in this run needed one
+	// and it was never built.
+	g *modgraph.Graph
 }
 
 // evaluate decides one advisory against one installed distribution.
 //
 // The order of the cases is the order of increasing cost and decreasing
 // certainty, the same order the OS plugin uses: whether the distribution
-// exists, and whether it ships code. The third question -- whether that code
-// is ever imported -- needs the import graph, and until it exists everything
-// that survives the first two reports linked.
+// exists, whether it ships code, and whether anything the image runs imports
+// that code.
 func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosystem.Finding {
 	f := ecosystem.Finding{
 		Module:  c.Name,
@@ -116,15 +123,161 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 		return f
 	}
 
-	f.Status = ecosystem.StatusLinked
-	f.Method = MethodInventory
 	f.Evidence = []ecosystem.Evidence{{
 		Origin: MethodInventory,
 		Detail: fmt.Sprintf("%s is installed in %s and ships %s",
 			c.Name, strings.Join(c.Locations, ", "), modules(code)),
 	}}
-	f.Reachability = "installed: the distribution's code is on disk and importable (whether anything imports it is not asserted)"
+
+	// Everything above answers "is the code here". What follows answers "does
+	// anything import it", which is the only remaining lever: Python strips no
+	// dead code at build time, so an installed distribution's modules are on
+	// disk whether or not they ever run.
+	return e.reachability(f, c, code)
+}
+
+// reachability applies the import graph to a distribution known to ship code.
+func (e evaluator) reachability(f ecosystem.Finding, c ecosystem.Component, code []string) ecosystem.Finding {
+	linked := func(reason string) ecosystem.Finding {
+		f.Status = ecosystem.StatusLinked
+		if f.Method == "" {
+			f.Method = MethodInventory
+		}
+		f.Reachability = reason
+		return f
+	}
+
+	if e.g == nil {
+		return linked("installed: the distribution's code is on disk and importable (whether anything imports it is not asserted)")
+	}
+
+	files := e.g.Classify(e.st.files())
+	if len(files.Module) == 0 {
+		// The graph can only speak about files it would recognise as modules.
+		// A distribution whose manifest lists none -- console scripts only, or
+		// a file list that was reconstructed and found nothing -- has no
+		// modules to be unreached, and silence there is not evidence.
+		f.Evidence = append(f.Evidence, ecosystem.Evidence{
+			Origin:   MethodGraph,
+			Detail:   fmt.Sprintf("%s ships code the import graph cannot address, so reachability was not decided for it", c.Name),
+			Blocking: true,
+		})
+		return linked("installed, with no importable module the graph could follow")
+	}
+
+	blockers := e.blockers()
+
+	switch {
+	case len(files.Reachable) > 0:
+		f.Method = MethodGraph
+		f.Evidence = append(f.Evidence, e.importedBy(files.Reachable)...)
+		f.Evidence = append(f.Evidence, blockers...)
+		return linked(fmt.Sprintf("imported: the closure from %s reaches %s (whether the vulnerable code is called is not asserted)",
+			e.entrypoint(), modules(files.Reachable)))
+
+	case len(blockers) > 0:
+		// Unreached, but something about this image makes the closure an
+		// incomplete account of what gets imported. Both halves are recorded:
+		// a reader can see that nothing reached it and see exactly what stopped
+		// that from being the answer.
+		f.Method = MethodGraph
+		f.Evidence = append(f.Evidence, ecosystem.Evidence{
+			Origin: MethodGraph,
+			Detail: fmt.Sprintf("nothing reachable from %s imports %s, but this image's imports cannot be fully resolved",
+				e.entrypoint(), c.Name),
+		})
+		f.Evidence = append(f.Evidence, blockers...)
+		return linked("installed but not reached by the import graph, which this image blocks from being conclusive")
+
+	case !e.st.filesKnown():
+		// The graph reached none of the modules the file list names -- but the
+		// list was reconstructed by guessing where the code lives, so the
+		// modules that were checked may not be the ones the distribution
+		// installs. That is the wrong place to conclude anything from.
+		f.Method = MethodGraph
+		f.Evidence = append(f.Evidence, ecosystem.Evidence{
+			Origin:   MethodGraph,
+			Detail:   fmt.Sprintf("nothing imports the modules found for %s, but it ships no RECORD, so which files it installs was inferred rather than read", c.Name),
+			Blocking: true,
+		})
+		return linked("installed but not reached, with no installation manifest to say that is the whole distribution")
+	}
+
+	f.Status = ecosystem.StatusNotInPath
+	f.Justification = "vulnerable_code_not_in_execute_path"
+	f.Method = MethodGraph
+	f.Evidence = append(f.Evidence, ecosystem.Evidence{
+		Origin: MethodGraph,
+		Detail: fmt.Sprintf("%s installs %s, and nothing reachable from %s imports any of them",
+			c.Name, modules(files.Module), e.entrypoint()),
+	})
 	return f
+}
+
+// blockers are the taints that stop this distribution's modules being declared
+// unimported: every global one, plus any scoped to a name it is imported by.
+func (e evaluator) blockers() []ecosystem.Evidence {
+	var out []ecosystem.Evidence
+	for _, t := range e.g.TaintsFor(e.st.importNames()) {
+		if !t.Blocking {
+			continue
+		}
+		out = append(out, ecosystem.Evidence{
+			Origin:   MethodGraph,
+			Detail:   t.Detail,
+			Blocking: true,
+		})
+	}
+	return out
+}
+
+// importedBy explains a reached module by naming what imports it.
+func (e evaluator) importedBy(reachable []string) []ecosystem.Evidence {
+	var out []ecosystem.Evidence
+	for _, p := range reachable {
+		n, ok := e.g.Node(p)
+		if !ok {
+			continue
+		}
+		switch {
+		case n.Root:
+			out = append(out, ecosystem.Evidence{
+				Origin: MethodGraph,
+				Detail: fmt.Sprintf("%s is %s", p, n.Why),
+			})
+		case len(n.ImportedBy) > 0:
+			out = append(out, ecosystem.Evidence{
+				Origin: MethodGraph,
+				Detail: fmt.Sprintf("%s is imported by %s", p, strings.Join(n.ImportedBy, ", ")),
+			})
+		}
+		// Three explanations establish reachability; a distribution like six is
+		// imported from hundreds of places and listing them all buries the
+		// finding.
+		if len(out) == 3 {
+			break
+		}
+	}
+	if len(out) == 0 {
+		out = append(out, ecosystem.Evidence{
+			Origin: MethodGraph,
+			Detail: fmt.Sprintf("the import graph reaches %s", modules(reachable)),
+		})
+	}
+	return out
+}
+
+// entrypoint names what the closure was rooted at, for evidence prose.
+func (e evaluator) entrypoint() string {
+	roots := e.g.Roots()
+	switch {
+	case len(roots) == 0:
+		return "the image entrypoint"
+	case len(roots) == 1:
+		return roots[0]
+	default:
+		return fmt.Sprintf("%s and %d other roots", roots[0], len(roots)-1)
+	}
 }
 
 // codeFiles picks the importable files out of an installed file list.

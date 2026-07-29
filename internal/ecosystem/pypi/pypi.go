@@ -1,13 +1,15 @@
 // Package pypi is the Python distribution ecosystem plugin.
 //
-// Its deterministic presence test today is the installed-distribution
-// inventory in internal/langdb: is the distribution installed at all, and does
-// it ship any importable code? That is a weaker test than the Go plugin's
-// pclntab or the OS plugin's DT_NEEDED closure, and deliberately so -- Python
-// removes nothing at build time, so "the code is on disk" is all an inventory
-// can honestly establish. The import graph that turns reachability into a
-// second lever lands on top of this, and until it does every installed
-// distribution an advisory applies to reports linked.
+// Its deterministic presence test has two halves. The first is the
+// installed-distribution inventory in internal/langdb: is the distribution
+// installed at all, and does it ship any importable code? That is a weaker
+// test than the Go plugin's pclntab, and deliberately so -- Python removes
+// nothing at build time, so "the code is on disk" is all an inventory can
+// honestly establish. The second is the static import closure rooted at what
+// the image runs (internal/modgraph over the Python Language in python.go),
+// which is this ecosystem's DT_NEEDED closure: it is the only lever left for
+// saying an installed distribution never runs, and it carries the same taints,
+// blocking a conclusion wherever the graph cannot honestly reach.
 package pypi
 
 import (
@@ -20,11 +22,23 @@ import (
 
 	"github.com/cwayne18/vexscan/internal/ecosystem"
 	"github.com/cwayne18/vexscan/internal/langdb"
+	"github.com/cwayne18/vexscan/internal/modgraph"
 	"github.com/cwayne18/vexscan/internal/target"
 )
 
 // Plugin analyzes the Python distributions installed in an image.
 type Plugin struct {
+	// Roots are extra entry modules for the import graph, from --roots. An
+	// image whose real command comes from outside its config -- a Kubernetes
+	// override, an init system, a shell wrapper -- has no entrypoint this
+	// plugin could otherwise find, and without one every distribution is
+	// escalated to a root.
+	Roots []string
+
+	// DynamicPolicy decides whether a reachable computed import blocks
+	// conclusions.
+	DynamicPolicy modgraph.DynamicPolicy
+
 	// Logf receives progress messages. Never nil after New.
 	Logf func(format string, args ...any)
 
@@ -34,7 +48,9 @@ type Plugin struct {
 
 // Options configure a Plugin.
 type Options struct {
-	Logf func(format string, args ...any)
+	Roots         []string
+	DynamicPolicy modgraph.DynamicPolicy
+	Logf          func(format string, args ...any)
 }
 
 // New returns a configured PyPI plugin.
@@ -43,7 +59,7 @@ func New(opts Options) *Plugin {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	return &Plugin{Logf: logf}
+	return &Plugin{Roots: opts.Roots, DynamicPolicy: opts.DynamicPolicy, Logf: logf}
 }
 
 // ID implements ecosystem.Plugin.
@@ -72,6 +88,16 @@ type state struct {
 	unreadable []string
 }
 
+// importNames are the names this distribution's code is imported by, which is
+// what a taint scoped to an import is compared against.
+func (s *state) importNames() []string {
+	var out []string
+	for _, p := range s.pkgs {
+		out = append(out, p.ImportNames...)
+	}
+	return out
+}
+
 // files returns every file the covered distributions install.
 func (s *state) files() []string {
 	var out []string
@@ -97,6 +123,10 @@ func (s *state) filesKnown() bool {
 type prepared struct {
 	img *target.Image
 	res langdb.Result
+
+	once     sync.Once
+	graph    *modgraph.Graph
+	graphErr error
 }
 
 // prepare finds and reads every site-packages directory in the image, once.
@@ -285,19 +315,48 @@ func aimedHere(p *Plugin, s ecosystem.Subject) bool {
 	return false
 }
 
+// graph builds the import closure, once.
+func (p *Plugin) graph(pr *prepared) (*modgraph.Graph, error) {
+	pr.once.Do(func() {
+		p.Logf("Building the Python import graph...")
+		lang := newPython(pr.img, pr.res, p.Logf)
+		pr.graph, pr.graphErr = modgraph.Build(pr.img.FS, lang, modgraph.Options{
+			Roots:   p.Roots,
+			Dynamic: p.DynamicPolicy,
+			Logf:    p.Logf,
+		})
+	})
+	return pr.graph, pr.graphErr
+}
+
 // AnalyzeImage implements ecosystem.ImageAnalyzer.
 func (p *Plugin) AnalyzeImage(_ context.Context, img *target.Image, items []ecosystem.WorkItem) ([]ecosystem.Finding, error) {
-	if _, err := p.prepare(img); err != nil {
+	pr, err := p.prepare(img)
+	if err != nil {
 		return nil, err
 	}
 
-	var out []ecosystem.Finding
+	// The closure costs a walk of every reachable source file, so a run that
+	// resolves to nothing but distributions the image does not have should not
+	// pay for it.
+	var g *modgraph.Graph
 	for _, item := range items {
 		st, ok := item.Component.Extra.(*state)
 		if !ok {
 			return nil, fmt.Errorf("pypi: component %s was not produced by this plugin", item.Component.Key())
 		}
-		ev := evaluator{st: st}
+		if !st.absent {
+			if g, err = p.graph(pr); err != nil {
+				return nil, err
+			}
+			break
+		}
+	}
+
+	var out []ecosystem.Finding
+	for _, item := range items {
+		st := item.Component.Extra.(*state)
+		ev := evaluator{st: st, g: g}
 		for _, req := range item.Requests() {
 			out = append(out, ev.evaluate(item.Component, req))
 		}

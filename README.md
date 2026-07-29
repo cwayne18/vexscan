@@ -283,8 +283,9 @@ not be read, `2` the command line was wrong.
 | `--version` | *(auto)* | Override the module version (image mode) instead of reading build info |
 | `--go-version` | *(auto)* | Pin the Go toolchain for `--repo`, e.g. `1.24.0` (useful with `golang:stdlib`) |
 | `--osv-ecosystem` | *(auto)* | Override the OSV ecosystem derived from os-release, e.g. `Debian:12` |
-| `--roots` | | Extra entrypoints for the closure; repeatable |
+| `--roots` | | Extra entrypoints for the closures — shared libraries and language imports; repeatable |
 | `--dlopen-policy` | `taint` | `taint` (block conclusions) or `assume-none` |
+| `--dynamic-import-policy` | `taint` | The same knob for a language import graph's computed imports. These are far more common than `dlopen`, so `assume-none` discards much more |
 | `--trust-import-absence` | `false` | Let a missing dynamic import conclude `not_in_execute_path` (weaker than it looks) |
 | `--os` / `--arch` | `linux` / `amd64` | Image platform variant to pull |
 | `--llm` | `false` | Consult a GitHub Models LLM on genuinely-affected CVEs |

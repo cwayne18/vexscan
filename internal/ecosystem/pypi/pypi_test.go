@@ -2,12 +2,14 @@ package pypi
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/cwayne18/vexscan/internal/ecosystem"
+	"github.com/cwayne18/vexscan/internal/modgraph"
 	"github.com/cwayne18/vexscan/internal/osv"
 	"github.com/cwayne18/vexscan/internal/target"
 )
@@ -41,8 +43,13 @@ func record(paths ...string) string {
 // distribution.
 func statuses(t *testing.T, img *target.Image, subjects []ecosystem.Subject) map[string]ecosystem.Finding {
 	t.Helper()
+	return statusesWith(t, img, subjects, Options{})
+}
+
+func statusesWith(t *testing.T, img *target.Image, subjects []ecosystem.Subject, opts Options) map[string]ecosystem.Finding {
+	t.Helper()
 	ctx := context.Background()
-	p := New(Options{})
+	p := New(opts)
 
 	ok, err := p.DetectImage(ctx, img)
 	if err != nil {
@@ -238,6 +245,163 @@ func TestDetectSkipsAnImageWithNoPython(t *testing.T) {
 	}
 	if ok {
 		t.Error("the plugin claimed to apply to an image with no site-packages")
+	}
+}
+
+// appTree is an image whose entrypoint imports one installed distribution and
+// not the other. It is the shape every reachability row of the status table is
+// decided on.
+func appTree(main string, extra map[string]string) map[string]string {
+	files := map[string]string{
+		"/usr/lib/python3.12/os.py":                     "",
+		"/app/main.py":                                  main,
+		sp + "/PyYAML-6.0.1.dist-info/METADATA":         "Name: PyYAML\nVersion: 6.0.1\n",
+		sp + "/PyYAML-6.0.1.dist-info/top_level.txt":    "yaml\n",
+		sp + "/PyYAML-6.0.1.dist-info/RECORD":           record("yaml/__init__.py", "yaml/loader.py"),
+		sp + "/yaml/__init__.py":                        "from .loader import Loader\n",
+		sp + "/yaml/loader.py":                          "",
+		sp + "/requests-2.31.0.dist-info/METADATA":      "Name: requests\nVersion: 2.31.0\n",
+		sp + "/requests-2.31.0.dist-info/top_level.txt": "requests\n",
+		sp + "/requests-2.31.0.dist-info/RECORD":        record("requests/__init__.py"),
+		sp + "/requests/__init__.py":                    "",
+	}
+	for k, v := range extra {
+		files[k] = v
+	}
+	return files
+}
+
+// evidence renders a finding's evidence for an assertion message, and reports
+// whether any of it is blocking.
+func evidence(f ecosystem.Finding) (string, bool) {
+	var b strings.Builder
+	blocking := false
+	for _, e := range f.Evidence {
+		fmt.Fprintf(&b, "\n  [%s blocking=%v] %s", e.Origin, e.Blocking, e.Detail)
+		blocking = blocking || e.Blocking
+	}
+	return b.String(), blocking
+}
+
+// The two rows the graph adds: reached is still linked, and unreached with
+// nothing blocking is the only not_in_execute_path this ecosystem can reach.
+func TestImportGraphDecidesReachability(t *testing.T) {
+	img := pyImage(t, appTree("import yaml\n", nil))
+	img.Config = target.ImageConfig{Entrypoint: []string{"python3", "/app/main.py"}}
+
+	got := statuses(t, img, []ecosystem.Subject{{Raw: "all"}})
+
+	f := got["requests"]
+	if f.Status != ecosystem.StatusNotInPath || f.Method != MethodGraph {
+		det, _ := evidence(f)
+		t.Fatalf("requests = %s/%s, want not_in_execute_path/%s:%s", f.Status, f.Method, MethodGraph, det)
+	}
+	if f.Justification != "vulnerable_code_not_in_execute_path" {
+		t.Errorf("requests justification = %q", f.Justification)
+	}
+	if _, blocking := evidence(f); blocking {
+		det, _ := evidence(f)
+		t.Errorf("a concluded finding must carry no blocking evidence:%s", det)
+	}
+
+	f = got["pyyaml"]
+	if f.Status != ecosystem.StatusLinked || f.Method != MethodGraph {
+		det, _ := evidence(f)
+		t.Fatalf("pyyaml = %s/%s, want linked/%s:%s", f.Status, f.Method, MethodGraph, det)
+	}
+	// Reaching a distribution is only useful if the finding says what reached
+	// it, so the reader can check the claim.
+	det, _ := evidence(f)
+	if !strings.Contains(det, "/app/main.py") {
+		t.Errorf("nothing in the evidence names what imports pyyaml:%s", det)
+	}
+}
+
+// A computed import in the application's own code is unscoped: it could load
+// anything, so nothing installed can be declared unreached.
+func TestABlockingTaintStopsTheUnreachedConclusion(t *testing.T) {
+	files := appTree("import yaml\nimport importlib\nmod = importlib.import_module(chosen)\n", map[string]string{
+		"/usr/lib/python3.12/importlib/__init__.py": "",
+	})
+	img := pyImage(t, files)
+	img.Config = target.ImageConfig{Entrypoint: []string{"python3", "/app/main.py"}}
+
+	f := statuses(t, img, []ecosystem.Subject{{Raw: "all"}})["requests"]
+	if f.Status != ecosystem.StatusLinked || f.Method != MethodGraph {
+		det, _ := evidence(f)
+		t.Fatalf("requests = %s/%s, want linked/%s:%s", f.Status, f.Method, MethodGraph, det)
+	}
+	det, blocking := evidence(f)
+	if !blocking {
+		t.Errorf("the taint that withheld the conclusion is not in the evidence:%s", det)
+	}
+	// Both halves are recorded: nothing reached it, and why that is not the
+	// answer.
+	if !strings.Contains(det, "nothing reachable from") {
+		t.Errorf("the unreached half of the finding is missing:%s", det)
+	}
+
+	// --dynamic-import-policy=assume-none is the user taking that risk on.
+	f = statusesWith(t, img, []ecosystem.Subject{{Raw: "all"}}, Options{DynamicPolicy: modgraph.DynamicAssumeNone})["requests"]
+	if f.Status != ecosystem.StatusNotInPath {
+		det, _ := evidence(f)
+		t.Errorf("with assume-none requests = %s, want not_in_execute_path:%s", f.Status, det)
+	}
+}
+
+// Silence about a file list that was guessed is not evidence: the modules the
+// graph checked may not be the ones the distribution installs.
+func TestReconstructedFileListCannotSayUnreached(t *testing.T) {
+	files := appTree("import yaml\n", map[string]string{
+		// METADATA and top_level.txt but no RECORD: the file list is
+		// reconstructed by walking the import name's directory.
+		sp + "/mystery-1.0.dist-info/METADATA":      "Name: mystery\nVersion: 1.0\n",
+		sp + "/mystery-1.0.dist-info/top_level.txt": "mystery\n",
+		sp + "/mystery/__init__.py":                 "",
+	})
+	img := pyImage(t, files)
+	img.Config = target.ImageConfig{Entrypoint: []string{"python3", "/app/main.py"}}
+
+	got := statuses(t, img, []ecosystem.Subject{{Raw: "all"}})
+
+	f := got["mystery"]
+	if f.Status != ecosystem.StatusLinked {
+		det, _ := evidence(f)
+		t.Fatalf("mystery = %s/%s, want linked: an inferred file list cannot prove a negative:%s", f.Status, f.Method, det)
+	}
+	det, blocking := evidence(f)
+	if !blocking {
+		t.Errorf("the missing manifest is not recorded as blocking:%s", det)
+	}
+	// The distribution beside it, with a manifest and the same reachability,
+	// still concludes: the block is about provenance, not about the image.
+	if r := got["requests"]; r.Status != ecosystem.StatusNotInPath {
+		t.Errorf("requests = %s, want not_in_execute_path", r.Status)
+	}
+}
+
+// --roots is how an image whose real command comes from outside its config
+// still gets a closure rather than a global escalation.
+func TestExtraRootsFeedTheImportGraph(t *testing.T) {
+	img := pyImage(t, appTree("import yaml\n", nil))
+	img.Config = target.ImageConfig{Entrypoint: []string{"/bin/sh", "-c", "exec python3 /app/main.py"}}
+
+	// Without help, a foreign entrypoint escalates every installed module to a
+	// root, so nothing is unreached and nothing concludes.
+	if f := statuses(t, img, []ecosystem.Subject{{Raw: "all"}})["requests"]; f.Status != ecosystem.StatusLinked {
+		t.Errorf("requests = %s, want linked behind the foreign-entrypoint taint", f.Status)
+	}
+
+	f := statusesWith(t, img, []ecosystem.Subject{{Raw: "all"}}, Options{Roots: []string{"/app/main.py"}})["requests"]
+	if f.Status != ecosystem.StatusNotInPath || f.Method != MethodGraph {
+		det, _ := evidence(f)
+		t.Fatalf("with --roots requests = %s/%s, want not_in_execute_path/%s:%s", f.Status, f.Method, MethodGraph, det)
+	}
+	// The conclusion rests on the user's assertion, so the finding has to name
+	// what it was rooted at.
+	det, _ := evidence(f)
+	if !strings.Contains(det, "/app/main.py") {
+		t.Errorf("the evidence does not name the root the conclusion rests on:%s", det)
 	}
 }
 

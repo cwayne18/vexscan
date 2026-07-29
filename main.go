@@ -16,13 +16,14 @@ import (
 	"github.com/cwayne18/vexscan/internal/analyze"
 	"github.com/cwayne18/vexscan/internal/elfgraph"
 	"github.com/cwayne18/vexscan/internal/gist"
+	"github.com/cwayne18/vexscan/internal/modgraph"
 )
 
 func main() {
 	var packages, ecosystems, roots stringList
 	flag.Var(&packages, "package", "package to check: a purl, an ecosystem:name shorthand (deb:openssl, golang:golang.org/x/net), or a bare name resolved against the inventory; repeatable")
 	flag.Var(&ecosystems, "ecosystem", "restrict the scan to these ecosystems (golang, os, pypi, or a distro family like debian); repeatable, default all")
-	flag.Var(&roots, "roots", "extra entrypoints for the shared-library closure, for an image whose real command comes from outside its config; repeatable")
+	flag.Var(&roots, "roots", "extra entrypoints for the reachability closures (shared libraries and language imports), for an image whose real command comes from outside its config; repeatable")
 	var (
 		image      = flag.String("image", "", "container image reference to inspect (mutually exclusive with --repo)")
 		repo       = flag.String("repo", "", "git source repo to analyze via govulncheck source mode, e.g. github.com/rancher/rancher (mutually exclusive with --image)")
@@ -38,6 +39,7 @@ func main() {
 		arch       = flag.String("arch", "amd64", "image architecture variant to pull (image mode)")
 		osvEco     = flag.String("osv-ecosystem", "", "override the OSV ecosystem derived from the image's os-release, e.g. 'Debian:12'")
 		dlopen     = flag.String("dlopen-policy", "taint", "what a reachable dlopen does to the closure: taint (block conclusions) or assume-none")
+		dynamic    = flag.String("dynamic-import-policy", "taint", "what an import of a computed name does to a language import graph: taint (block conclusions) or assume-none; these are far more common than dlopen, so assume-none discards much more")
 		mine       = flag.Bool("mine-advisories", false, "with --llm, let the model read each advisory's prose for symbols to check against the image")
 		trustAbs   = flag.Bool("trust-import-absence", false, "let a missing dynamic import of the vulnerable symbol conclude not_in_execute_path (see README: this is weaker than it looks)")
 		useLLM     = flag.Bool("llm", false, "consult a GitHub Models LLM on genuinely-affected CVEs for exploitability")
@@ -84,6 +86,10 @@ func main() {
 	if err != nil {
 		fail("%v", err)
 	}
+	dynamicPolicy, err := modgraph.ParseDynamicPolicy(*dynamic)
+	if err != nil {
+		fail("%v", err)
+	}
 
 	logf := func(format string, args ...any) {
 		if !*quiet {
@@ -122,6 +128,7 @@ func main() {
 		OSVEcosystem:       *osvEco,
 		Roots:              roots,
 		DlopenPolicy:       dlopenPolicy,
+		DynamicPolicy:      dynamicPolicy,
 		GoVersion:          *goVersion,
 		UseLLM:             *useLLM,
 		LLMModel:           *llmModel,

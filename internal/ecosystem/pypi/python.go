@@ -216,9 +216,29 @@ func (p *python) Roots(extra []string) ([]modgraph.Root, []modgraph.Taint, error
 	roots = append(roots, p.pthRoots...)
 	taints = append(taints, p.pthTaints...)
 
+	var explicit bool
 	for _, e := range extra {
 		for _, f := range p.explicitRoot(e) {
 			roots = append(roots, modgraph.Root{Path: f, Why: "named by --roots", Kind: modgraph.RootExplicit})
+			explicit = true
+		}
+	}
+
+	// --roots exists for exactly the image the entrypoint taints describe: the
+	// real command comes from outside the config. Having asked the user what
+	// runs, answering "what runs is unknown" anyway would make the flag
+	// unable to change any conclusion, which is the same as not having it. The
+	// assertion is recorded rather than dropped, so a reader can see that the
+	// closure rests on it -- and it demotes only the two taints about the
+	// entrypoint. Nothing the code itself does is affected.
+	if explicit {
+		for i, t := range taints {
+			switch t.Kind {
+			case modgraph.TaintNoEntrypoint, modgraph.TaintForeignEntrypoint:
+				taints[i].Detail = t.Detail + ", so the closure was rooted at --roots instead"
+				taints[i].Blocking = false
+				taints[i].Global = false
+			}
 		}
 	}
 

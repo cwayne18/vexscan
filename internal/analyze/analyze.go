@@ -22,6 +22,7 @@ import (
 	"github.com/cwayne18/vexscan/internal/elfgraph"
 	"github.com/cwayne18/vexscan/internal/image"
 	"github.com/cwayne18/vexscan/internal/llm"
+	"github.com/cwayne18/vexscan/internal/modgraph"
 	"github.com/cwayne18/vexscan/internal/osv"
 	"github.com/cwayne18/vexscan/internal/source"
 	"github.com/cwayne18/vexscan/internal/target"
@@ -69,11 +70,15 @@ type Options struct {
 	OS      string
 	Arch    string
 
-	// Roots are extra entrypoints for the OS plugin's shared-library closure,
-	// for an image whose real command comes from outside its config.
+	// Roots are extra entrypoints for the reachability closures -- the OS
+	// plugin's shared libraries and the language plugins' import graphs -- for
+	// an image whose real command comes from outside its config.
 	Roots []string
 	// DlopenPolicy decides whether a reachable dlopen blocks conclusions.
 	DlopenPolicy elfgraph.DlopenPolicy
+	// DynamicPolicy decides whether a reachable import of a computed name
+	// blocks conclusions. It is the import graph's DlopenPolicy.
+	DynamicPolicy modgraph.DynamicPolicy
 	// OSVEcosystem overrides the OSV ecosystem derived from the image's
 	// os-release, for the distributions os-release does not determine. It is
 	// not the same knob as Ecosystems, which chooses which plugins run.
@@ -185,7 +190,9 @@ func registryFor(opts Options) *ecosystem.Registry {
 			Logf:               opts.Logf,
 		}),
 		pypi.New(pypi.Options{
-			Logf: opts.Logf,
+			Roots:         opts.Roots,
+			DynamicPolicy: opts.DynamicPolicy,
+			Logf:          opts.Logf,
 		}),
 	)
 }
