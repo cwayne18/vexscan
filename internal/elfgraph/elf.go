@@ -159,6 +159,11 @@ func ReadELF(fsys target.RootFS, name string) (*Info, error) {
 	return info, nil
 }
 
+// SymbolReader loads an object's dynamic symbol table. Like Reader it is a
+// function type, so that a caller's validation logic can be exercised without
+// real ELF objects to hold the symbols.
+type SymbolReader func(fsys target.RootFS, name string) (defined, undefined []string, err error)
+
 // Symbols reports the dynamic symbols an object defines and the ones it expects
 // someone else to define.
 //

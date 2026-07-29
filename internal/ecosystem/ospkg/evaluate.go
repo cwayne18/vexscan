@@ -23,13 +23,15 @@ const (
 
 // evaluator holds what every finding for one component needs.
 type evaluator struct {
-	g    *elfgraph.Graph
-	st   *state
-	logf func(string, ...any)
+	g     *elfgraph.Graph
+	st    *state
+	sym   *symbolCache
+	trust bool // --trust-import-absence
+	logf  func(string, ...any)
 }
 
-func (p *Plugin) evaluator(g *elfgraph.Graph, st *state) evaluator {
-	return evaluator{g: g, st: st, logf: p.Logf}
+func (p *Plugin) evaluator(g *elfgraph.Graph, st *state, sym *symbolCache) evaluator {
+	return evaluator{g: g, st: st, sym: sym, trust: p.TrustImportAbsence, logf: p.Logf}
 }
 
 // evaluate decides one advisory against one installed package.
@@ -83,16 +85,51 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 
 	blockers := e.blockers(files.ELF)
 
+	// The mined-symbol layer runs before the closure is consulted, because it
+	// answers a stronger question: whether the vulnerable function is in this
+	// build at all. It is gated on there being no blocking taint for the same
+	// reason the closure is -- a statically linked entrypoint may hold a copy
+	// of the vulnerable code, and the package's own export tables say nothing
+	// about what is inside it.
+	if sym := e.checkSymbols(req.Advisory, req.Hints, files.ELF); sym.Usable {
+		f.Evidence = append(f.Evidence, ecosystem.Evidence{Origin: MethodMined, Detail: sym.Why})
+		switch {
+		case len(sym.Defined) == 0 && len(blockers) == 0:
+			f.Status = ecosystem.StatusNotPresent
+			f.Justification = "vulnerable_code_not_present"
+			f.Method = MethodDynsymAbsent
+			return f
+
+		case len(sym.Defined) > 0 && len(sym.Importers) == 0 && len(files.Reachable) > 0:
+			f.Evidence = append(f.Evidence, ecosystem.Evidence{
+				Origin: MethodImportAbsent,
+				Detail: fmt.Sprintf("no object the closure reaches imports %s",
+					strings.Join(sym.Defined, ", ")),
+			})
+			if e.trust && len(blockers) == 0 {
+				f.Status = ecosystem.StatusNotInPath
+				f.Justification = "vulnerable_code_not_in_execute_path"
+				f.Method = MethodImportAbsent
+				return f
+			}
+		}
+	} else if req.Hints != nil {
+		// Validation rejected the hints. Recording that is the point: a reader
+		// must be able to tell "the model found nothing usable" from "the
+		// model was never asked".
+		f.Evidence = append(f.Evidence, ecosystem.Evidence{Origin: MethodMined, Detail: sym.Why})
+	}
+
 	switch {
 	case len(files.Reachable) == 0 && len(blockers) == 0:
 		f.Status = ecosystem.StatusNotInPath
 		f.Justification = "vulnerable_code_not_in_execute_path"
 		f.Method = MethodClosure
-		f.Evidence = []ecosystem.Evidence{{
+		f.Evidence = append(f.Evidence, ecosystem.Evidence{
 			Origin: MethodClosure,
 			Detail: fmt.Sprintf("%s installs %s, and the dynamic linker would load none of them starting from %s",
 				pkg.Name, objects(files.ELF), e.entrypoint()),
-		}}
+		})
 
 	case len(files.Reachable) == 0:
 		// Unreachable, but something about this image makes the closure an
@@ -101,17 +138,19 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 		// what stopped that from being the answer.
 		f.Status = ecosystem.StatusLinked
 		f.Method = MethodClosure
-		f.Evidence = append([]ecosystem.Evidence{{
+		f.Evidence = append(f.Evidence, ecosystem.Evidence{
 			Origin: MethodClosure,
 			Detail: fmt.Sprintf("%s installs %s and the closure reaches none of them, but this image cannot be closed over",
 				pkg.Name, objects(files.ELF)),
-		}}, blockers...)
+		})
+		f.Evidence = append(f.Evidence, blockers...)
 		f.Reachability = "installed but not reached by the shared-library closure, which this image blocks from being conclusive"
 
 	default:
 		f.Status = ecosystem.StatusLinked
 		f.Method = MethodClosure
-		f.Evidence = append(e.loadedBy(files.Reachable), blockers...)
+		f.Evidence = append(f.Evidence, e.loadedBy(files.Reachable)...)
+		f.Evidence = append(f.Evidence, blockers...)
 		f.Reachability = fmt.Sprintf("loaded: the dynamic linker reaches %s from %s (whether the vulnerable function is called is not asserted)",
 			objects(files.Reachable), e.entrypoint())
 	}

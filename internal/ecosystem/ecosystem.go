@@ -74,6 +74,25 @@ type ImageAnalyzer interface {
 	AnalyzeImage(ctx context.Context, img *target.Image, items []WorkItem) ([]Finding, error)
 }
 
+// HintConsumer is implemented by a plugin that can do something with hints
+// mined from an advisory's prose.
+//
+// It exists so the orchestrator does not pay for mining nobody will read. The
+// Go plugin has pclntab, which answers presence outright; asking a model to
+// guess at symbol names for it would be a round trip per advisory spent on an
+// answer the plugin discards. A plugin that says yes here is also promising to
+// validate what it receives — an unvalidated hint is indistinguishable from a
+// hallucination, and must never reach a status.
+type HintConsumer interface {
+	WantsHints() bool
+}
+
+// UsesHints reports whether a plugin opted into advisory mining.
+func UsesHints(p Plugin) bool {
+	c, ok := p.(HintConsumer)
+	return ok && c.WantsHints()
+}
+
 // SourceAnalyzer analyzes a source checkout in two phases rather than three.
 //
 // The split differs from ImageAnalyzer on purpose. In image mode the
@@ -179,6 +198,17 @@ type WorkItem struct {
 	// still produce a finding, recorded undetermined — otherwise a --cves scan
 	// silently drops the ids it could not map, which reads as "not affected".
 	Requested []string
+
+	// Hints are the identifiers an LLM claimed each advisory's text names,
+	// keyed by the advisory's canonical id. Present only under
+	// --mine-advisories, and nil the rest of the time.
+	//
+	// Nothing here is a fact. A plugin must validate a hint against something
+	// it can observe in the artifact before letting it support a
+	// not_affected-flavored status, and an unvalidatable hint must be inert:
+	// it is indistinguishable from an invented one. The validation lives in
+	// the plugins because they are what hold the evidence to do it with.
+	Hints map[string]*llm.Hints
 }
 
 // Request is one advisory to decide on, paired with the id the caller asked
@@ -186,6 +216,10 @@ type WorkItem struct {
 type Request struct {
 	ID       string
 	Advisory *osv.Advisory
+
+	// Hints are the mined identifiers for this advisory, or nil. See
+	// WorkItem.Hints for what a plugin owes them.
+	Hints *llm.Hints
 }
 
 // Requests turns a WorkItem's requested-id list into concrete lookups.
@@ -199,7 +233,8 @@ func (w WorkItem) Requests() []Request {
 	if len(w.Requested) > 0 {
 		out := make([]Request, 0, len(w.Requested))
 		for _, id := range w.Requested {
-			out = append(out, Request{ID: id, Advisory: w.Advisories[id]})
+			adv := w.Advisories[id]
+			out = append(out, Request{ID: id, Advisory: adv, Hints: w.hintsFor(adv)})
 		}
 		return out
 	}
@@ -210,10 +245,20 @@ func (w WorkItem) Requests() []Request {
 			continue
 		}
 		seen[adv.ID] = true
-		out = append(out, Request{ID: adv.ID, Advisory: adv})
+		out = append(out, Request{ID: adv.ID, Advisory: adv, Hints: w.hintsFor(adv)})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
+}
+
+// hintsFor looks up an advisory's mined hints. Hints are keyed by the
+// advisory's own id, not by the alias the caller asked under, so a --cves scan
+// naming a CVE finds the hints mined for the GHSA record behind it.
+func (w WorkItem) hintsFor(adv *osv.Advisory) *llm.Hints {
+	if adv == nil || w.Hints == nil {
+		return nil
+	}
+	return w.Hints[adv.ID]
 }
 
 // Evidence is one recorded observation behind a finding.

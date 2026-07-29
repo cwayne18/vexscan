@@ -41,10 +41,28 @@ type Plugin struct {
 	// not determine -- SUSE keys advisories on the support phase.
 	Ecosystem string
 
+	// Mine reports that this plugin wants advisory prose mined for it. It only
+	// says what the orchestrator should spend; the validation that decides
+	// whether a mined hint may matter lives in checkSymbols regardless.
+	Mine bool
+
+	// TrustImportAbsence lets an unimported symbol decide a status.
+	//
+	// Off by default, and the default is the honest one: the absence of a
+	// direct dynamic import does not prove the vulnerable function is never
+	// called, because it is usually called from inside the same library that
+	// defines it, where no relocation records it. Turning this on asserts that
+	// the risk is acceptable; leaving it off records the observation and
+	// changes nothing.
+	TrustImportAbsence bool
+
 	// ReadELF loads ELF metadata; nil means the real debug/elf reader. It is
 	// the same injection point elfgraph.Options exposes, so the status table
 	// can be exercised against a filesystem holding no ELF objects at all.
 	ReadELF elfgraph.Reader
+
+	// ReadSymbols loads dynamic symbol tables; nil means elfgraph.Symbols.
+	ReadSymbols elfgraph.SymbolReader
 
 	// Logf receives progress messages. Never nil after New.
 	Logf func(format string, args ...any)
@@ -55,11 +73,14 @@ type Plugin struct {
 
 // Options configure a Plugin.
 type Options struct {
-	Roots        []string
-	DlopenPolicy elfgraph.DlopenPolicy
-	Ecosystem    string
-	ReadELF      elfgraph.Reader
-	Logf         func(format string, args ...any)
+	Roots              []string
+	DlopenPolicy       elfgraph.DlopenPolicy
+	Ecosystem          string
+	Mine               bool
+	TrustImportAbsence bool
+	ReadELF            elfgraph.Reader
+	ReadSymbols        elfgraph.SymbolReader
+	Logf               func(format string, args ...any)
 }
 
 // New returns a configured OS plugin.
@@ -69,11 +90,14 @@ func New(opts Options) *Plugin {
 		logf = func(string, ...any) {}
 	}
 	return &Plugin{
-		Roots:        opts.Roots,
-		DlopenPolicy: opts.DlopenPolicy,
-		Ecosystem:    opts.Ecosystem,
-		ReadELF:      opts.ReadELF,
-		Logf:         logf,
+		Roots:              opts.Roots,
+		DlopenPolicy:       opts.DlopenPolicy,
+		Ecosystem:          opts.Ecosystem,
+		Mine:               opts.Mine,
+		TrustImportAbsence: opts.TrustImportAbsence,
+		ReadELF:            opts.ReadELF,
+		ReadSymbols:        opts.ReadSymbols,
+		Logf:               logf,
 	}
 }
 
@@ -84,6 +108,15 @@ func (p *Plugin) ID() string { return "os" }
 // image is derived from its os-release at detect time; these are the families
 // --ecosystem can name.
 func (p *Plugin) Ecosystems() []string { return osv.Families() }
+
+// WantsHints implements ecosystem.HintConsumer.
+//
+// Distro OSV records give a fixed version and nothing about what inside the
+// package is vulnerable, so for an image the only thing left to check is
+// whether the named function was compiled into this build. That is what the
+// mined symbols are for -- after checkSymbols has established they came from
+// the advisory and from this package's namespace.
+func (p *Plugin) WantsHints() bool { return p.Mine }
 
 // state is the plugin-private payload on each Component.
 type state struct {
@@ -112,6 +145,27 @@ type prepared struct {
 	once     sync.Once
 	graph    *elfgraph.Graph
 	graphErr error
+
+	// syms is only populated under --mine-advisories.
+	syms *symbolCache
+}
+
+// symbolCache holds the dynamic symbol tables read during one image's scan.
+//
+// glibc alone exports a couple of thousand symbols, and the importer scan
+// walks every reachable object once per package being checked, so without this
+// the same tables would be parsed over and over inside a single run.
+type symbolCache struct {
+	fsys target.RootFS
+	read elfgraph.SymbolReader
+
+	mu    sync.Mutex
+	cache map[string]symbolEntry
+}
+
+type symbolEntry struct {
+	defined, undefined []string
+	err                error
 }
 
 // prepare reads the package databases and the distribution identity, once per
@@ -129,7 +183,11 @@ func (p *Plugin) prepare(img *target.Image) (*prepared, error) {
 		return p.prep, nil
 	}
 
-	pr := &prepared{img: img}
+	pr := &prepared{img: img, syms: &symbolCache{
+		fsys:  img.FS,
+		read:  p.ReadSymbols,
+		cache: map[string]symbolEntry{},
+	}}
 	found := false
 	for _, r := range pkgdb.Readers() {
 		if _, ok := r.Detect(img.FS); ok {
@@ -345,7 +403,7 @@ func (p *Plugin) AnalyzeImage(_ context.Context, img *target.Image, items []ecos
 	var out []ecosystem.Finding
 	for _, item := range items {
 		st := item.Component.Extra.(*state)
-		ev := p.evaluator(g, st)
+		ev := p.evaluator(g, st, pr.syms)
 		for _, req := range item.Requests() {
 			out = append(out, ev.evaluate(item.Component, req))
 		}

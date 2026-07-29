@@ -72,6 +72,16 @@ type Options struct {
 	LLMModel string
 	Token    string
 
+	// MineAdvisories lets the model read each advisory's prose for symbol,
+	// soname and filename leads, which plugins then validate against the image.
+	// Requires UseLLM.
+	MineAdvisories bool
+	// TrustImportAbsence lets the OS plugin conclude not_in_execute_path when
+	// nothing the closure reaches imports the vulnerable symbol. Off by default:
+	// the vulnerable function is usually called from inside the same library,
+	// where no dynamic import records it.
+	TrustImportAbsence bool
+
 	// Logf receives progress messages (may be nil).
 	Logf func(format string, args ...any)
 }
@@ -131,10 +141,12 @@ func registryFor(opts Options) *ecosystem.Registry {
 			Logf:            opts.Logf,
 		}),
 		ospkg.New(ospkg.Options{
-			Roots:        opts.Roots,
-			DlopenPolicy: opts.DlopenPolicy,
-			Ecosystem:    opts.Ecosystem,
-			Logf:         opts.Logf,
+			Roots:              opts.Roots,
+			DlopenPolicy:       opts.DlopenPolicy,
+			Ecosystem:          opts.Ecosystem,
+			Mine:               opts.MineAdvisories && opts.UseLLM,
+			TrustImportAbsence: opts.TrustImportAbsence,
+			Logf:               opts.Logf,
 		}),
 	)
 }
@@ -186,8 +198,9 @@ func runImage(ctx context.Context, opts Options) (*Result, error) {
 	// run with nothing at all to report -- returned as an error, so that an
 	// unreadable package database can never be mistaken for a clean image.
 	applied, failed := 0, 0
+	mine := newMiner(opts, llmClient)
 	for _, a := range analyzers {
-		er, findings := runAnalyzer(ctx, a, img, subjects, resolver, opts.CVEs, logf)
+		er, findings := runAnalyzer(ctx, a, img, subjects, resolver, mine, opts.CVEs, logf)
 		if er == nil {
 			continue // did not apply
 		}
@@ -213,7 +226,7 @@ func runImage(ctx context.Context, opts Options) (*Result, error) {
 
 // runAnalyzer runs one plugin's three phases, returning nil when the plugin
 // does not apply to the image at all.
-func runAnalyzer(ctx context.Context, a ecosystem.ImageAnalyzer, img *target.Image, subjects []ecosystem.Subject, resolver *advisoryResolver, cves []string, logf func(string, ...any)) (*ecosystem.EcosystemResult, []Finding) {
+func runAnalyzer(ctx context.Context, a ecosystem.ImageAnalyzer, img *target.Image, subjects []ecosystem.Subject, resolver *advisoryResolver, mine *miner, cves []string, logf func(string, ...any)) (*ecosystem.EcosystemResult, []Finding) {
 	er := &ecosystem.EcosystemResult{ID: a.ID()}
 
 	ok, err := a.DetectImage(ctx, img)
@@ -236,7 +249,12 @@ func runAnalyzer(ctx context.Context, a ecosystem.ImageAnalyzer, img *target.Ima
 	er.Components = len(components)
 	er.Ecosystems = distinctEcosystems(components)
 
-	findings, err := a.AnalyzeImage(ctx, img, resolver.workItems(ctx, components, cves, logf))
+	items := resolver.workItems(ctx, components, cves, logf)
+	if ecosystem.UsesHints(a) {
+		mine.apply(ctx, a.ID(), items)
+	}
+
+	findings, err := a.AnalyzeImage(ctx, img, items)
 	if err != nil {
 		er.Error = fmt.Sprintf("analyze: %v", err)
 		return er, nil
