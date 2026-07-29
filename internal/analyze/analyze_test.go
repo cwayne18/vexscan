@@ -270,19 +270,3 @@ func TestResolveRequests(t *testing.T) {
 		}
 	})
 }
-
-func TestRelPath(t *testing.T) {
-	tests := []struct {
-		root, path, want string
-	}{
-		{"/tmp/x", "/tmp/x/usr/bin/app", "/usr/bin/app"},
-		{"/tmp/x", "/tmp/xusr/bin/app", "/usr/bin/app"}, // no separator: still trimmed
-		{"/tmp/x", "/elsewhere/app", "/elsewhere/app"},  // outside root: unchanged
-		{"/tmp/x", "/tmp/x", "/tmp/x"},                  // equal length: unchanged
-	}
-	for _, tt := range tests {
-		if got := relPath(tt.root, tt.path); got != tt.want {
-			t.Errorf("relPath(%q, %q) = %q, want %q", tt.root, tt.path, got, tt.want)
-		}
-	}
-}

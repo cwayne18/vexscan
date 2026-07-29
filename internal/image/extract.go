@@ -22,6 +22,8 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+
+	"github.com/cwayne18/vexscan/internal/target"
 )
 
 // Overlay whiteout markers. An opaque marker hides everything the lower layers
@@ -30,22 +32,6 @@ const (
 	whiteoutPrefix = ".wh."
 	whiteoutOpaque = ".wh..wh..opq"
 )
-
-// maxSymlinkHops bounds symlink resolution so a layer containing a link cycle
-// cannot hang extraction.
-const maxSymlinkHops = 64
-
-// Config is the subset of the OCI image configuration vexscan needs. Entrypoint
-// and Cmd are what root the ELF reachability closure: without them there is
-// nothing to walk the shared-library graph from, and every library in the image
-// has to be treated as potentially loaded.
-type Config struct {
-	Entrypoint []string `json:"entrypoint,omitempty"`
-	Cmd        []string `json:"cmd,omitempty"`
-	Env        []string `json:"env,omitempty"`
-	WorkingDir string   `json:"working_dir,omitempty"`
-	User       string   `json:"user,omitempty"`
-}
 
 // Extractor flattens container images.
 type Extractor struct {
@@ -81,11 +67,12 @@ type configFile struct {
 	} `json:"config"`
 }
 
-// Extract copies image into a temporary OCI dir with skopeo and untars every
+// Extract copies ref into a temporary OCI dir with skopeo and untars every
 // layer, in order, into dest. Later layers overwrite earlier ones and their
 // whiteouts delete from earlier ones, yielding the final image filesystem
-// state. It returns the image configuration.
-func (e *Extractor) Extract(ctx context.Context, image, dest string) (*Config, error) {
+// state. The returned Image owns no resources: dest stays the caller's to
+// clean up.
+func (e *Extractor) Extract(ctx context.Context, ref, dest string) (*target.Image, error) {
 	if _, err := exec.LookPath(e.SkopeoPath); err != nil {
 		return nil, fmt.Errorf("skopeo not found on PATH: %w", err)
 	}
@@ -98,7 +85,7 @@ func (e *Extractor) Extract(ctx context.Context, image, dest string) (*Config, e
 
 	cmd := exec.CommandContext(ctx, e.SkopeoPath, "copy", "-q",
 		"--override-os", e.OS, "--override-arch", e.Arch,
-		"docker://"+image, "dir:"+raw)
+		"docker://"+ref, "dir:"+raw)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("skopeo copy failed: %w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -136,7 +123,13 @@ func (e *Extractor) Extract(ctx context.Context, image, dest string) (*Config, e
 	// A missing or unparseable config is not fatal: the rest of the analysis
 	// still works, callers just lose the closure roots and have to treat the
 	// whole image as potentially reachable.
-	return readConfig(blobPath(raw, m.Config.Digest)), nil
+	return &target.Image{
+		Ref:    ref,
+		OS:     e.OS,
+		Arch:   e.Arch,
+		Config: readConfig(blobPath(raw, m.Config.Digest)),
+		FS:     target.NewDirFS(destAbs),
+	}, nil
 }
 
 // blobPath maps a "sha256:<hex>" descriptor digest to the blob file skopeo
@@ -149,21 +142,21 @@ func blobPath(raw, digest string) string {
 	return filepath.Join(raw, parts[1])
 }
 
-// readConfig parses an image config blob, returning an empty Config when it is
-// absent or malformed.
-func readConfig(blob string) *Config {
+// readConfig parses an image config blob, returning a zero ImageConfig when it
+// is absent or malformed.
+func readConfig(blob string) target.ImageConfig {
 	if blob == "" {
-		return &Config{}
+		return target.ImageConfig{}
 	}
 	data, err := os.ReadFile(blob)
 	if err != nil {
-		return &Config{}
+		return target.ImageConfig{}
 	}
 	var cf configFile
 	if err := json.Unmarshal(data, &cf); err != nil {
-		return &Config{}
+		return target.ImageConfig{}
 	}
-	return &Config{
+	return target.ImageConfig{
 		Entrypoint: cf.Config.Entrypoint,
 		Cmd:        cf.Config.Cmd,
 		Env:        cf.Config.Env,
@@ -207,14 +200,14 @@ func untar(blob, destAbs string) error {
 		// Whiteouts delete from the layers below instead of adding anything.
 		// Check the opaque marker first: it also carries the .wh. prefix.
 		if base == whiteoutOpaque {
-			if p, err := resolve(destAbs, dir); err == nil {
+			if p, err := target.Resolve(destAbs, dir); err == nil {
 				clearDir(p)
 			}
 			continue
 		}
 		if strings.HasPrefix(base, whiteoutPrefix) {
 			victim := path.Join(dir, strings.TrimPrefix(base, whiteoutPrefix))
-			if p, err := resolveParent(destAbs, victim); err == nil {
+			if p, err := target.ResolveParent(destAbs, victim); err == nil {
 				_ = os.RemoveAll(p)
 			}
 			continue
@@ -222,26 +215,26 @@ func untar(blob, destAbs string) error {
 
 		// Resolve the parent chain but not the final component, so an entry
 		// replaces an existing symlink rather than writing through it.
-		target, err := resolveParent(destAbs, name)
+		dst, err := target.ResolveParent(destAbs, name)
 		if err != nil {
 			continue
 		}
 
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := makeDir(target); err != nil {
+			if err := makeDir(dst); err != nil {
 				continue
 			}
 		case tar.TypeReg:
-			if err := writeFile(tr, target, os.FileMode(hdr.Mode)); err != nil {
+			if err := writeFile(tr, dst, os.FileMode(hdr.Mode)); err != nil {
 				continue
 			}
 		case tar.TypeSymlink:
-			if err := writeSymlink(hdr.Linkname, target); err != nil {
+			if err := writeSymlink(hdr.Linkname, dst); err != nil {
 				continue
 			}
 		case tar.TypeLink:
-			if err := writeHardlink(destAbs, hdr.Linkname, target); err != nil {
+			if err := writeHardlink(destAbs, hdr.Linkname, dst); err != nil {
 				continue
 			}
 		default:
@@ -274,69 +267,6 @@ func decompress(f *os.File) (io.Reader, error) {
 	return f, nil
 }
 
-// resolve maps an image-absolute path to a host path inside root, following
-// symlinks that already exist in the extracted tree but never escaping root.
-// Absolute link targets are re-rooted, exactly as they would resolve inside the
-// running container, and ".." is clamped at root. This is what makes extraction
-// safe against a layer that symlinks a directory onto the host filesystem.
-func resolve(root, name string) (string, error) {
-	rest := strings.Split(path.Clean("/"+name), "/")
-	var resolved []string
-	hops := 0
-
-	for len(rest) > 0 {
-		comp := rest[0]
-		rest = rest[1:]
-
-		switch comp {
-		case "", ".":
-			continue
-		case "..":
-			if len(resolved) > 0 {
-				resolved = resolved[:len(resolved)-1]
-			}
-			continue
-		}
-
-		candidate := filepath.Join(root, filepath.Join(resolved...), comp)
-		fi, err := os.Lstat(candidate)
-		if err != nil || fi.Mode()&os.ModeSymlink == 0 {
-			resolved = append(resolved, comp)
-			continue
-		}
-
-		hops++
-		if hops > maxSymlinkHops {
-			return "", fmt.Errorf("symlink loop resolving %q", name)
-		}
-		link, err := os.Readlink(candidate)
-		if err != nil {
-			return "", err
-		}
-		if path.IsAbs(link) {
-			resolved = resolved[:0]
-		}
-		rest = append(strings.Split(path.Clean(link), "/"), rest...)
-	}
-	return filepath.Join(root, filepath.Join(resolved...)), nil
-}
-
-// resolveParent resolves everything but the last component of name. Used for
-// entry targets so that writing over an existing symlink replaces the link
-// itself, matching overlay semantics.
-func resolveParent(root, name string) (string, error) {
-	clean := path.Clean("/" + name)
-	dir, base := path.Split(clean)
-	parent, err := resolve(root, dir)
-	if err != nil {
-		return "", err
-	}
-	if base == "" {
-		return parent, nil
-	}
-	return filepath.Join(parent, base), nil
-}
-
 // clearDir removes everything inside dir, implementing an opaque whiteout.
 func clearDir(dir string) {
 	entries, err := os.ReadDir(dir)
@@ -348,36 +278,36 @@ func clearDir(dir string) {
 	}
 }
 
-// makeDir creates target as a directory, replacing a non-directory of the same
+// makeDir creates dst as a directory, replacing a non-directory of the same
 // name left behind by a lower layer.
-func makeDir(target string) error {
-	if fi, err := os.Lstat(target); err == nil && !fi.IsDir() {
-		_ = os.Remove(target)
+func makeDir(dst string) error {
+	if fi, err := os.Lstat(dst); err == nil && !fi.IsDir() {
+		_ = os.Remove(dst)
 	}
-	return os.MkdirAll(target, 0o755)
+	return os.MkdirAll(dst, 0o755)
 }
 
-// replaceExisting clears the way for a new entry at target.
-func replaceExisting(target string) error {
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+// replaceExisting clears the way for a new entry at dst.
+func replaceExisting(dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
-	if fi, err := os.Lstat(target); err == nil {
+	if fi, err := os.Lstat(dst); err == nil {
 		if fi.IsDir() {
-			return os.RemoveAll(target)
+			return os.RemoveAll(dst)
 		}
-		return os.Remove(target)
+		return os.Remove(dst)
 	}
 	return nil
 }
 
-func writeFile(r io.Reader, target string, mode os.FileMode) error {
-	if err := replaceExisting(target); err != nil {
+func writeFile(r io.Reader, dst string, mode os.FileMode) error {
+	if err := replaceExisting(dst); err != nil {
 		return err
 	}
 	// Force owner-write so a read-only mode in the layer doesn't stop a later
 	// layer from replacing the file, or cleanup from removing it.
-	out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode.Perm()|0o200)
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode.Perm()|0o200)
 	if err != nil {
 		return err
 	}
@@ -386,34 +316,34 @@ func writeFile(r io.Reader, target string, mode os.FileMode) error {
 	return err
 }
 
-// writeSymlink recreates a symlink verbatim. The raw target is preserved rather
-// than resolved, because soname resolution needs to see what the link actually
-// says (libssl.so.3 -> libssl.so.3.0.11).
-func writeSymlink(linkname, target string) error {
-	if err := replaceExisting(target); err != nil {
+// writeSymlink recreates a symlink verbatim. The raw link target is preserved
+// rather than resolved, because soname resolution needs to see what the link
+// actually says (libssl.so.3 -> libssl.so.3.0.11).
+func writeSymlink(linkname, dst string) error {
+	if err := replaceExisting(dst); err != nil {
 		return err
 	}
-	return os.Symlink(linkname, target)
+	return os.Symlink(linkname, dst)
 }
 
 // writeHardlink materializes a hardlink. It prefers a real link to avoid
 // duplicating large binaries, and falls back to a copy when the filesystem
 // refuses.
-func writeHardlink(root, linkname, target string) error {
-	src, err := resolveParent(root, linkname)
+func writeHardlink(root, linkname, dst string) error {
+	src, err := target.ResolveParent(root, linkname)
 	if err != nil {
 		return err
 	}
 	if _, err := os.Lstat(src); err != nil {
-		return err // link target never appeared; skip rather than invent a file
+		return err // link dst never appeared; skip rather than invent a file
 	}
-	if err := replaceExisting(target); err != nil {
+	if err := replaceExisting(dst); err != nil {
 		return err
 	}
-	if err := os.Link(src, target); err == nil {
+	if err := os.Link(src, dst); err == nil {
 		return nil
 	}
-	return copyFile(src, target)
+	return copyFile(src, dst)
 }
 
 func copyFile(src, dst string) error {

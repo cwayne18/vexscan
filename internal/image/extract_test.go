@@ -330,54 +330,6 @@ func TestUntarReadOnlyFileCanBeReplaced(t *testing.T) {
 	}
 }
 
-func TestResolve(t *testing.T) {
-	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "usr/lib"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("usr/lib", filepath.Join(root, "lib")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("/usr/lib", filepath.Join(root, "lib64")); err != nil {
-		t.Fatal(err)
-	}
-
-	tests := []struct {
-		name, in, want string
-	}{
-		{"plain path", "/usr/lib", filepath.Join(root, "usr/lib")},
-		{"relative symlink", "/lib/libc.so", filepath.Join(root, "usr/lib/libc.so")},
-		{"absolute symlink is re-rooted", "/lib64/libc.so", filepath.Join(root, "usr/lib/libc.so")},
-		{"dotdot is clamped at root", "/../../etc/passwd", filepath.Join(root, "etc/passwd")},
-		{"dotdot within tree", "/usr/lib/../lib/x", filepath.Join(root, "usr/lib/x")},
-		{"dot segments", "/./usr/./lib", filepath.Join(root, "usr/lib")},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := resolve(root, tt.in)
-			if err != nil {
-				t.Fatalf("resolve(%q): %v", tt.in, err)
-			}
-			if got != tt.want {
-				t.Errorf("resolve(%q) = %q, want %q", tt.in, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestResolveDetectsLoop(t *testing.T) {
-	root := t.TempDir()
-	if err := os.Symlink("b", filepath.Join(root, "a")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("a", filepath.Join(root, "b")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := resolve(root, "/a/file"); err == nil {
-		t.Error("expected a symlink loop error")
-	}
-}
-
 func TestReadConfig(t *testing.T) {
 	t.Run("parses entrypoint cmd and env", func(t *testing.T) {
 		blob := filepath.Join(t.TempDir(), "config")
@@ -409,7 +361,7 @@ func TestReadConfig(t *testing.T) {
 	// A malformed or missing config must degrade to "no roots known" rather
 	// than failing the scan.
 	t.Run("missing blob yields empty config", func(t *testing.T) {
-		if got := readConfig(filepath.Join(t.TempDir(), "nope")); got == nil || len(got.Entrypoint) != 0 {
+		if got := readConfig(filepath.Join(t.TempDir(), "nope")); len(got.Entrypoint) != 0 {
 			t.Errorf("got %+v, want empty", got)
 		}
 	})
@@ -418,12 +370,12 @@ func TestReadConfig(t *testing.T) {
 		if err := os.WriteFile(blob, []byte("not json"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if got := readConfig(blob); got == nil || len(got.Entrypoint) != 0 {
+		if got := readConfig(blob); len(got.Entrypoint) != 0 {
 			t.Errorf("got %+v, want empty", got)
 		}
 	})
 	t.Run("empty digest yields empty config", func(t *testing.T) {
-		if got := readConfig(""); got == nil || len(got.Cmd) != 0 {
+		if got := readConfig(""); len(got.Cmd) != 0 {
 			t.Errorf("got %+v, want empty", got)
 		}
 	})

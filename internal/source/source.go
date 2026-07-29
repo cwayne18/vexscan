@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/cwayne18/vexscan/internal/envx"
+	"github.com/cwayne18/vexscan/internal/target"
 )
 
 // Statement is one parsed govulncheck OpenVEX statement.
@@ -36,39 +37,85 @@ func (s Statement) IDs() []string {
 	return append([]string{s.GoID}, s.Aliases...)
 }
 
-// CloneAndScan clones repoArg (optionally at ref) and runs govulncheck source
-// mode from subPath within the checkout. The checkout is removed before return.
-// If repoArg points at an existing local directory (or a file:// URL) it is
-// scanned in place instead of being cloned. goVersion, when non-empty, pins the
-// Go toolchain used for analysis (GOTOOLCHAIN=go<goVersion>), which matters for
-// standard-library findings since those depend on the toolchain version.
-func CloneAndScan(ctx context.Context, repoArg, ref, subPath, goVersion string, logf func(string, ...any)) ([]Statement, error) {
+// Checkout makes repoArg available on disk and describes it as a target.Source.
+// If repoArg points at an existing local directory (or a file:// URL) it is used
+// in place; otherwise it is shallow-cloned at ref. The returned cleanup removes
+// whatever Checkout created and is a no-op for a local checkout, so it is always
+// safe to defer.
+func Checkout(ctx context.Context, repoArg, ref, subPath string, logf func(string, ...any)) (*target.Source, func(), error) {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
+	noop := func() {}
 
 	if local := localPath(repoArg); local != "" {
-		workdir := joinSub(local, subPath)
-		logf("Scanning local checkout %s...", workdir)
-		logf("Running govulncheck (source mode)...")
-		return govulncheckSource(ctx, workdir, goVersion)
+		logf("Scanning local checkout %s...", joinSub(local, subPath))
+		return newSource(repoArg, local, subPath), noop, nil
 	}
 
 	dir, err := os.MkdirTemp("", "vexscan-src-")
 	if err != nil {
-		return nil, err
+		return nil, noop, err
 	}
-	defer os.RemoveAll(dir)
+	cleanup := func() { _ = os.RemoveAll(dir) }
 
 	cloneURL := normalizeRepo(repoArg)
 	logf("Cloning %s%s...", cloneURL, refNote(ref))
 	if err := clone(ctx, cloneURL, ref, dir); err != nil {
-		return nil, fmt.Errorf("clone: %w", err)
+		cleanup()
+		return nil, noop, fmt.Errorf("clone: %w", err)
 	}
 
-	workdir := joinSub(dir, subPath)
+	src := newSource(repoArg, dir, subPath)
+	src.Rev = headRev(ctx, dir)
+	return src, cleanup, nil
+}
+
+// newSource assembles a Source for a checkout already on disk at root.
+func newSource(ref, root, subPath string) *target.Source {
+	sub := strings.TrimPrefix(subPath, "/")
+	if sub == "" {
+		sub = "."
+	}
+	return &target.Source{
+		Ref:    ref,
+		Dir:    joinSub(root, subPath),
+		Subdir: sub,
+		FS:     target.NewDirFS(root),
+	}
+}
+
+// headRev reports the checked-out commit, best effort: it is provenance for the
+// report, never something the analysis depends on.
+func headRev(ctx context.Context, dir string) string {
+	cmd := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "HEAD")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// Scan runs govulncheck source mode over an already-checked-out tree.
+// goVersion, when non-empty, pins the Go toolchain used for analysis
+// (GOTOOLCHAIN=go<goVersion>), which matters for standard-library findings since
+// those depend on the toolchain version.
+func Scan(ctx context.Context, src *target.Source, goVersion string, logf func(string, ...any)) ([]Statement, error) {
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
 	logf("Running govulncheck (source mode) — this downloads the module graph and may take a while...")
-	return govulncheckSource(ctx, workdir, goVersion)
+	return govulncheckSource(ctx, src.Dir, goVersion)
+}
+
+// CloneAndScan checks out repoArg and scans it, discarding the checkout.
+func CloneAndScan(ctx context.Context, repoArg, ref, subPath, goVersion string, logf func(string, ...any)) ([]Statement, error) {
+	src, cleanup, err := Checkout(ctx, repoArg, ref, subPath, logf)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	return Scan(ctx, src, goVersion, logf)
 }
 
 // localPath returns a filesystem directory for repoArg when it refers to a

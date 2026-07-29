@@ -2,6 +2,8 @@ package source
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -93,5 +95,66 @@ func TestNormalizeGoVersion(t *testing.T) {
 		if got := normalizeGoVersion(in); got != want {
 			t.Errorf("normalizeGoVersion(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestCheckoutLocal(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "pkg", "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "pkg", "sub", "go.mod"), []byte("module x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name, subPath, wantSubdir, wantDir string
+	}{
+		{"top level", "", ".", root},
+		{"explicit dot", ".", ".", root},
+		{"subdirectory", "pkg/sub", "pkg/sub", filepath.Join(root, "pkg", "sub")},
+		{"leading slash is stripped", "/pkg/sub", "pkg/sub", filepath.Join(root, "pkg", "sub")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src, cleanup, err := Checkout(context.Background(), root, "", tt.subPath, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cleanup()
+
+			if src.Dir != tt.wantDir {
+				t.Errorf("Dir = %q, want %q", src.Dir, tt.wantDir)
+			}
+			if src.Subdir != tt.wantSubdir {
+				t.Errorf("Subdir = %q, want %q", src.Subdir, tt.wantSubdir)
+			}
+			// FS is rooted at the checkout, not the module subdirectory, so a
+			// plugin can look at repo-level files regardless of --repo-path.
+			if src.FS.Root() != root {
+				t.Errorf("FS.Root() = %q, want %q", src.FS.Root(), root)
+			}
+		})
+	}
+}
+
+// TestCheckoutLocalCleanupDoesNotDelete is the property that keeps `--repo .`
+// from destroying the user's working tree: nothing Checkout did not create may
+// be removed.
+func TestCheckoutLocalCleanupDoesNotDelete(t *testing.T) {
+	root := t.TempDir()
+	canary := filepath.Join(root, "keep")
+	if err := os.WriteFile(canary, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, cleanup, err := Checkout(context.Background(), "file://"+root, "", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup()
+
+	if _, err := os.Stat(canary); err != nil {
+		t.Fatalf("cleanup deleted a local checkout: %v", err)
 	}
 }

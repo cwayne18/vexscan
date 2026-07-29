@@ -16,6 +16,7 @@ import (
 	"github.com/cwayne18/vexscan/internal/llm"
 	"github.com/cwayne18/vexscan/internal/osv"
 	"github.com/cwayne18/vexscan/internal/source"
+	"github.com/cwayne18/vexscan/internal/target"
 )
 
 // Status classifies a (binary/repo, CVE) pair.
@@ -123,12 +124,13 @@ func runImage(ctx context.Context, opts Options) (*Result, error) {
 	logf("Extracting %s (%s/%s)...", opts.Image, opts.OS, opts.Arch)
 	ex := image.NewExtractor()
 	ex.OS, ex.Arch = opts.OS, opts.Arch
-	if _, err := ex.Extract(ctx, opts.Image, dest); err != nil {
+	img, err := ex.Extract(ctx, opts.Image, dest)
+	if err != nil {
 		return nil, fmt.Errorf("extract image: %w", err)
 	}
 
 	logf("Scanning for Go binaries...")
-	bins := binscan.FindGoBinaries(dest)
+	bins := binscan.FindGoBinaries(img.FS.Root())
 	logf("Found %d Go binaries.", len(bins))
 
 	osvClient := osv.NewClient()
@@ -152,7 +154,7 @@ func runImage(ctx context.Context, opts Options) (*Result, error) {
 		if version == "" {
 			continue // module not linked into this binary and no override given
 		}
-		rel := relPath(dest, bin.Path)
+		rel := target.Rel(img.FS.Root(), bin.Path)
 
 		advMap, ok := osvCache[version]
 		if !ok {
@@ -456,15 +458,4 @@ func inNotAffected(set map[string]struct{}, ids ...string) bool {
 		}
 	}
 	return false
-}
-
-func relPath(root, p string) string {
-	if len(p) > len(root) && p[:len(root)] == root {
-		trimmed := p[len(root):]
-		if len(trimmed) > 0 && trimmed[0] == '/' {
-			return trimmed
-		}
-		return "/" + trimmed
-	}
-	return p
 }
