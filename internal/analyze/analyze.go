@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/cwayne18/vexscan/internal/binscan"
+	"github.com/cwayne18/vexscan/internal/ecosystem"
 	"github.com/cwayne18/vexscan/internal/image"
 	"github.com/cwayne18/vexscan/internal/llm"
 	"github.com/cwayne18/vexscan/internal/osv"
@@ -19,33 +20,21 @@ import (
 	"github.com/cwayne18/vexscan/internal/target"
 )
 
-// Status classifies a (binary/repo, CVE) pair.
-type Status string
-
-const (
-	StatusNotPresent   Status = "not_present"         // vulnerable package absent (pclntab / govulncheck source)
-	StatusNotInPath    Status = "not_in_execute_path" // linked but govulncheck says unreachable
-	StatusLinked       Status = "linked"              // vulnerable package genuinely linked (image mode)
-	StatusReachable    Status = "reachable"           // vulnerable symbol is called (source mode)
-	StatusUndetermined Status = "undetermined"        // could not resolve a mapping
+// The finding vocabulary lives in internal/ecosystem, which is what the plugins
+// produce. These aliases keep the existing analyze.Finding / analyze.Status
+// spelling working for callers and keep the JSON output byte-identical.
+type (
+	Finding = ecosystem.Finding
+	Status  = ecosystem.Status
 )
 
-// Finding is the per-binary (or per-repo), per-CVE result.
-type Finding struct {
-	Binary        string       `json:"binary,omitempty"`
-	Module        string       `json:"module"`
-	Version       string       `json:"version"`
-	CVE           string       `json:"cve"`
-	GoID          string       `json:"go_id,omitempty"`
-	Packages      []string     `json:"packages,omitempty"`
-	Granularity   string       `json:"granularity,omitempty"` // package | module
-	Stripped      bool         `json:"stripped"`
-	Status        Status       `json:"status"`
-	Method        string       `json:"method,omitempty"`
-	Justification string       `json:"justification,omitempty"`
-	Reason        string       `json:"reason,omitempty"` // for undetermined
-	LLM           *llm.Verdict `json:"llm,omitempty"`
-}
+const (
+	StatusNotPresent   = ecosystem.StatusNotPresent
+	StatusNotInPath    = ecosystem.StatusNotInPath
+	StatusLinked       = ecosystem.StatusLinked
+	StatusReachable    = ecosystem.StatusReachable
+	StatusUndetermined = ecosystem.StatusUndetermined
+)
 
 // Options configure a run. Set exactly one of Image or Repo.
 type Options struct {
