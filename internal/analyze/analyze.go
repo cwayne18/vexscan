@@ -123,7 +123,7 @@ func runImage(ctx context.Context, opts Options) (*Result, error) {
 	logf("Extracting %s (%s/%s)...", opts.Image, opts.OS, opts.Arch)
 	ex := image.NewExtractor()
 	ex.OS, ex.Arch = opts.OS, opts.Arch
-	if err := ex.Extract(ctx, opts.Image, dest); err != nil {
+	if _, err := ex.Extract(ctx, opts.Image, dest); err != nil {
 		return nil, fmt.Errorf("extract image: %w", err)
 	}
 
