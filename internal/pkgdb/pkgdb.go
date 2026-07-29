@@ -30,10 +30,19 @@ const (
 
 // Package is one installed package.
 type Package struct {
-	Format  Format `json:"format"`
-	Name    string `json:"name"`
+	Format Format `json:"format"`
+	Name   string `json:"name"`
+	// Version is the version string to compare against OSV ranges. For rpm
+	// this is the full EVR with the epoch always present ("0:1.43.0-5.el9_3"),
+	// because that is how the Red Hat, Rocky and AlmaLinux records are
+	// written. See rpmEVR.
 	Version string `json:"version"`
 	Arch    string `json:"arch,omitempty"`
+
+	// Epoch is the rpm epoch, broken out so a consumer can reconstruct the
+	// epoch-free version for the ecosystems whose records omit it (Azure
+	// Linux). Zero and meaningless for deb and apk.
+	Epoch int `json:"epoch,omitempty"`
 
 	// Source is the source (dpkg "Source:", apk "o:", rpm SOURCERPM) package
 	// this was built from, when the database records one and it differs from
@@ -99,7 +108,7 @@ type Reader interface {
 
 // Readers returns every backend, in a stable order.
 func Readers() []Reader {
-	return []Reader{&Deb{}, &APK{}}
+	return []Reader{&Deb{}, &APK{}, &RPM{}}
 }
 
 // Result is what one reader found.
