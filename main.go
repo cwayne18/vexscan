@@ -32,7 +32,7 @@ func main() {
 		arch       = flag.String("arch", "amd64", "image architecture variant to pull (image mode)")
 		useLLM     = flag.Bool("llm", false, "consult a GitHub Models LLM on genuinely-affected CVEs for exploitability")
 		llmModel   = flag.String("llm-model", "openai/gpt-4o", "GitHub Models model id for --llm")
-		format     = flag.String("format", "text", "output format: text or json")
+		format     = flag.String("format", "text", "output format: text, json, or inventory (list the image's OS packages and exit)")
 		out        = flag.String("out", "", "write output to this file instead of stdout")
 		gistFlag   = flag.Bool("gist", false, "also upload the output to a public GitHub gist and print its URL (needs GITHUB_TOKEN/GH_TOKEN with gist scope)")
 		gistSecret = flag.Bool("gist-secret", false, "with --gist, create a secret (unlisted) gist instead of a public one")
@@ -41,7 +41,11 @@ func main() {
 	flag.Usage = usage
 	flag.Parse()
 
-	if *module == "" {
+	// --format inventory answers "what is installed in this image", which
+	// needs no subject and no advisory lookup.
+	inventoryMode := *format == "inventory"
+
+	if *module == "" && !inventoryMode {
 		fmt.Fprintln(os.Stderr, "error: --module is required")
 		flag.Usage()
 		os.Exit(2)
@@ -62,6 +66,17 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	if inventoryMode {
+		runInventory(ctx, analyze.Options{
+			Image: *image,
+			Repo:  *repo,
+			OS:    *goos,
+			Arch:  *arch,
+			Logf:  logf,
+		}, *out, logf)
+		return
+	}
 
 	res, err := analyze.Run(ctx, analyze.Options{
 		Image:     *image,
@@ -118,6 +133,67 @@ func main() {
 		logf("Uploaded report to gist")
 		fmt.Println(url)
 	}
+}
+
+// runInventory handles --format inventory, which lists the image's OS packages
+// and exits without resolving a single advisory.
+func runInventory(ctx context.Context, opts analyze.Options, out string, logf func(string, ...any)) {
+	inv, err := analyze.Inventory(ctx, opts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	rendered := renderInventory(inv)
+	if out != "" {
+		if err := os.WriteFile(out, []byte(rendered), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		logf("Wrote %s", out)
+		return
+	}
+	fmt.Print(rendered)
+}
+
+func renderInventory(inv *analyze.InventoryResult) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "vexscan inventory for %s\n", inv.Target)
+
+	switch {
+	case inv.OS == nil:
+		b.WriteString("os:        unknown (no readable /etc/os-release)\n")
+	default:
+		name := inv.OS.PrettyName
+		if name == "" {
+			name = strings.TrimSpace(inv.OS.ID + " " + inv.OS.VersionID)
+		}
+		fmt.Fprintf(&b, "os:        %s\n", name)
+		if inv.OS.Ecosystem != "" {
+			fmt.Fprintf(&b, "ecosystem: %s\n", inv.OS.Ecosystem)
+		} else {
+			// Worth shouting about: with no ecosystem there is nothing to
+			// query, and a scan would come back empty rather than clean.
+			fmt.Fprintf(&b, "ecosystem: UNRESOLVED - %s\n", inv.OS.EcosystemError)
+		}
+	}
+
+	if len(inv.Databases) == 0 {
+		b.WriteString("\nNo dpkg, apk or rpm database found.\n")
+		return b.String()
+	}
+
+	fmt.Fprintf(&b, "packages:  %d\n", inv.Packages())
+	for _, db := range inv.Databases {
+		fmt.Fprintf(&b, "\n%s (%d packages, %s)\n", db.Format, len(db.Packages), db.DB)
+		for _, p := range db.Packages {
+			// The queried names are shown because they are the part a user is
+			// most likely to want to check: OSV keys Debian and Alpine on the
+			// source package, not the one the database lists.
+			names := strings.Join(p.OSVNames(), ", ")
+			fmt.Fprintf(&b, "  %-32s %-28s %-8s %s\n", p.Name, p.Version, p.Arch, names)
+		}
+	}
+	return b.String()
 }
 
 // uploadGist pushes the rendered report to a GitHub gist and returns its URL.
@@ -258,6 +334,9 @@ Examples:
   # Standard library CVEs (module "stdlib")
   vexscan --image myorg/app:latest --module stdlib --cves CVE-2025-22870
   vexscan --repo github.com/rancher/rancher --module stdlib --go-version 1.24.0
+
+  # List the OS packages in an image, with the names OSV will be queried by
+  vexscan --image debian:12 --format inventory
 
   # Share the report as a public gist (needs GITHUB_TOKEN/GH_TOKEN with gist scope)
   vexscan --image rancher/hardened-kubernetes:v1.30.1 --module golang.org/x/net \
