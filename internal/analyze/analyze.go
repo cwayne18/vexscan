@@ -44,12 +44,26 @@ const (
 
 // Options configure a run. Set exactly one of Image or Repo.
 type Options struct {
-	Image   string
-	Repo    string // git repo (source mode); mutually exclusive with Image
-	Ref     string // branch/tag/commit for Repo
-	Path    string // module subdirectory within Repo (default ".")
-	Module  string
-	CVEs    []string // optional filter; empty means "all advisories for the module version"
+	Image string
+	Repo  string // git repo (source mode); mutually exclusive with Image
+	Ref   string // branch/tag/commit for Repo
+	Path  string // module subdirectory within Repo (default ".")
+
+	// Packages are the raw --package selectors: purls, ecosystem:name
+	// shorthand, or bare names resolved against whatever inventory contains
+	// them. See ecosystem.ParseSubject.
+	Packages []string
+	// Module is the deprecated --module flag, equivalent to one
+	// --package golang:MODULE.
+	Module string
+	// All requests everything each plugin can inventory, rather than a named
+	// list of packages.
+	All bool
+	// Ecosystems restricts which plugins run (--ecosystem). Empty runs them
+	// all. Naming one nothing handles is an error, not an empty result.
+	Ecosystems []string
+
+	CVEs    []string // optional filter; empty means "every advisory that applies"
 	Version string   // optional override of the detected module version (image mode)
 	OS      string
 	Arch    string
@@ -59,9 +73,10 @@ type Options struct {
 	Roots []string
 	// DlopenPolicy decides whether a reachable dlopen blocks conclusions.
 	DlopenPolicy elfgraph.DlopenPolicy
-	// Ecosystem overrides the OSV ecosystem derived from the image's
-	// os-release, for the distributions os-release does not determine.
-	Ecosystem string
+	// OSVEcosystem overrides the OSV ecosystem derived from the image's
+	// os-release, for the distributions os-release does not determine. It is
+	// not the same knob as Ecosystems, which chooses which plugins run.
+	OSVEcosystem string
 
 	// GoVersion optionally pins the Go toolchain for repo-mode analysis
 	// (e.g. "1.24.0"). Mainly useful with --module stdlib, whose findings depend
@@ -119,6 +134,18 @@ func (r *Result) Failed() bool {
 	return false
 }
 
+// Validate reports whether the options describe a coherent scan, touching
+// neither the network nor the disk. It lets the caller tell a bad command line
+// from a failed scan, and report the former before the pull rather than after.
+//
+// It cannot catch everything: a bare --package name is resolved against the
+// inventory, so whether it names anything is only knowable once the target has
+// been read.
+func Validate(opts Options) error {
+	_, _, err := plan(opts)
+	return err
+}
+
 // Run dispatches to image or source-repo analysis.
 func Run(ctx context.Context, opts Options) (*Result, error) {
 	if opts.Logf == nil {
@@ -151,7 +178,7 @@ func registryFor(opts Options) *ecosystem.Registry {
 		ospkg.New(ospkg.Options{
 			Roots:              opts.Roots,
 			DlopenPolicy:       opts.DlopenPolicy,
-			Ecosystem:          opts.Ecosystem,
+			Ecosystem:          opts.OSVEcosystem,
 			Mine:               opts.MineAdvisories && opts.UseLLM,
 			TrustImportAbsence: opts.TrustImportAbsence,
 			Logf:               opts.Logf,
@@ -159,10 +186,59 @@ func registryFor(opts Options) *ecosystem.Registry {
 	)
 }
 
-// subjectsFor turns the user's selection into plugin subjects. Today that is
-// exactly --module; --package and --all arrive with the new CLI surface.
-func subjectsFor(opts Options) []ecosystem.Subject {
-	return []ecosystem.Subject{{Name: opts.Module, Raw: opts.Module}}
+// plan resolves the command line into the plugins that will run and the
+// subjects they will be asked about.
+//
+// Both halves can fail, and both failures matter for the same reason: an
+// ecosystem selector or a package selector that matches nothing produces an
+// empty report, and an empty report is indistinguishable from a clean one.
+func plan(opts Options) ([]ecosystem.Plugin, []ecosystem.Subject, error) {
+	plugins, err := registryFor(opts).Select(opts.Ecosystems)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	subjects, err := ecosystem.Subjects(plugins, opts.Packages)
+	if err != nil {
+		return nil, nil, err
+	}
+	if opts.Module != "" {
+		// The deprecated --module is exactly --package golang:MODULE. Spelling
+		// it out that way here is what keeps it working forever without a
+		// second code path to keep in step.
+		subjects = append(subjects, ecosystem.Subject{
+			Ecosystem: "golang",
+			Name:      golang.NormalizeModule(opts.Module),
+			Raw:       "--module " + opts.Module,
+		})
+	}
+
+	switch {
+	case opts.All:
+		// A bare subject matches everything in every selected plugin. It
+		// replaces rather than joins the named ones, so --all always means the
+		// same thing regardless of what else is on the command line.
+		subjects = []ecosystem.Subject{{Raw: "--all"}}
+	case len(subjects) > 0:
+	case len(opts.CVEs) > 0:
+		// Ids with nothing named to check them against: search the whole
+		// target for where they land.
+		subjects = []ecosystem.Subject{{Raw: "--cves"}}
+	default:
+		return nil, nil, fmt.Errorf("nothing to check: name a package with --package, give ids with --cves, or pass --all")
+	}
+	return plugins, subjects, nil
+}
+
+// targeted reports whether the user named what to look at, as opposed to
+// asking for an enumeration. See ecosystem.WorkItem.Targeted.
+func targeted(subjects []ecosystem.Subject) bool {
+	for _, s := range subjects {
+		if s.MatchesAll() {
+			return false
+		}
+	}
+	return true
 }
 
 // runImage extracts a container image and hands it to every image analyzer.
@@ -175,8 +251,13 @@ func runImage(ctx context.Context, opts Options) (*Result, error) {
 		opts.Arch = "amd64"
 	}
 
-	// Build the LLM client before the extraction: a missing or rejected token
-	// should fail in the first second, not after a multi-gigabyte pull.
+	// Plan the scan and build the LLM client before the extraction: a bad
+	// selector or a rejected token should fail in the first second, not after a
+	// multi-gigabyte pull.
+	plugins, subjects, err := plan(opts)
+	if err != nil {
+		return nil, err
+	}
 	llmClient, err := newLLM(opts)
 	if err != nil {
 		return nil, err
@@ -196,19 +277,25 @@ func runImage(ctx context.Context, opts Options) (*Result, error) {
 		return nil, fmt.Errorf("extract image: %w", err)
 	}
 
-	analyzers := ecosystem.ImageAnalyzers(registryFor(opts).All())
-	subjects := subjectsFor(opts)
-	resolver := newResolver()
+	analyzers := ecosystem.ImageAnalyzers(plugins)
 	result := &Result{SchemaVersion: SchemaVersion, Target: opts.Image, Mode: "image", Module: opts.Module}
+
+	run := &imageRun{
+		subjects: subjects,
+		targeted: targeted(subjects),
+		resolver: newResolver(),
+		mine:     newMiner(opts, llmClient),
+		cves:     opts.CVEs,
+		logf:     logf,
+	}
 
 	// One ecosystem failing does not stop the others, but it is never silent:
 	// the failure is logged, recorded in the result, and -- when it leaves the
 	// run with nothing at all to report -- returned as an error, so that an
 	// unreadable package database can never be mistaken for a clean image.
 	applied, failed := 0, 0
-	mine := newMiner(opts, llmClient)
 	for _, a := range analyzers {
-		er, findings := runAnalyzer(ctx, a, img, subjects, resolver, mine, opts.CVEs, logf)
+		er, findings := run.analyze(ctx, a, img)
 		if er == nil {
 			continue // did not apply
 		}
@@ -226,15 +313,29 @@ func runImage(ctx context.Context, opts Options) (*Result, error) {
 	if failed == applied {
 		return nil, fmt.Errorf("every ecosystem failed on %s; see the log above", opts.Image)
 	}
+	result.Findings = append(result.Findings, unmapped(opts.CVEs, result.Findings)...)
 
 	llmOverlay(ctx, llmClient, result.Findings, "", logf)
 	sortFindings(result.Findings)
 	return result, nil
 }
 
-// runAnalyzer runs one plugin's three phases, returning nil when the plugin
-// does not apply to the image at all.
-func runAnalyzer(ctx context.Context, a ecosystem.ImageAnalyzer, img *target.Image, subjects []ecosystem.Subject, resolver *advisoryResolver, mine *miner, cves []string, logf func(string, ...any)) (*ecosystem.EcosystemResult, []Finding) {
+// imageRun is the state every plugin in one image scan shares: what was asked
+// for, and the advisory cache that keeps two plugins from querying OSV twice
+// for the same coordinates.
+type imageRun struct {
+	subjects []ecosystem.Subject
+	targeted bool
+	resolver *advisoryResolver
+	mine     *miner
+	cves     []string
+	logf     func(string, ...any)
+}
+
+// analyze runs one plugin's three phases, returning nil when the plugin does
+// not apply to the image at all.
+func (r *imageRun) analyze(ctx context.Context, a ecosystem.ImageAnalyzer, img *target.Image) (*ecosystem.EcosystemResult, []Finding) {
+	subjects, logf := r.subjects, r.logf
 	er := &ecosystem.EcosystemResult{ID: a.ID()}
 
 	ok, err := a.DetectImage(ctx, img)
@@ -257,9 +358,9 @@ func runAnalyzer(ctx context.Context, a ecosystem.ImageAnalyzer, img *target.Ima
 	er.Components = len(components)
 	er.Ecosystems = distinctEcosystems(components)
 
-	items := resolver.workItems(ctx, components, cves, logf)
+	items := r.resolver.workItems(ctx, components, r.cves, r.targeted, logf)
 	if ecosystem.UsesHints(a) {
-		mine.apply(ctx, a.ID(), items)
+		r.mine.apply(ctx, a.ID(), items)
 	}
 
 	findings, err := a.AnalyzeImage(ctx, img, items)
@@ -288,6 +389,10 @@ func distinctEcosystems(components []ecosystem.Component) []string {
 func runRepo(ctx context.Context, opts Options) (*Result, error) {
 	logf := opts.Logf
 
+	plugins, subjects, err := plan(opts)
+	if err != nil {
+		return nil, err
+	}
 	llmClient, err := newLLM(opts)
 	if err != nil {
 		return nil, err
@@ -299,8 +404,7 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 	}
 	defer cleanup()
 
-	analyzers := ecosystem.SourceAnalyzers(registryFor(opts).All())
-	subjects := subjectsFor(opts)
+	analyzers := ecosystem.SourceAnalyzers(plugins)
 	result := &Result{SchemaVersion: SchemaVersion, Target: opts.Repo, Mode: "repo", Module: opts.Module}
 
 	applied := 0
@@ -325,6 +429,7 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 	if applied == 0 {
 		return nil, fmt.Errorf("no ecosystem could analyze %s (looked in %s)", opts.Repo, src.Subdir)
 	}
+	result.Findings = append(result.Findings, unmapped(opts.CVEs, result.Findings)...)
 
 	llmOverlay(ctx, llmClient, result.Findings, "source tree", logf)
 	sortFindings(result.Findings)
@@ -349,7 +454,7 @@ func newResolver() *advisoryResolver {
 }
 
 // workItems pairs each component with its advisories and the requested ids.
-func (r *advisoryResolver) workItems(ctx context.Context, components []ecosystem.Component, requested []string, logf func(string, ...any)) []ecosystem.WorkItem {
+func (r *advisoryResolver) workItems(ctx context.Context, components []ecosystem.Component, requested []string, targeted bool, logf func(string, ...any)) []ecosystem.WorkItem {
 	r.prefetch(ctx, components, logf)
 
 	out := make([]ecosystem.WorkItem, 0, len(components))
@@ -358,6 +463,7 @@ func (r *advisoryResolver) workItems(ctx context.Context, components []ecosystem
 			Component:  c,
 			Advisories: r.advisories(ctx, c, logf),
 			Requested:  requested,
+			Targeted:   targeted,
 		})
 	}
 	return out
@@ -480,6 +586,42 @@ func merge(sets []map[string]*osv.Advisory) map[string]*osv.Advisory {
 				out[id] = adv
 			}
 		}
+	}
+	return out
+}
+
+// unmapped accounts for the requested ids that no ecosystem said anything
+// about.
+//
+// Every id the user asks for has to appear in the output. When a package was
+// named, the plugin owning it reports the id undetermined and this finds
+// nothing left to do. When nothing was named -- `--cves CVE-... ` against a
+// whole image -- the plugins deliberately stay quiet about the hundreds of
+// components an id does not apply to, and the only place that can tell the id
+// landed nowhere at all is here, after every ecosystem has reported.
+//
+// The alternative is silence, and a missing id reads as a clean one.
+func unmapped(requested []string, findings []Finding) []Finding {
+	if len(requested) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(findings))
+	for _, f := range findings {
+		seen[f.CVE] = true
+	}
+
+	var out []Finding
+	for _, id := range requested {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true // a duplicate --cves entry is one finding, not two
+		out = append(out, Finding{
+			ID:     id,
+			CVE:    id,
+			Status: ecosystem.StatusUndetermined,
+			Reason: "no_component_matched",
+		})
 	}
 	return out
 }

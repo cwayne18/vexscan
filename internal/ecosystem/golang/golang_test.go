@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"testing"
 
@@ -211,6 +212,53 @@ func TestGroupStdlibUsesTheToolchainVersion(t *testing.T) {
 	}
 }
 
+func TestGroupAllEnumeratesEveryLinkedModule(t *testing.T) {
+	const root = "/tmp/extract"
+	bins := []binscan.Binary{
+		fakeBinary(root+"/usr/bin/a", map[string]string{"golang.org/x/net": "v0.17.0"}),
+		fakeBinary(root+"/usr/bin/b", map[string]string{"golang.org/x/net": "v0.17.0", "golang.org/x/text": "v0.14.0"}),
+		{Path: root + "/usr/bin/not-go"}, // no build info; must not panic or appear
+	}
+
+	var got []string
+	for _, c := range New(Options{}).groupAll(root, bins) {
+		got = append(got, c.Name+"@"+c.Version)
+	}
+	sort.Strings(got)
+
+	// The main module and the toolchain are enumerated alongside the deps:
+	// both carry advisories, and neither shows up in Deps.
+	want := []string{
+		"example.com/app@v1.0.0",
+		"golang.org/x/net@v0.17.0",
+		"golang.org/x/text@v0.14.0",
+		"stdlib@1.24.0",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestGroupAllSharesOneComponentAcrossBinaries(t *testing.T) {
+	const root = "/tmp/extract"
+	bins := []binscan.Binary{
+		fakeBinary(root+"/usr/bin/a", map[string]string{"golang.org/x/net": "v0.17.0"}),
+		fakeBinary(root+"/usr/bin/b", map[string]string{"golang.org/x/net": "v0.17.0"}),
+	}
+	for _, c := range New(Options{}).groupAll(root, bins) {
+		if c.Name != "golang.org/x/net" {
+			continue
+		}
+		// One component means one OSV query for both binaries, which is what
+		// keeps a whole-image enumeration to a survivable number of lookups.
+		if want := []string{"/usr/bin/a", "/usr/bin/b"}; !reflect.DeepEqual(c.Locations, want) {
+			t.Errorf("locations = %v, want %v", c.Locations, want)
+		}
+		return
+	}
+	t.Fatal("golang.org/x/net missing from the enumeration")
+}
+
 func TestDetectSource(t *testing.T) {
 	p := New(Options{})
 
@@ -270,7 +318,7 @@ func TestFindingsForModule(t *testing.T) {
 	}
 
 	t.Run("all mode reports one finding per advisory, other modules excluded", func(t *testing.T) {
-		got := findingsForModule(module, stmts, nil)
+		got := findingsForModule(module, stmts, nil, true)
 		if len(got) != 3 {
 			t.Fatalf("got %d findings, want 3", len(got))
 		}
@@ -299,7 +347,7 @@ func TestFindingsForModule(t *testing.T) {
 	})
 
 	t.Run("a requested id matches its GO id as well as its CVE alias", func(t *testing.T) {
-		got := findingsForModule(module, stmts, []string{"GO-2023-2102"})
+		got := findingsForModule(module, stmts, []string{"GO-2023-2102"}, true)
 		if len(got) != 1 || got[0].Status != ecosystem.StatusReachable {
 			t.Fatalf("got %+v", got)
 		}
@@ -311,7 +359,7 @@ func TestFindingsForModule(t *testing.T) {
 	// govulncheck analyzed the module and did not flag this id: that is real
 	// evidence of absence.
 	t.Run("an unflagged id in an analyzed module is not_present", func(t *testing.T) {
-		got := findingsForModule(module, stmts, []string{"CVE-9999-0001"})
+		got := findingsForModule(module, stmts, []string{"CVE-9999-0001"}, true)
 		if len(got) != 1 {
 			t.Fatalf("got %d findings, want 1", len(got))
 		}
@@ -331,7 +379,7 @@ func TestFindingsForModule(t *testing.T) {
 	// Reporting that as not_present would publish a VEX statement about code
 	// that was never examined.
 	t.Run("an id in an unanalyzed module is undetermined", func(t *testing.T) {
-		got := findingsForModule("example.com/never-seen", stmts, []string{"CVE-9999-0001"})
+		got := findingsForModule("example.com/never-seen", stmts, []string{"CVE-9999-0001"}, true)
 		if len(got) != 1 {
 			t.Fatalf("got %d findings, want 1", len(got))
 		}
@@ -348,10 +396,33 @@ func TestFindingsForModule(t *testing.T) {
 	})
 
 	t.Run("all mode over an unanalyzed module reports nothing", func(t *testing.T) {
-		if got := findingsForModule("example.com/never-seen", stmts, nil); len(got) != 0 {
+		if got := findingsForModule("example.com/never-seen", stmts, nil, true); len(got) != 0 {
 			t.Errorf("got %d findings, want 0", len(got))
 		}
 	})
+
+	// Enumeration reaches every module govulncheck mentioned, so a requested id
+	// belonging to some other module has already been reported by that module's
+	// pass. Repeating it here as undetermined would contradict it.
+	t.Run("an enumerated module drops a requested id that belongs elsewhere", func(t *testing.T) {
+		if got := findingsForModule(module, stmts, []string{"CVE-2024-9999"}, false); len(got) != 0 {
+			t.Errorf("got %+v, want no findings", got)
+		}
+	})
+}
+
+func TestFlaggedModules(t *testing.T) {
+	stmts := []source.Statement{
+		stmt("GO-2024-9999", "", "golang.org/x/text", "v0.14.0", "affected", ""),
+		stmt("GO-2023-2102", "", "golang.org/x/net", "v0.17.0", "affected", ""),
+		stmt("GO-2023-1988", "", "golang.org/x/net", "v0.17.0", "not_affected", ""),
+		stmt("GO-2023-0000", "", "", "", "affected", ""),
+	}
+	got := flaggedModules(stmts)
+	want := []string{"golang.org/x/net", "golang.org/x/text"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v (distinct, sorted, no empty module)", got, want)
+	}
 }
 
 func TestPrimaryID(t *testing.T) {

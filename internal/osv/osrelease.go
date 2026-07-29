@@ -181,10 +181,10 @@ func (rel Release) Ecosystem() (string, error) {
 		//
 		// Guessing the base name would answer "no advisories" for every SLE
 		// image past general support -- which is most of the images anyone
-		// scans. Refusing is the only honest option; --ecosystem lets a user
-		// who knows their support phase name it outright.
+		// scans. Refusing is the only honest option; --osv-ecosystem lets a
+		// user who knows their support phase name it outright.
 		return "", fmt.Errorf("osv: %w: %s (%q) -- SUSE keys advisories on the support phase "+
-			"(e.g. %q, %q), which os-release does not record; name it with --ecosystem",
+			"(e.g. %q, %q), which os-release does not record; name it with --osv-ecosystem",
 			ErrAmbiguousDistro, rel.ID, rel.PrettyName,
 			"SUSE:Linux Enterprise Server 15 SP4-LTSS", "SUSE:Linux Enterprise Micro 5.5")
 

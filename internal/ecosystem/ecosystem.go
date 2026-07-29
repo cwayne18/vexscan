@@ -194,10 +194,21 @@ type WorkItem struct {
 	Advisories map[string]*osv.Advisory
 
 	// Requested are the ids the user explicitly asked about; empty means "every
-	// advisory that applies". An id in this list with no matching advisory must
-	// still produce a finding, recorded undetermined — otherwise a --cves scan
-	// silently drops the ids it could not map, which reads as "not affected".
+	// advisory that applies".
 	Requested []string
+
+	// Targeted says the user named this component, rather than it arriving from
+	// an enumeration of everything installed.
+	//
+	// It decides what happens to a requested id this component has no advisory
+	// for. Named, the user asked about this package and is owed an answer, so
+	// the id reports undetermined; a --cves scan that silently dropped the ids
+	// it could not map would read as "not affected". Enumerated, the same
+	// answer repeated across four hundred packages is noise that buries the one
+	// package the id actually landed on. An id that lands on nothing at all is
+	// the orchestrator's to report, because it is the only thing that can see
+	// the whole image at once.
+	Targeted bool
 
 	// Hints are the identifiers an LLM claimed each advisory's text names,
 	// keyed by the advisory's canonical id. Present only under
@@ -225,15 +236,17 @@ type Request struct {
 // Requests turns a WorkItem's requested-id list into concrete lookups.
 //
 // In filter mode every requested id is returned, with a nil advisory when OSV
-// has no mapping: such an id must still produce a finding, recorded
-// undetermined, or a --cves scan would silently drop the ids it could not map
-// and the omission would read as "not affected". With no ids requested, every
-// distinct advisory is returned under its canonical OSV id.
+// has no mapping -- as long as the component was named. See Targeted for why an
+// enumerated component drops the ids that do not apply to it. With no ids
+// requested, every distinct advisory is returned under its canonical OSV id.
 func (w WorkItem) Requests() []Request {
 	if len(w.Requested) > 0 {
 		out := make([]Request, 0, len(w.Requested))
 		for _, id := range w.Requested {
 			adv := w.Advisories[id]
+			if adv == nil && !w.Targeted {
+				continue
+			}
 			out = append(out, Request{ID: id, Advisory: adv, Hints: w.hintsFor(adv)})
 		}
 		return out

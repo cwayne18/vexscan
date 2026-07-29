@@ -210,7 +210,7 @@ ID="sles"`,
 VERSION_ID="12.5"
 PRETTY_NAME="SUSE Linux Enterprise Server for SAP Applications 12 SP5"
 ID="sles_sap"`,
-			wantErr: "--ecosystem",
+			wantErr: "--osv-ecosystem",
 		},
 		{
 			name: "sle micro is refused for the same reason",

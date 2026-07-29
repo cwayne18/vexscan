@@ -68,7 +68,7 @@ func TestReadOSInfo(t *testing.T) {
 			files: map[string]string{
 				"/etc/os-release": "ID=\"sles\"\nVERSION_ID=\"15.5\"\nPRETTY_NAME=\"SUSE Linux Enterprise Server 15 SP5\"\n",
 			},
-			wantErrFragment: "--ecosystem",
+			wantErrFragment: "--osv-ecosystem",
 		},
 		{
 			name: "unknown-distro",

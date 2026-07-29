@@ -294,7 +294,7 @@ func TestResolverQueriesEachComponentOnce(t *testing.T) {
 		{Ecosystem: "Go", Name: "golang.org/x/net", Version: "v0.17.0", Locations: []string{"/usr/bin/b"}},
 		{Ecosystem: "Go", Name: "golang.org/x/net", Version: "v0.18.0"},
 	}
-	items := r.workItems(context.Background(), components, []string{"CVE-2023-39325"}, func(string, ...any) {})
+	items := r.workItems(context.Background(), components, []string{"CVE-2023-39325"}, true, func(string, ...any) {})
 
 	if len(items) != 3 {
 		t.Fatalf("got %d work items, want 3", len(items))
@@ -330,7 +330,7 @@ func TestResolverQueriesEveryNameAComponentIsKnownBy(t *testing.T) {
 
 	items := r.workItems(context.Background(), []ecosystem.Component{
 		{Ecosystem: "Debian:12", Name: "libssl3", AltNames: []string{"openssl"}, Version: "3.0.11-1"},
-	}, nil, func(string, ...any) {})
+	}, nil, true, func(string, ...any) {})
 
 	want := []string{"Debian:12/libssl3@3.0.11-1", "Debian:12/openssl@3.0.11-1"}
 	if got := f.questions(); !reflect.DeepEqual(got, want) {
@@ -354,7 +354,7 @@ func TestResolverMergesAdvisoriesAcrossNames(t *testing.T) {
 
 	items := r.workItems(context.Background(), []ecosystem.Component{
 		{Ecosystem: "Red Hat", Name: "openssl-libs", AltNames: []string{"openssl"}, Version: "1:3.0.7-24.el9"},
-	}, nil, func(string, ...any) {})
+	}, nil, true, func(string, ...any) {})
 
 	// Keyed by id and by alias, so two keys for one advisory -- but only one
 	// distinct record behind them.
@@ -380,7 +380,7 @@ func TestResolverFallsBackWhenTheBatchFails(t *testing.T) {
 	items := r.workItems(context.Background(), []ecosystem.Component{
 		{Ecosystem: "Debian:12", Name: "openssl", Version: "3.0.11-1"},
 		{Ecosystem: "Debian:12", Name: "zlib", Version: "1:1.2.13"},
-	}, nil, func(string, ...any) { logged++ })
+	}, nil, true, func(string, ...any) { logged++ })
 
 	if items[0].Advisories["CVE-2023-0464"] == nil {
 		t.Error("the fallback lost the advisory")
@@ -410,6 +410,7 @@ func TestResolverSurvivesOSVFailure(t *testing.T) {
 	items := r.workItems(context.Background(),
 		[]ecosystem.Component{{Ecosystem: "Go", Name: "golang.org/x/net", Version: "v0.17.0"}},
 		[]string{"CVE-2023-39325"},
+		true,
 		func(string, ...any) { logged++ })
 
 	if len(items) != 1 {
@@ -434,6 +435,7 @@ func TestResolverQueriesEachComponentsOwnEcosystem(t *testing.T) {
 	r.workItems(context.Background(),
 		[]ecosystem.Component{{Ecosystem: "Debian:12", Name: "openssl", Version: "3.0.11-1"}},
 		nil,
+		true,
 		func(string, ...any) {})
 
 	want := []string{"Debian:12/openssl@3.0.11-1"}
@@ -452,6 +454,7 @@ func TestResolverReportsComponentsWithNoEcosystem(t *testing.T) {
 	items := r.workItems(context.Background(),
 		[]ecosystem.Component{{Name: "openssl", Version: "3.0.11-1"}},
 		nil,
+		true,
 		func(string, ...any) { logged++ })
 
 	if got := f.questions(); len(got) != 0 {
@@ -465,11 +468,106 @@ func TestResolverReportsComponentsWithNoEcosystem(t *testing.T) {
 	}
 }
 
-func TestSubjectsFor(t *testing.T) {
-	got := subjectsFor(Options{Module: "golang.org/x/net"})
-	want := []ecosystem.Subject{{Name: "golang.org/x/net", Raw: "golang.org/x/net"}}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("got %+v, want %+v", got, want)
+func TestPlan(t *testing.T) {
+	subjectsOf := func(t *testing.T, opts Options) []ecosystem.Subject {
+		t.Helper()
+		_, subjects, err := plan(opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return subjects
+	}
+
+	// The deprecated flag is the new one with a fixed ecosystem, spelled out
+	// here so there is no second code path to keep in step.
+	t.Run("module is package golang:module", func(t *testing.T) {
+		got := subjectsOf(t, Options{Module: "std"})
+		want := []ecosystem.Subject{{Ecosystem: "golang", Name: "stdlib", Raw: "--module std"}}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("packages are parsed", func(t *testing.T) {
+		got := subjectsOf(t, Options{Packages: []string{"deb:openssl", "golang.org/x/net"}})
+		want := []ecosystem.Subject{
+			{Ecosystem: "os", Name: "openssl", Raw: "deb:openssl"},
+			{Name: "golang.org/x/net", Raw: "golang.org/x/net"},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %+v, want %+v", got, want)
+		}
+	})
+
+	// Ids with nothing named to check them against search the whole target.
+	// This is the mode the v1 CLI had no way to express.
+	t.Run("ids alone select everything", func(t *testing.T) {
+		got := subjectsOf(t, Options{CVEs: []string{"CVE-2024-5535"}})
+		if len(got) != 1 || !got[0].MatchesAll() {
+			t.Errorf("got %+v, want one match-everything subject", got)
+		}
+		if targeted(got) {
+			t.Error("an enumeration is not targeted")
+		}
+	})
+
+	t.Run("all replaces whatever else was named", func(t *testing.T) {
+		got := subjectsOf(t, Options{All: true, Module: "golang.org/x/net"})
+		if len(got) != 1 || !got[0].MatchesAll() {
+			t.Errorf("got %+v, want one match-everything subject", got)
+		}
+	})
+
+	t.Run("ecosystems restrict the plugins", func(t *testing.T) {
+		plugins, _, err := plan(Options{All: true, Ecosystems: []string{"os"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(plugins) != 1 || plugins[0].ID() != "os" {
+			t.Errorf("got %v, want just the os plugin", plugins)
+		}
+	})
+
+	// Each of these produces an empty report if it is allowed through, and an
+	// empty report is indistinguishable from a clean one.
+	for _, tt := range []struct {
+		name string
+		opts Options
+	}{
+		{"nothing selected at all", Options{}},
+		{"an ecosystem nothing handles", Options{All: true, Ecosystems: []string{"cargo"}}},
+		{"a package aimed at an unselected ecosystem", Options{
+			Packages: []string{"golang:golang.org/x/net"}, Ecosystems: []string{"os"},
+		}},
+	} {
+		t.Run(tt.name+" is an error", func(t *testing.T) {
+			if _, _, err := plan(tt.opts); err == nil {
+				t.Error("expected an error")
+			}
+		})
+	}
+}
+
+// Every id the user asks about appears in the output, including the ones that
+// matched nothing: a missing id reads as a clean one.
+func TestUnmappedAccountsForIdsNothingMatched(t *testing.T) {
+	found := []Finding{{CVE: "CVE-1111-1111", Module: "openssl"}}
+	got := unmapped([]string{"CVE-1111-1111", "CVE-2222-2222", "CVE-2222-2222"}, found)
+
+	if len(got) != 1 {
+		t.Fatalf("got %d findings, want 1: %+v", len(got), got)
+	}
+	if got[0].CVE != "CVE-2222-2222" || got[0].ID != "CVE-2222-2222" {
+		t.Errorf("got %+v, want the unmatched id", got[0])
+	}
+	if got[0].Status != StatusUndetermined {
+		t.Errorf("status = %q, want undetermined", got[0].Status)
+	}
+}
+
+func TestUnmappedIsSilentWhenNoIdsWereRequested(t *testing.T) {
+	if got := unmapped(nil, []Finding{{CVE: "CVE-1111-1111"}}); got != nil {
+		t.Errorf("got %+v, want nothing", got)
 	}
 }
 

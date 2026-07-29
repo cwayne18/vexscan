@@ -206,7 +206,7 @@ func (p *Plugin) prepare(img *target.Image) (*prepared, error) {
 		pr.ecosystem = p.Ecosystem
 	case relErr != nil:
 		return nil, fmt.Errorf("this image has an OS package database but no usable /etc/os-release, "+
-			"so its advisories cannot be looked up: %w; name the ecosystem with --ecosystem", relErr)
+			"so its advisories cannot be looked up: %w; name it with --osv-ecosystem", relErr)
 	default:
 		eco, err := rel.Ecosystem()
 		if err != nil {

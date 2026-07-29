@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/cwayne18/vexscan/internal/binscan"
@@ -111,14 +112,10 @@ func (p *Plugin) InventoryImage(ctx context.Context, img *target.Image, subjects
 
 	modules, all := p.wantedModules(subjects)
 	if all {
-		// An image with no Go code in it has nothing to enumerate, so --all over
-		// a distro image passes through quietly. An image that does carry Go
-		// binaries is the opposite case: reporting nothing would present code
-		// this plugin never looked at as clean.
-		if len(bins) > 0 {
-			return nil, fmt.Errorf("golang: this image has %d Go binaries, and listing every module linked into them is not supported yet; name one with --package golang:PATH", len(bins))
-		}
-		return nil, nil
+		// Every module every binary links, read straight out of build info.
+		// An image with no Go code in it produces nothing, which is the honest
+		// answer rather than a silence: there was no Go code to examine.
+		return p.groupAll(root, bins), nil
 	}
 	if len(modules) == 0 {
 		return nil, nil // nothing was aimed at this plugin
@@ -126,13 +123,49 @@ func (p *Plugin) InventoryImage(ctx context.Context, img *target.Image, subjects
 	return p.group(root, bins, modules), nil
 }
 
+// groupAll inventories every module linked into every binary.
+//
+// It exists separately from group because the two ask opposite questions.
+// group has a short list of module names and interrogates each binary about
+// them; groupAll has the binaries and reads their dependency lists, which is
+// the only way round that stays linear when an image carries a hundred
+// binaries with a few hundred dependencies apiece.
+//
+// The version override is deliberately ignored here: --version answers "what
+// version is this one module really", which means nothing applied to every
+// module in the image at once.
+func (p *Plugin) groupAll(root string, bins []binscan.Binary) []ecosystem.Component {
+	g := newGrouper()
+	for _, bin := range bins {
+		if bin.Info == nil {
+			continue
+		}
+		rel := target.Rel(root, bin.Path)
+		// The standard library is a module OSV publishes advisories against,
+		// and it is linked into every Go binary by definition, so an
+		// enumeration that left it out would miss the CVEs most likely to
+		// apply to all of them at once.
+		g.add(StdlibModule, binscan.NormalizeGoVersion(bin.Info.GoVersion), rel, bin.Path)
+		if m := bin.Info.Main; m.Path != "" && m.Version != "" {
+			g.add(m.Path, m.Version, rel, bin.Path)
+		}
+		for _, dep := range bin.Info.Deps {
+			m := dep
+			if dep.Replace != nil {
+				m = dep.Replace
+			}
+			if m.Path == "" || m.Version == "" {
+				continue
+			}
+			g.add(m.Path, m.Version, rel, bin.Path)
+		}
+	}
+	return g.components()
+}
+
 // group folds the discovered binaries into one component per (module, version).
 func (p *Plugin) group(root string, bins []binscan.Binary, modules []string) []ecosystem.Component {
-	// Keyed by module@version, so two binaries linking the same version share a
-	// component and therefore a single OSV lookup.
-	byKey := map[string]*ecosystem.Component{}
-	var order []string
-
+	g := newGrouper()
 	for _, bin := range bins {
 		rel := target.Rel(root, bin.Path)
 		for _, module := range modules {
@@ -143,27 +176,55 @@ func (p *Plugin) group(root string, bins []binscan.Binary, modules []string) []e
 			if version == "" {
 				continue // module not linked into this binary
 			}
-			key := module + "@" + version
-			c, ok := byKey[key]
-			if !ok {
-				c = &ecosystem.Component{
-					Ecosystem: "Go",
-					Name:      module,
-					Version:   version,
-					PURL:      purl(module, version),
-					Extra:     &state{},
-				}
-				byKey[key] = c
-				order = append(order, key)
-			}
-			c.Locations = append(c.Locations, rel)
-			c.Extra.(*state).binaries = append(c.Extra.(*state).binaries, binary{path: bin.Path, rel: rel})
+			g.add(module, version, rel, bin.Path)
 		}
 	}
+	return g.components()
+}
 
-	out := make([]ecosystem.Component, 0, len(order))
-	for _, key := range order {
-		out = append(out, *byKey[key])
+// grouper collects (module, version, binary) triples into components.
+//
+// One component per module@version, so two binaries linking the same version
+// share a single OSV lookup, and the binaries that link it ride along as
+// Locations. That grouping is what lets the analysis phase emit one finding
+// per (binary, advisory) without the orchestrator knowing binaries exist.
+type grouper struct {
+	byKey map[string]*ecosystem.Component
+	order []string
+}
+
+func newGrouper() *grouper {
+	return &grouper{byKey: map[string]*ecosystem.Component{}}
+}
+
+func (g *grouper) add(module, version, rel, path string) {
+	key := module + "@" + version
+	c, ok := g.byKey[key]
+	if !ok {
+		c = &ecosystem.Component{
+			Ecosystem: "Go",
+			Name:      module,
+			Version:   version,
+			PURL:      purl(module, version),
+			Extra:     &state{},
+		}
+		g.byKey[key] = c
+		g.order = append(g.order, key)
+	}
+	// A binary reached twice for the same module -- a replace directive
+	// pointing at a path already listed -- must not be scanned twice.
+	st := c.Extra.(*state)
+	if len(st.binaries) > 0 && st.binaries[len(st.binaries)-1].path == path {
+		return
+	}
+	c.Locations = append(c.Locations, rel)
+	st.binaries = append(st.binaries, binary{path: path, rel: rel})
+}
+
+func (g *grouper) components() []ecosystem.Component {
+	out := make([]ecosystem.Component, 0, len(g.order))
+	for _, key := range g.order {
+		out = append(out, *g.byKey[key])
 	}
 	return out
 }
@@ -174,10 +235,10 @@ func (p *Plugin) group(root string, bins []binscan.Binary, modules []string) []e
 // The two ways this comes back with no modules are different and have to stay
 // different. No subject aimed here at all -- `--package deb:openssl` -- means Go
 // was never asked, and the honest answer is an empty inventory. A subject that
-// *was* aimed here and names everything -- `--all` -- is a question this plugin
-// cannot answer: enumerating every dependency of every binary is a different and
-// much larger scan, and answering it with silence would render unexamined code
-// as clean. The caller decides which of those it is looking at.
+// *was* aimed here and names everything -- `--all` -- means enumerate, which is
+// a much larger scan over a completely different source of module names.
+// Collapsing the two would either run that scan when nobody asked for it or
+// return silence when somebody did.
 func (p *Plugin) wantedModules(subjects []ecosystem.Subject) (modules []string, all bool) {
 	seen := map[string]bool{}
 	for _, s := range subjects {
@@ -266,31 +327,53 @@ func (p *Plugin) DetectSource(_ context.Context, src *target.Source) (bool, erro
 // AnalyzeSource implements ecosystem.SourceAnalyzer.
 func (p *Plugin) AnalyzeSource(ctx context.Context, src *target.Source, subjects []ecosystem.Subject, requested []string) ([]ecosystem.Finding, error) {
 	modules, all := p.wantedModules(subjects)
-	if all {
-		// govulncheck source mode does enumerate -- it reports every vulnerable
-		// module in the graph -- but this plugin's finding shape is per-module,
-		// so the enumeration has nowhere to go yet.
-		return nil, fmt.Errorf("golang: scanning every module in a source tree is not supported yet; name one with --package golang:PATH")
-	}
-	if len(modules) == 0 {
-		return nil, nil
+	if len(modules) == 0 && !all {
+		return nil, nil // nothing was aimed at this plugin
 	}
 
 	stmts, err := source.Scan(ctx, src, p.GoVersion, p.Logf)
 	if err != nil {
 		return nil, err
 	}
+	if all {
+		// govulncheck source mode enumerates for free: it reports every
+		// vulnerable module in the graph, so --all is just a matter of taking
+		// the modules from its output instead of from the command line.
+		modules = flaggedModules(stmts)
+	}
 
 	var out []ecosystem.Finding
 	for _, module := range modules {
-		out = append(out, findingsForModule(module, stmts, requested)...)
+		out = append(out, findingsForModule(module, stmts, requested, !all)...)
 	}
 	return out, nil
 }
 
+// flaggedModules is every module govulncheck had something to say about,
+// sorted so a repeated scan reports in the same order.
+func flaggedModules(stmts []source.Statement) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, st := range stmts {
+		if st.Module != "" && !seen[st.Module] {
+			seen[st.Module] = true
+			out = append(out, st.Module)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // findingsForModule turns govulncheck's statements for one module into
 // findings.
-func findingsForModule(module string, stmts []source.Statement, requested []string) []ecosystem.Finding {
+//
+// targeted says whether the user named this module. It only matters for a
+// requested id the module has no statement for: when the module was named, the
+// user is owed an answer about it and gets one, and when the module came out of
+// an enumeration, saying "CVE-2023-39325 is not present in each of your 400
+// dependencies" is noise. An id that lands nowhere at all is reported by the
+// orchestrator, which is the only thing that can see that it landed nowhere.
+func findingsForModule(module string, stmts []source.Statement, requested []string, targeted bool) []ecosystem.Finding {
 	byID := map[string]source.Statement{}
 	moduleSeen := false
 	var moduleVersion string
@@ -311,6 +394,9 @@ func findingsForModule(module string, stmts []source.Statement, requested []stri
 	if len(requested) > 0 {
 		for _, id := range requested {
 			st, ok := byID[id]
+			if !ok && !targeted {
+				continue
+			}
 			out = append(out, sourceFinding(module, moduleVersion, moduleSeen, id, st, ok))
 		}
 		return out

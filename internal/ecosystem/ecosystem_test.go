@@ -287,12 +287,28 @@ func TestWorkItemRequests(t *testing.T) {
 		"CVE-2023-0002": advB,
 	}
 
-	t.Run("filter mode keeps unmapped ids so they report as undetermined", func(t *testing.T) {
-		got := WorkItem{Advisories: advMap, Requested: []string{"CVE-2023-0001", "CVE-9999-9999"}}.Requests()
+	t.Run("a targeted component keeps unmapped ids so they report as undetermined", func(t *testing.T) {
+		got := WorkItem{
+			Advisories: advMap,
+			Requested:  []string{"CVE-2023-0001", "CVE-9999-9999"},
+			Targeted:   true,
+		}.Requests()
 		want := []Request{
 			{ID: "CVE-2023-0001", Advisory: advA},
 			{ID: "CVE-9999-9999", Advisory: nil},
 		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("Requests() = %+v, want %+v", got, want)
+		}
+	})
+
+	// An enumerated component says nothing about an id that does not name it.
+	// Keeping the unmapped request here would put one undetermined finding on
+	// every installed package, burying the component that actually matched;
+	// the orchestrator accounts for a wholly unmatched id separately.
+	t.Run("an enumerated component drops ids that did not match it", func(t *testing.T) {
+		got := WorkItem{Advisories: advMap, Requested: []string{"CVE-2023-0001", "CVE-9999-9999"}}.Requests()
+		want := []Request{{ID: "CVE-2023-0001", Advisory: advA}}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("Requests() = %+v, want %+v", got, want)
 		}

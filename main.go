@@ -14,22 +14,32 @@ import (
 	"syscall"
 
 	"github.com/cwayne18/vexscan/internal/analyze"
+	"github.com/cwayne18/vexscan/internal/elfgraph"
 	"github.com/cwayne18/vexscan/internal/gist"
 )
 
 func main() {
+	var packages, ecosystems, roots stringList
+	flag.Var(&packages, "package", "package to check: a purl, an ecosystem:name shorthand (deb:openssl, golang:golang.org/x/net), or a bare name resolved against the inventory; repeatable")
+	flag.Var(&ecosystems, "ecosystem", "restrict the scan to these ecosystems (golang, os, or a distro family like debian); repeatable, default all")
+	flag.Var(&roots, "roots", "extra entrypoints for the shared-library closure, for an image whose real command comes from outside its config; repeatable")
 	var (
 		image      = flag.String("image", "", "container image reference to inspect (mutually exclusive with --repo)")
 		repo       = flag.String("repo", "", "git source repo to analyze via govulncheck source mode, e.g. github.com/rancher/rancher (mutually exclusive with --image)")
 		ref        = flag.String("ref", "", "branch, tag, or commit to check out for --repo (default: repo default branch)")
 		repoPath   = flag.String("repo-path", ".", "module subdirectory within --repo to scan")
-		module     = flag.String("module", "", "Go module import path to evaluate, or 'stdlib' for the standard library (required)")
-		cvesFlag   = flag.String("cves", "", "comma-separated CVE/GHSA/GO ids to check; empty checks every advisory found for the module version")
+		module     = flag.String("module", "", "deprecated alias for --package golang:MODULE")
+		all        = flag.Bool("all", false, "check everything each ecosystem can inventory, instead of named packages")
+		cvesFlag   = flag.String("cves", "", "comma-separated CVE/GHSA/GO ids to check; alone, they are resolved against the whole target")
 		cvesFile   = flag.String("cves-file", "", "path to a file with one CVE/GHSA/GO id per line (merged with --cves)")
 		version    = flag.String("version", "", "override the module version (image mode only; default: read from each binary's build info)")
-		goVersion  = flag.String("go-version", "", "pin the Go toolchain for --repo analysis, e.g. 1.24.0 (useful with --module stdlib)")
+		goVersion  = flag.String("go-version", "", "pin the Go toolchain for --repo analysis, e.g. 1.24.0 (useful with --package golang:stdlib)")
 		goos       = flag.String("os", "linux", "image OS variant to pull (image mode)")
 		arch       = flag.String("arch", "amd64", "image architecture variant to pull (image mode)")
+		osvEco     = flag.String("osv-ecosystem", "", "override the OSV ecosystem derived from the image's os-release, e.g. 'Debian:12'")
+		dlopen     = flag.String("dlopen-policy", "taint", "what a reachable dlopen does to the closure: taint (block conclusions) or assume-none")
+		mine       = flag.Bool("mine-advisories", false, "with --llm, let the model read each advisory's prose for symbols to check against the image")
+		trustAbs   = flag.Bool("trust-import-absence", false, "let a missing dynamic import of the vulnerable symbol conclude not_in_execute_path (see README: this is weaker than it looks)")
 		useLLM     = flag.Bool("llm", false, "consult a GitHub Models LLM on genuinely-affected CVEs for exploitability")
 		llmModel   = flag.String("llm-model", "openai/gpt-4o", "GitHub Models model id for --llm")
 		format     = flag.String("format", "text", "output format: text, json, or inventory (list the image's OS packages and exit)")
@@ -45,18 +55,35 @@ func main() {
 	// needs no subject and no advisory lookup.
 	inventoryMode := *format == "inventory"
 
-	if *module == "" && !inventoryMode {
-		fmt.Fprintln(os.Stderr, "error: --module is required")
-		flag.Usage()
-		os.Exit(2)
-	}
 	if (*image == "") == (*repo == "") {
-		fmt.Fprintln(os.Stderr, "error: set exactly one of --image or --repo")
-		flag.Usage()
-		os.Exit(2)
+		fail("set exactly one of --image or --repo")
 	}
-
+	switch *format {
+	case "text", "json", "inventory":
+	default:
+		fail("unknown --format %q; want text, json, or inventory", *format)
+	}
 	cves := parseCVEs(*cvesFlag, *cvesFile)
+
+	if !inventoryMode {
+		// Every other combination has a meaning; this one has none, and the
+		// only honest thing to do with it is say what the three answers are.
+		if len(packages) == 0 && *module == "" && len(cves) == 0 && !*all {
+			fail("nothing to check: name a package with --package, give ids with --cves, or pass --all")
+		}
+		if *all && (len(packages) > 0 || *module != "") {
+			fail("--all checks everything, so it cannot be combined with --package or --module")
+		}
+	}
+	if *module != "" {
+		// Not gated on --quiet: this is about the command line, not progress,
+		// and the person who needs to read it is the one who typed it.
+		fmt.Fprintf(os.Stderr, "warning: --module is deprecated; use --package golang:%s\n", *module)
+	}
+	dlopenPolicy, err := elfgraph.ParseDlopenPolicy(*dlopen)
+	if err != nil {
+		fail("%v", err)
+	}
 
 	logf := func(format string, args ...any) {
 		if !*quiet {
@@ -69,30 +96,46 @@ func main() {
 
 	if inventoryMode {
 		runInventory(ctx, analyze.Options{
-			Image: *image,
-			Repo:  *repo,
-			OS:    *goos,
-			Arch:  *arch,
-			Logf:  logf,
+			Image:        *image,
+			Repo:         *repo,
+			OS:           *goos,
+			Arch:         *arch,
+			OSVEcosystem: *osvEco,
+			Logf:         logf,
 		}, *out, logf)
 		return
 	}
 
-	res, err := analyze.Run(ctx, analyze.Options{
-		Image:     *image,
-		Repo:      *repo,
-		Ref:       *ref,
-		Path:      *repoPath,
-		Module:    *module,
-		CVEs:      cves,
-		Version:   *version,
-		OS:        *goos,
-		Arch:      *arch,
-		GoVersion: *goVersion,
-		UseLLM:    *useLLM,
-		LLMModel:  *llmModel,
-		Logf:      logf,
-	})
+	opts := analyze.Options{
+		Image:              *image,
+		Repo:               *repo,
+		Ref:                *ref,
+		Path:               *repoPath,
+		Packages:           packages,
+		Module:             *module,
+		All:                *all,
+		Ecosystems:         ecosystems,
+		CVEs:               cves,
+		Version:            *version,
+		OS:                 *goos,
+		Arch:               *arch,
+		OSVEcosystem:       *osvEco,
+		Roots:              roots,
+		DlopenPolicy:       dlopenPolicy,
+		GoVersion:          *goVersion,
+		UseLLM:             *useLLM,
+		LLMModel:           *llmModel,
+		MineAdvisories:     *mine,
+		TrustImportAbsence: *trustAbs,
+		Logf:               logf,
+	}
+	// A misspelled selector is a command-line error, so it exits 2 and it says
+	// so before the pull rather than after it.
+	if err := analyze.Validate(opts); err != nil {
+		fail("%v", err)
+	}
+
+	res, err := analyze.Run(ctx, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -107,11 +150,8 @@ func main() {
 			os.Exit(1)
 		}
 		rendered = string(b) + "\n"
-	case "text":
+	default: // --format was validated up front; inventory returned earlier
 		rendered = renderText(res)
-	default:
-		fmt.Fprintf(os.Stderr, "error: unknown --format %q\n", *format)
-		os.Exit(2)
 	}
 
 	if *out != "" {
@@ -133,6 +173,26 @@ func main() {
 		logf("Uploaded report to gist")
 		fmt.Println(url)
 	}
+
+	// The report is written first and the failure reported after, because an
+	// incomplete report is still worth having -- but it must never exit 0. A
+	// zero status on a scan that could not read a package database is how a
+	// broken CI job passes.
+	if res.Failed() {
+		for _, e := range res.Ecosystems {
+			if e.Error != "" {
+				fmt.Fprintf(os.Stderr, "error: ecosystem %s did not complete: %s\n", e.ID, e.Error)
+			}
+		}
+		os.Exit(1)
+	}
+}
+
+// fail prints a usage error and exits 2.
+func fail(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "error: "+format+"\n", args...)
+	flag.Usage()
+	os.Exit(2)
 }
 
 // runInventory handles --format inventory, which lists the image's OS packages
@@ -206,7 +266,10 @@ func uploadGist(ctx context.Context, res *analyze.Result, rendered, format strin
 	if format == "json" {
 		filename = "vexscan-report.json"
 	}
-	desc := fmt.Sprintf("vexscan %s report for %s (module %s)", res.Mode, res.Target, res.Module)
+	desc := fmt.Sprintf("vexscan %s report for %s", res.Mode, res.Target)
+	if res.Module != "" {
+		desc += fmt.Sprintf(" (module %s)", res.Module)
+	}
 	return client.Create(ctx, filename, desc, rendered, public)
 }
 
@@ -243,11 +306,21 @@ func parseCVEs(flagVal, file string) []string {
 func renderText(res *analyze.Result) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "vexscan report (%s) for %s\n", res.Mode, res.Target)
-	fmt.Fprintf(&b, "module: %s\n\n", res.Module)
+	if res.Module != "" {
+		fmt.Fprintf(&b, "module: %s\n", res.Module)
+	}
+	for _, e := range res.Ecosystems {
+		if e.Error != "" {
+			// Above the findings, not below: a reader who stops after the
+			// summary must still see that part of the target went unexamined.
+			fmt.Fprintf(&b, "INCOMPLETE: ecosystem %s did not run - %s\n", e.ID, e.Error)
+		}
+	}
+	b.WriteString("\n")
 
 	if len(res.Findings) == 0 {
-		b.WriteString("No findings: the module was not linked into any Go binary in this image,\n")
-		b.WriteString("or no matching advisories were found.\n")
+		b.WriteString("No findings: nothing selected was found in this target,\n")
+		b.WriteString("or no matching advisories were published for it.\n")
 		return b.String()
 	}
 
@@ -266,8 +339,11 @@ func renderText(res *analyze.Result) string {
 		if f.GoID != "" && f.GoID != f.CVE {
 			id = fmt.Sprintf("%s (%s)", f.CVE, f.GoID)
 		}
-		fmt.Fprintf(&b, "%-22s %s@%s\n", statusLabel(f.Status), f.Module, f.Version)
+		fmt.Fprintf(&b, "%-22s %s\n", statusLabel(f.Status), component(f))
 		fmt.Fprintf(&b, "  cve:      %s\n", id)
+		if f.Ecosystem != "" {
+			fmt.Fprintf(&b, "  from:     %s\n", f.Ecosystem)
+		}
 		if f.Binary != "" {
 			fmt.Fprintf(&b, "  binary:   %s%s\n", f.Binary, strippedNote(f.Stripped))
 		}
@@ -308,6 +384,20 @@ func statusLabel(s analyze.Status) string {
 	}
 }
 
+// component names what a finding is about. An id that matched nothing in the
+// target has no component at all, and printing "@" for it would look like a
+// package whose name failed to render.
+func component(f analyze.Finding) string {
+	switch {
+	case f.Package == "":
+		return "(no matching component)"
+	case f.Version == "":
+		return f.Package
+	default:
+		return f.Package + "@" + f.Version
+	}
+}
+
 // strippedNote annotates a binary that carries no symbol table. Nil means the
 // question does not apply: an OS package is not a Go binary.
 func strippedNote(stripped *bool) string {
@@ -318,31 +408,56 @@ func strippedNote(stripped *bool) string {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `vexscan - check whether Go-module CVEs are actually present in an image or source repo
+	fmt.Fprint(os.Stderr, `vexscan - check whether a CVE's vulnerable code is actually present in an image or source repo
+
+Every ecosystem brings its own deterministic presence test: pclntab
+dead-code-elimination evidence and govulncheck for Go, the dynamic linker's
+DT_NEEDED closure for OS packages. The LLM, if enabled, only ever comments on
+what those tests could not rule out.
 
 Usage:
-  vexscan --image REF   --module PATH [--cves LIST] [flags]
-  vexscan --repo  REPO  --module PATH [--cves LIST] [flags]
+  vexscan --image REF  (--package SPEC... | --cves LIST | --all) [flags]
+  vexscan --repo  REPO (--package SPEC... | --cves LIST | --all) [flags]
+
+A --package SPEC is a purl, an "ecosystem:name" shorthand, or a bare name
+resolved against whatever inventory contains it:
+
+  golang:golang.org/x/net    deb:openssl    apk:musl    openssl
+  pkg:golang/golang.org%2Fx%2Fnet@v0.17.0
 
 Examples:
-  # Container image (pclntab + govulncheck binary mode)
-  vexscan --image rancher/hardened-kubernetes:v1.30.1 --module golang.org/x/net \
-    --cves CVE-2023-39325,CVE-2023-44487
+  # One Go module in a container image (pclntab + govulncheck binary mode)
+  vexscan --image rancher/hardened-kubernetes:v1.30.1 \
+    --package golang:golang.org/x/net --cves CVE-2023-39325,CVE-2023-44487
+
+  # Where does this CVE land, anywhere in the image? (searches every ecosystem)
+  vexscan --image debian:12 --cves CVE-2024-5535
+
+  # One OS package, with the shared-library closure as the presence test
+  vexscan --image debian:12 --package deb:openssl
+
+  # Everything the image installs, OS packages only
+  vexscan --image registry.access.redhat.com/ubi9/ubi:latest --all --ecosystem os
 
   # Source repo (govulncheck source-mode reachability)
-  vexscan --repo github.com/rancher/rancher --module golang.org/x/net \
-    --cves CVE-2023-39325
+  vexscan --repo github.com/rancher/rancher \
+    --package golang:golang.org/x/net --cves CVE-2023-39325
 
-  # Standard library CVEs (module "stdlib")
-  vexscan --image myorg/app:latest --module stdlib --cves CVE-2025-22870
-  vexscan --repo github.com/rancher/rancher --module stdlib --go-version 1.24.0
+  # Standard library CVEs
+  vexscan --image myorg/app:latest --package golang:stdlib --cves CVE-2025-22870
+  vexscan --repo github.com/rancher/rancher --package golang:stdlib --go-version 1.24.0
 
   # List the OS packages in an image, with the names OSV will be queried by
   vexscan --image debian:12 --format inventory
 
   # Share the report as a public gist (needs GITHUB_TOKEN/GH_TOKEN with gist scope)
-  vexscan --image rancher/hardened-kubernetes:v1.30.1 --module golang.org/x/net \
-    --cves CVE-2023-39325 --gist
+  vexscan --image rancher/hardened-kubernetes:v1.30.1 \
+    --package golang:golang.org/x/net --cves CVE-2023-39325 --gist
+
+Exit status:
+  0  the scan completed
+  1  the scan failed, or an ecosystem could not be read (the report says which)
+  2  the command line was wrong
 
 Flags:
 `)
