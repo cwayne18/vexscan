@@ -351,30 +351,60 @@ func stderrSuffix(stderrTxt string) string {
 	return "\ngovulncheck stderr: " + stderrTxt
 }
 
-// parsePurl extracts module + version from the first golang purl subcomponent,
-// e.g. pkg:golang/golang.org%2Fx%2Fnet@v0.7.0 -> golang.org/x/net, v0.7.0.
-func parsePurl(products []product) (module, version string) {
+// parsePurl extracts the package name and version from the first purl
+// subcomponent, e.g. pkg:golang/golang.org%2Fx%2Fnet@v0.7.0 ->
+// golang.org/x/net, v0.7.0.
+//
+// Any purl type is accepted, not just pkg:golang. govulncheck emits Go purls
+// today, but this parses OpenVEX documents, and refusing to read a purl whose
+// type we did not anticipate would silently drop the statement rather than
+// report it — the wrong failure direction for a tool that publishes VEX.
+func parsePurl(products []product) (name, version string) {
 	for _, p := range products {
 		for _, sc := range p.Subcomponents {
-			id := sc.ID
-			const prefix = "pkg:golang/"
-			if !strings.HasPrefix(id, prefix) {
-				continue
+			name, version, ok := splitPurl(sc.ID)
+			if ok {
+				return name, version
 			}
-			body := strings.TrimPrefix(id, prefix)
-			if at := strings.LastIndex(body, "@"); at >= 0 {
-				version = body[at+1:]
-				body = body[:at]
-			}
-			if decoded, err := url.PathUnescape(body); err == nil {
-				module = decoded
-			} else {
-				module = body
-			}
-			return module, version
 		}
 	}
 	return "", ""
+}
+
+// splitPurl decomposes pkg:<type>/<namespace>/<name>@<version>?<qualifiers>#<subpath>
+// into its name (namespace and name joined, percent-decoded) and version.
+func splitPurl(id string) (name, version string, ok bool) {
+	const scheme = "pkg:"
+	if !strings.HasPrefix(id, scheme) {
+		return "", "", false
+	}
+	body := strings.TrimPrefix(id, scheme)
+
+	// Trim the trailing components in purl order, so a "@" or "?" appearing
+	// inside a subpath or a qualifier value cannot be mistaken for a separator.
+	if i := strings.Index(body, "#"); i >= 0 {
+		body = body[:i]
+	}
+	if i := strings.Index(body, "?"); i >= 0 {
+		body = body[:i]
+	}
+	// The type is everything up to the first "/" and is not part of the name.
+	slash := strings.Index(body, "/")
+	if slash < 0 {
+		return "", "", false
+	}
+	body = body[slash+1:]
+	if at := strings.LastIndex(body, "@"); at >= 0 {
+		version = body[at+1:]
+		body = body[:at]
+	}
+	if decoded, err := url.PathUnescape(body); err == nil {
+		body = decoded
+	}
+	if body == "" {
+		return "", "", false
+	}
+	return body, version, true
 }
 
 func run(ctx context.Context, dir, name string, args ...string) (string, error) {

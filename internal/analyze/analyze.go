@@ -1,7 +1,12 @@
-// Package analyze orchestrates the vexscan pipeline: extract an image, find
-// its Go binaries, resolve vulnerable packages from OSV, and decide for each
-// requested CVE whether the vulnerable code is present / reachable, optionally
-// consulting an LLM for the genuinely-linked survivors.
+// Package analyze orchestrates the vexscan pipeline: prepare a target
+// (extract an image, or check out a source tree), ask each ecosystem plugin
+// what it finds, resolve advisories for what the plugins inventory, and
+// optionally overlay an LLM assessment on the genuinely-affected results.
+//
+// The division of labour is deliberate. Plugins own the *deterministic*
+// question — is this vulnerable code present, and can it run — and nothing
+// else. This package owns advisory resolution and the LLM overlay, so no
+// plugin can make the model's opinion load-bearing.
 package analyze
 
 import (
@@ -9,15 +14,13 @@ import (
 	"fmt"
 	"os"
 	"sort"
-	"strings"
 
-	"github.com/cwayne18/vexscan/internal/binscan"
 	"github.com/cwayne18/vexscan/internal/ecosystem"
+	"github.com/cwayne18/vexscan/internal/ecosystem/golang"
 	"github.com/cwayne18/vexscan/internal/image"
 	"github.com/cwayne18/vexscan/internal/llm"
 	"github.com/cwayne18/vexscan/internal/osv"
 	"github.com/cwayne18/vexscan/internal/source"
-	"github.com/cwayne18/vexscan/internal/target"
 )
 
 // The finding vocabulary lives in internal/ecosystem, which is what the plugins
@@ -76,9 +79,8 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	}
 	// The Go standard library is "stdlib" in OSV and govulncheck; accept "std"
 	// as a convenience alias.
-	if opts.Module == "std" {
-		opts.Module = binscan.StdlibModule
-	}
+	opts.Module = golang.NormalizeModule(opts.Module)
+
 	if opts.Image != "" && opts.Repo != "" {
 		return nil, fmt.Errorf("set only one of --image or --repo")
 	}
@@ -91,17 +93,39 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	return nil, fmt.Errorf("one of --image or --repo is required")
 }
 
-// runImage extracts a container image and inspects its Go binaries.
+// registryFor builds the plugin set for a run. Go is the only ecosystem today;
+// the OS, PyPI and npm plugins register here.
+func registryFor(opts Options) *ecosystem.Registry {
+	return ecosystem.NewRegistry(
+		golang.New(golang.Options{
+			VersionOverride: opts.Version,
+			GoVersion:       opts.GoVersion,
+			Logf:            opts.Logf,
+		}),
+	)
+}
+
+// subjectsFor turns the user's selection into plugin subjects. Today that is
+// exactly --module; --package and --all arrive with the new CLI surface.
+func subjectsFor(opts Options) []ecosystem.Subject {
+	return []ecosystem.Subject{{Name: opts.Module, Raw: opts.Module}}
+}
+
+// runImage extracts a container image and hands it to every image analyzer.
 func runImage(ctx context.Context, opts Options) (*Result, error) {
 	logf := opts.Logf
-	if logf == nil {
-		logf = func(string, ...any) {}
-	}
 	if opts.OS == "" {
 		opts.OS = "linux"
 	}
 	if opts.Arch == "" {
 		opts.Arch = "amd64"
+	}
+
+	// Build the LLM client before the extraction: a missing or rejected token
+	// should fail in the first second, not after a multi-gigabyte pull.
+	llmClient, err := newLLM(opts)
+	if err != nil {
+		return nil, err
 	}
 
 	dest, err := os.MkdirTemp("", "vexscan-fs-")
@@ -118,333 +142,206 @@ func runImage(ctx context.Context, opts Options) (*Result, error) {
 		return nil, fmt.Errorf("extract image: %w", err)
 	}
 
-	logf("Scanning for Go binaries...")
-	bins := binscan.FindGoBinaries(img.FS.Root())
-	logf("Found %d Go binaries.", len(bins))
-
-	osvClient := osv.NewClient()
-	osvCache := map[string]map[string]*osv.Advisory{} // version -> advisory map
-
-	var llmClient *llm.Client
-	if opts.UseLLM {
-		llmClient, err = llm.NewClient(opts.LLMModel, opts.Token)
-		if err != nil {
-			return nil, fmt.Errorf("llm client: %w", err)
-		}
-	}
-
+	analyzers := ecosystem.ImageAnalyzers(registryFor(opts).All())
+	subjects := subjectsFor(opts)
+	resolver := newResolver()
 	result := &Result{Target: opts.Image, Mode: "image", Module: opts.Module}
 
-	for _, bin := range bins {
-		version := opts.Version
-		if version == "" {
-			version = bin.ModuleVersion(opts.Module)
-		}
-		if version == "" {
-			continue // module not linked into this binary and no override given
-		}
-		rel := target.Rel(img.FS.Root(), bin.Path)
-
-		advMap, ok := osvCache[version]
-		if !ok {
-			advMap, err = osvClient.Query(ctx, opts.Module, version)
-			if err != nil {
-				logf("  ! OSV query failed for %s@%s: %v", opts.Module, version, err)
-				advMap = map[string]*osv.Advisory{}
-			}
-			osvCache[version] = advMap
-		}
-
-		syms, err := binscan.LoadSymbols(bin.Path)
+	applied := 0
+	for _, a := range analyzers {
+		ok, err := a.DetectImage(ctx, img)
 		if err != nil {
-			logf("  ! cannot read %s: %v", rel, err)
+			return nil, fmt.Errorf("%s: detect: %w", a.ID(), err)
+		}
+		if !ok {
 			continue
 		}
-		stripped := binscan.IsStripped(bin.Path)
+		applied++
 
-		// govulncheck is computed lazily (only for non-stripped binaries with a
-		// linked package candidate).
-		var gvIDs map[string]struct{}
-		gvDone := false
-		govuln := func() map[string]struct{} {
-			if !gvDone {
-				gvIDs = binscan.GovulncheckNotAffected(ctx, bin.Path)
-				gvDone = true
-			}
-			return gvIDs
+		components, err := a.InventoryImage(ctx, img, subjects)
+		if err != nil {
+			return nil, fmt.Errorf("%s: inventory: %w", a.ID(), err)
 		}
 
-		for _, req := range resolveRequests(opts.CVEs, advMap) {
-			f := evaluate(ctx, evalCtx{
-				binaryRel: rel,
-				module:    opts.Module,
-				version:   version,
-				stripped:  stripped,
-				syms:      syms,
-				govuln:    govuln,
-				llmClient: llmClient,
-				logf:      logf,
-			}, req.id, req.adv)
-			result.Findings = append(result.Findings, f)
+		findings, err := a.AnalyzeImage(ctx, img, resolver.workItems(ctx, components, opts.CVEs, logf))
+		if err != nil {
+			return nil, fmt.Errorf("%s: analyze: %w", a.ID(), err)
 		}
+		result.Findings = append(result.Findings, findings...)
+	}
+	if applied == 0 {
+		return nil, fmt.Errorf("no ecosystem could analyze %s", opts.Image)
 	}
 
-	sort.Slice(result.Findings, func(i, j int) bool {
-		a, b := result.Findings[i], result.Findings[j]
+	llmOverlay(ctx, llmClient, result.Findings, "", logf)
+	sortFindings(result.Findings)
+	return result, nil
+}
+
+// runRepo checks out a git repository and hands it to every source analyzer.
+func runRepo(ctx context.Context, opts Options) (*Result, error) {
+	logf := opts.Logf
+
+	llmClient, err := newLLM(opts)
+	if err != nil {
+		return nil, err
+	}
+
+	src, cleanup, err := source.Checkout(ctx, opts.Repo, opts.Ref, opts.Path, logf)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
+	analyzers := ecosystem.SourceAnalyzers(registryFor(opts).All())
+	subjects := subjectsFor(opts)
+	result := &Result{Target: opts.Repo, Mode: "repo", Module: opts.Module}
+
+	applied := 0
+	for _, a := range analyzers {
+		ok, err := a.DetectSource(ctx, src)
+		if err != nil {
+			return nil, fmt.Errorf("%s: detect: %w", a.ID(), err)
+		}
+		if !ok {
+			continue
+		}
+		applied++
+
+		findings, err := a.AnalyzeSource(ctx, src, subjects, opts.CVEs)
+		if err != nil {
+			return nil, err
+		}
+		result.Findings = append(result.Findings, findings...)
+	}
+	// No analyzer recognizing the tree must not read as a clean scan: an empty
+	// findings array is indistinguishable from "checked, nothing wrong".
+	if applied == 0 {
+		return nil, fmt.Errorf("no ecosystem could analyze %s (looked in %s)", opts.Repo, src.Subdir)
+	}
+
+	llmOverlay(ctx, llmClient, result.Findings, "source tree", logf)
+	sortFindings(result.Findings)
+	return result, nil
+}
+
+// advisoryResolver turns an inventory into per-component advisory sets.
+//
+// It lives here rather than in the plugins so that no plugin decides which
+// advisories exist for the code it just examined — the presence test and the
+// vulnerability list come from independent parties.
+type advisoryResolver struct {
+	client *osv.Client
+	cache  map[string]map[string]*osv.Advisory // component key -> advisories
+}
+
+func newResolver() *advisoryResolver {
+	return &advisoryResolver{
+		client: osv.NewClient(),
+		cache:  map[string]map[string]*osv.Advisory{},
+	}
+}
+
+// workItems pairs each component with its advisories and the requested ids.
+func (r *advisoryResolver) workItems(ctx context.Context, components []ecosystem.Component, requested []string, logf func(string, ...any)) []ecosystem.WorkItem {
+	out := make([]ecosystem.WorkItem, 0, len(components))
+	for _, c := range components {
+		out = append(out, ecosystem.WorkItem{
+			Component:  c,
+			Advisories: r.advisories(ctx, c, logf),
+			Requested:  requested,
+		})
+	}
+	return out
+}
+
+// advisories resolves one component, caching by key so several binaries linking
+// the same module version cost a single query.
+//
+// A lookup failure yields an empty advisory set rather than an error, which is
+// what makes an explicitly requested id still report as undetermined instead of
+// aborting the whole run.
+func (r *advisoryResolver) advisories(ctx context.Context, c ecosystem.Component, logf func(string, ...any)) map[string]*osv.Advisory {
+	if adv, ok := r.cache[c.Key()]; ok {
+		return adv
+	}
+	adv := map[string]*osv.Advisory{}
+	if c.Ecosystem != "Go" {
+		// internal/osv speaks only the Go database so far.
+		logf("  ! no advisory source for ecosystem %s yet", c.Ecosystem)
+		r.cache[c.Key()] = adv
+		return adv
+	}
+	got, err := r.client.Query(ctx, c.Name, c.Version)
+	if err != nil {
+		logf("  ! OSV query failed for %s@%s: %v", c.Name, c.Version, err)
+	} else {
+		adv = got
+	}
+	r.cache[c.Key()] = adv
+	return adv
+}
+
+// newLLM builds the assessment client, or returns nil when --llm is off.
+func newLLM(opts Options) (*llm.Client, error) {
+	if !opts.UseLLM {
+		return nil, nil
+	}
+	c, err := llm.NewClient(opts.LLMModel, opts.Token)
+	if err != nil {
+		return nil, fmt.Errorf("llm client: %w", err)
+	}
+	return c, nil
+}
+
+// llmOverlay attaches a model assessment to each genuinely-affected finding,
+// in place.
+//
+// It runs after every plugin has finished, which is what makes the LLM an
+// overlay in fact and not just in intent: no status in the report can depend on
+// it, and turning --llm off changes only whether an "llm" object is attached.
+//
+// location names what was analyzed for findings that have no binary of their
+// own, because repo mode assesses a source tree rather than an artifact.
+// A failed assessment is logged and skipped: losing an advisory opinion must
+// never lose the deterministic finding underneath it.
+func llmOverlay(ctx context.Context, client *llm.Client, findings []Finding, location string, logf func(string, ...any)) {
+	if client == nil {
+		return
+	}
+	for i := range findings {
+		f := &findings[i]
+		if !f.Affected() {
+			continue
+		}
+		binary := f.Binary
+		if binary == "" {
+			binary = location
+		}
+		v, err := client.Assess(ctx, llm.Request{
+			CVE:       f.CVE,
+			Module:    f.Module,
+			Version:   f.Version,
+			Packages:  f.Packages,
+			Binary:    binary,
+			Reachable: f.Reachability,
+		})
+		if err != nil {
+			logf("  ! LLM assess failed for %s: %v", f.CVE, err)
+			continue
+		}
+		f.LLM = v
+	}
+}
+
+// sortFindings orders findings by location then advisory id. Repo-mode findings
+// have no binary, so they sort by id alone, as they always have.
+func sortFindings(findings []Finding) {
+	sort.SliceStable(findings, func(i, j int) bool {
+		a, b := findings[i], findings[j]
 		if a.Binary != b.Binary {
 			return a.Binary < b.Binary
 		}
 		return a.CVE < b.CVE
 	})
-	return result, nil
-}
-
-// runRepo clones a git repository and runs govulncheck in source mode, whose
-// call-graph reachability is authoritative for a source tree.
-func runRepo(ctx context.Context, opts Options) (*Result, error) {
-	logf := opts.Logf
-
-	var llmClient *llm.Client
-	if opts.UseLLM {
-		var err error
-		llmClient, err = llm.NewClient(opts.LLMModel, opts.Token)
-		if err != nil {
-			return nil, fmt.Errorf("llm client: %w", err)
-		}
-	}
-
-	stmts, err := source.CloneAndScan(ctx, opts.Repo, opts.Ref, opts.Path, opts.GoVersion, logf)
-	if err != nil {
-		return nil, err
-	}
-
-	result := &Result{Target: opts.Repo, Mode: "repo", Module: opts.Module}
-
-	// Index statements for the target module by every id they are known by.
-	byID := map[string]source.Statement{}
-	moduleSeen := false
-	var moduleVersion string
-	for _, st := range stmts {
-		if st.Module != opts.Module {
-			continue
-		}
-		moduleSeen = true
-		if moduleVersion == "" {
-			moduleVersion = st.Version
-		}
-		for _, id := range st.IDs() {
-			byID[id] = st
-		}
-	}
-
-	makeFinding := func(id string, st source.Statement, matched bool) Finding {
-		f := Finding{
-			Module:  opts.Module,
-			Version: moduleVersion,
-			CVE:     id,
-			Method:  "govulncheck-source",
-		}
-		if !matched {
-			// No govulncheck statement for this id at the scanned version.
-			if moduleSeen {
-				f.Version = moduleVersion
-				f.Status = StatusNotPresent
-				f.Justification = "vulnerable_code_not_present"
-				f.Reason = "not flagged by govulncheck source analysis"
-			} else {
-				f.Status = StatusUndetermined
-				f.Reason = "module_not_in_dependency_graph"
-			}
-			return f
-		}
-		f.GoID = st.GoID
-		f.Version = st.Version
-		switch {
-		case st.Status == "affected":
-			f.Status = StatusReachable
-			if llmClient != nil {
-				v, lerr := llmClient.Assess(ctx, llm.Request{
-					CVE:       id,
-					Module:    opts.Module,
-					Version:   st.Version,
-					Binary:    "source tree",
-					Reachable: "reachable (govulncheck source mode: the vulnerable symbol is called)",
-				})
-				if lerr != nil {
-					logf("  ! LLM assess failed for %s: %v", id, lerr)
-				} else {
-					f.LLM = v
-				}
-			}
-		case st.Justification == "vulnerable_code_not_in_execute_path":
-			f.Status = StatusNotInPath
-			f.Justification = st.Justification
-		default: // vulnerable_code_not_present or any other not_affected
-			f.Status = StatusNotPresent
-			if st.Justification != "" {
-				f.Justification = st.Justification
-			} else {
-				f.Justification = "vulnerable_code_not_present"
-			}
-		}
-		return f
-	}
-
-	if len(opts.CVEs) > 0 {
-		for _, id := range opts.CVEs {
-			st, ok := byID[id]
-			result.Findings = append(result.Findings, makeFinding(id, st, ok))
-		}
-	} else {
-		// Report every distinct advisory govulncheck found for the module.
-		seen := map[string]bool{}
-		for _, st := range stmts {
-			if st.Module != opts.Module || seen[st.GoID] {
-				continue
-			}
-			seen[st.GoID] = true
-			id := primaryID(st)
-			result.Findings = append(result.Findings, makeFinding(id, st, true))
-		}
-	}
-
-	sort.Slice(result.Findings, func(i, j int) bool {
-		return result.Findings[i].CVE < result.Findings[j].CVE
-	})
-	return result, nil
-}
-
-// primaryID prefers a CVE alias for display, falling back to the GO id.
-func primaryID(st source.Statement) string {
-	for _, a := range st.Aliases {
-		if strings.HasPrefix(a, "CVE-") {
-			return a
-		}
-	}
-	return st.GoID
-}
-
-type request struct {
-	id  string
-	adv *osv.Advisory
-}
-
-// resolveRequests turns the CVE filter (or "all") into concrete advisory
-// lookups. In filter mode every requested id is returned, with a nil advisory
-// when OSV has no mapping (recorded as undetermined). In "all" mode every
-// distinct advisory is returned keyed by its canonical GO id.
-func resolveRequests(cves []string, advMap map[string]*osv.Advisory) []request {
-	if len(cves) > 0 {
-		out := make([]request, 0, len(cves))
-		for _, id := range cves {
-			out = append(out, request{id: id, adv: advMap[id]})
-		}
-		return out
-	}
-	seen := map[string]bool{}
-	var out []request
-	for _, adv := range advMap {
-		if seen[adv.GoID] {
-			continue
-		}
-		seen[adv.GoID] = true
-		out = append(out, request{id: adv.GoID, adv: adv})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].id < out[j].id })
-	return out
-}
-
-type evalCtx struct {
-	binaryRel string
-	module    string
-	version   string
-	stripped  bool
-	syms      *binscan.Symbols
-	govuln    func() map[string]struct{}
-	llmClient *llm.Client
-	logf      func(string, ...any)
-}
-
-func evaluate(ctx context.Context, ec evalCtx, id string, adv *osv.Advisory) Finding {
-	f := Finding{
-		Binary:   ec.binaryRel,
-		Module:   ec.module,
-		Version:  ec.version,
-		CVE:      id,
-		Stripped: ec.stripped,
-	}
-	if adv == nil {
-		f.Status = StatusUndetermined
-		f.Reason = "no_osv_package_mapping"
-		return f
-	}
-	f.GoID = adv.GoID
-
-	var pkgs []string
-	var linked bool
-	if len(adv.Pkgs) > 0 {
-		pkgs = append(pkgs, adv.Pkgs...)
-		sort.Strings(pkgs)
-		f.Granularity = "package"
-		for _, p := range pkgs {
-			if ec.syms.PackagePresent(p) {
-				linked = true
-				break
-			}
-		}
-	} else {
-		pkgs = []string{ec.module}
-		f.Granularity = "module"
-		linked = ec.syms.ModulePresent(ec.module)
-	}
-	f.Packages = pkgs
-
-	switch {
-	case !linked:
-		f.Status = StatusNotPresent
-		f.Justification = "vulnerable_code_not_present"
-		if f.Granularity == "module" {
-			f.Method = "pclntab-module"
-		} else {
-			f.Method = "pclntab"
-		}
-	case f.Granularity == "package" && !ec.stripped && inNotAffected(ec.govuln(), id, adv.GoID):
-		f.Status = StatusNotInPath
-		f.Justification = "vulnerable_code_not_in_execute_path"
-		f.Method = "govulncheck"
-	default:
-		f.Status = StatusLinked
-		if ec.llmClient != nil {
-			v, err := ec.llmClient.Assess(ctx, llm.Request{
-				CVE:       id,
-				Module:    ec.module,
-				Version:   ec.version,
-				Packages:  pkgs,
-				Binary:    ec.binaryRel,
-				Reachable: reachability(ec.stripped),
-			})
-			if err != nil {
-				ec.logf("  ! LLM assess failed for %s: %v", id, err)
-			} else {
-				f.LLM = v
-			}
-		}
-	}
-	return f
-}
-
-func reachability(stripped bool) string {
-	if stripped {
-		return "linked"
-	}
-	return "linked (symbols retained; reachability not asserted)"
-}
-
-func inNotAffected(set map[string]struct{}, ids ...string) bool {
-	for _, id := range ids {
-		if _, ok := set[id]; ok {
-			return true
-		}
-	}
-	return false
 }

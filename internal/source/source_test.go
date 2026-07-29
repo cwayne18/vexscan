@@ -56,6 +56,70 @@ func TestParsePurlStdlib(t *testing.T) {
 	}
 }
 
+func TestSplitPurl(t *testing.T) {
+	tests := []struct {
+		id          string
+		name        string
+		version     string
+		ok          bool
+		description string
+	}{
+		{"pkg:golang/golang.org%2Fx%2Fnet@v0.7.0", "golang.org/x/net", "v0.7.0", true,
+			"the Go form govulncheck emits"},
+		{"pkg:golang/stdlib@go1.21.5", "stdlib", "go1.21.5", true,
+			"stdlib has no namespace"},
+		{"pkg:golang/golang.org%2Fx%2Fnet", "golang.org/x/net", "", true,
+			"a purl need not carry a version"},
+
+		// Any purl type parses. Refusing an unanticipated type would drop the
+		// statement instead of reporting it -- the wrong failure direction.
+		{"pkg:deb/debian/openssl@3.0.11-1", "debian/openssl", "3.0.11-1", true,
+			"a deb purl"},
+		{"pkg:pypi/django@4.2.1", "django", "4.2.1", true, "a PyPI purl"},
+		{"pkg:npm/%40angular/core@13.0.0", "@angular/core", "13.0.0", true,
+			"an npm scoped package"},
+
+		{"pkg:deb/debian/openssl@3.0.11-1?arch=amd64", "debian/openssl", "3.0.11-1", true,
+			"qualifiers are trimmed"},
+		{"pkg:golang/example.com%2Fm@v1.0.0#sub/dir", "example.com/m", "v1.0.0", true,
+			"a subpath is trimmed"},
+		// "@" inside a qualifier value must not be read as the version separator.
+		{"pkg:deb/debian/x@1.0?note=a@b", "debian/x", "1.0", true,
+			"a qualifier containing @ does not confuse the version split"},
+
+		{"golang.org/x/net@v0.7.0", "", "", false, "not a purl at all"},
+		{"pkg:golang", "", "", false, "a type with no name"},
+		{"pkg:golang/", "", "", false, "an empty name"},
+		{"", "", "", false, "empty"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.description, func(t *testing.T) {
+			name, version, ok := splitPurl(tt.id)
+			if ok != tt.ok || name != tt.name || version != tt.version {
+				t.Errorf("splitPurl(%q) = %q, %q, %v; want %q, %q, %v",
+					tt.id, name, version, ok, tt.name, tt.version, tt.ok)
+			}
+		})
+	}
+}
+
+// parsePurl skips subcomponents it cannot read and keeps looking, so one
+// unparseable @id does not lose the statement.
+func TestParsePurlSkipsUnparseableSubcomponents(t *testing.T) {
+	products := []product{
+		{Subcomponents: []struct {
+			ID string `json:"@id"`
+		}{
+			{ID: "not-a-purl"},
+			{ID: "pkg:golang/golang.org%2Fx%2Fnet@v0.7.0"},
+		}},
+	}
+	mod, ver := parsePurl(products)
+	if mod != "golang.org/x/net" || ver != "v0.7.0" {
+		t.Errorf("got %q@%q", mod, ver)
+	}
+}
+
 func TestDiagnoseNoOutputOOM(t *testing.T) {
 	stderr := "go: downloading golang.org/x/vuln v1.6.0\nsignal: killed"
 	err := diagnoseNoOutput(context.Background(), nil, stderr)
