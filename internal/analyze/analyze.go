@@ -266,15 +266,17 @@ func (r *advisoryResolver) advisories(ctx context.Context, c ecosystem.Component
 		return adv
 	}
 	adv := map[string]*osv.Advisory{}
-	if c.Ecosystem != "Go" {
-		// internal/osv speaks only the Go database so far.
-		logf("  ! no advisory source for ecosystem %s yet", c.Ecosystem)
+	if c.Ecosystem == "" {
+		// An empty ecosystem is not a query OSV can answer, and a component
+		// that silently resolves to zero advisories reads as clean. Say so.
+		logf("  ! component %s@%s declares no ecosystem; skipping advisory lookup", c.Name, c.Version)
 		r.cache[c.Key()] = adv
 		return adv
 	}
-	got, err := r.client.Query(ctx, c.Name, c.Version)
+	ref := osv.Ref{Ecosystem: c.Ecosystem, Name: c.Name, Version: c.Version}
+	got, err := r.client.Query(ctx, ref)
 	if err != nil {
-		logf("  ! OSV query failed for %s@%s: %v", c.Name, c.Version, err)
+		logf("  ! OSV query failed for %s: %v", ref, err)
 	} else {
 		adv = got
 	}

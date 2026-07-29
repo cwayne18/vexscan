@@ -189,7 +189,7 @@ func osvServer(t *testing.T) (*osv.Client, *int) {
 			"ecosystem_specific":{"imports":[{"path":"golang.org/x/net/http2"}]}}]}]}`))
 	}))
 	t.Cleanup(srv.Close)
-	return &osv.Client{HTTP: srv.Client(), URL: srv.URL}, &calls
+	return &osv.Client{HTTP: srv.Client(), BaseURL: srv.URL}, &calls
 }
 
 func TestResolverQueriesEachComponentOnce(t *testing.T) {
@@ -230,7 +230,7 @@ func TestResolverSurvivesOSVFailure(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	r := &advisoryResolver{
-		client: &osv.Client{HTTP: srv.Client(), URL: srv.URL},
+		client: &osv.Client{HTTP: srv.Client(), BaseURL: srv.URL},
 		cache:  map[string]map[string]*osv.Advisory{},
 	}
 
@@ -254,26 +254,56 @@ func TestResolverSurvivesOSVFailure(t *testing.T) {
 	}
 }
 
-// Until internal/osv speaks other databases, a non-Go component must produce a
-// logged empty advisory set rather than a Go-database query under a wrong name.
-func TestResolverDoesNotQueryNonGoEcosystems(t *testing.T) {
+// The resolver passes a component's own ecosystem through to OSV rather than
+// assuming Go, and leaves a non-Go version unrewritten on the way.
+func TestResolverQueriesEachComponentsOwnEcosystem(t *testing.T) {
+	var got struct {
+		Package struct {
+			Ecosystem string `json:"ecosystem"`
+			Name      string `json:"name"`
+		} `json:"package"`
+		Version string `json:"version"`
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		_ = json.NewDecoder(req.Body).Decode(&got)
+		_, _ = w.Write([]byte(`{"vulns":[]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	r := &advisoryResolver{
+		client: &osv.Client{HTTP: srv.Client(), BaseURL: srv.URL},
+		cache:  map[string]map[string]*osv.Advisory{},
+	}
+	r.workItems(context.Background(),
+		[]ecosystem.Component{{Ecosystem: "Debian:12", Name: "openssl", Version: "3.0.11-1"}},
+		nil,
+		func(string, ...any) {})
+
+	if got.Package.Ecosystem != "Debian:12" || got.Package.Name != "openssl" || got.Version != "3.0.11-1" {
+		t.Errorf("queried %+v, want Debian:12/openssl@3.0.11-1", got)
+	}
+}
+
+// A component with no ecosystem cannot be queried at all. That must be
+// reported, not answered with a silent empty advisory set that reads as clean.
+func TestResolverReportsComponentsWithNoEcosystem(t *testing.T) {
 	client, calls := osvServer(t)
 	r := &advisoryResolver{client: client, cache: map[string]map[string]*osv.Advisory{}}
 
 	var logged int
 	items := r.workItems(context.Background(),
-		[]ecosystem.Component{{Ecosystem: "Debian:12", Name: "openssl", Version: "3.0.11-1"}},
+		[]ecosystem.Component{{Name: "openssl", Version: "3.0.11-1"}},
 		nil,
 		func(string, ...any) { logged++ })
 
 	if *calls != 0 {
-		t.Errorf("queried the Go database for a Debian component (%d calls)", *calls)
+		t.Errorf("queried OSV with no ecosystem (%d calls)", *calls)
 	}
 	if len(items[0].Advisories) != 0 {
 		t.Error("expected no advisories")
 	}
 	if logged == 0 {
-		t.Error("skipping an ecosystem should be reported to the log")
+		t.Error("skipping a component should be reported to the log")
 	}
 }
 

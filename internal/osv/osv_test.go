@@ -3,8 +3,13 @@ package osv
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -33,6 +38,10 @@ const sampleResponse = `{
   ]
 }`
 
+func goRef(name, version string) Ref {
+	return Ref{Ecosystem: GoEcosystem, Name: name, Version: version}
+}
+
 func TestQueryAliasMappingAndPreference(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -41,9 +50,9 @@ func TestQueryAliasMappingAndPreference(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient()
-	c.URL = srv.URL
+	c.BaseURL = srv.URL
 
-	m, err := c.Query(context.Background(), "golang.org/x/net", "v0.7.0")
+	m, err := c.Query(context.Background(), goRef("golang.org/x/net", "v0.7.0"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,32 +69,370 @@ func TestQueryAliasMappingAndPreference(t *testing.T) {
 
 	// CVE-2023-39325 is aliased by both records; the one carrying import paths
 	// must win over the empty GHSA-only record.
-	if got := m["CVE-2023-39325"].GoID; got != "GO-2023-1988" {
-		t.Errorf("expected import-carrying record to win, got GoID %q", got)
+	if got := m["CVE-2023-39325"].ID; got != "GO-2023-1988" {
+		t.Errorf("expected import-carrying record to win, got ID %q", got)
 	}
 }
 
 func TestQueryNormalizesStdlibVersion(t *testing.T) {
-	var gotVersion, gotName string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req queryRequest
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		gotVersion = req.Version
-		gotName = req.Package.Name
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"vulns":[]}`))
+	tests := []struct {
+		name        string
+		ref         Ref
+		wantVersion string
+	}{
+		{"module v prefix", goRef("golang.org/x/net", "v0.7.0"), "0.7.0"},
+		{"stdlib go prefix", goRef("stdlib", "go1.24.0"), "1.24.0"},
+		// A Debian version is an opaque string. Trimming a leading "v" or "go"
+		// off one would silently query a version that does not exist.
+		{"a deb version is left alone", Ref{Ecosystem: "Debian:12", Name: "golang-1.19", Version: "1.19.8-2"}, "1.19.8-2"},
+		{"a deb version starting with v is left alone", Ref{Ecosystem: "Debian:12", Name: "vim", Version: "v2:9.0-1"}, "v2:9.0-1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got queryRequest
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewDecoder(r.Body).Decode(&got)
+				_, _ = w.Write([]byte(`{"vulns":[]}`))
+			}))
+			defer srv.Close()
+
+			c := NewClient()
+			c.BaseURL = srv.URL
+			if _, err := c.Query(context.Background(), tt.ref); err != nil {
+				t.Fatal(err)
+			}
+			if got.Version != tt.wantVersion {
+				t.Errorf("version sent to OSV = %q, want %q", got.Version, tt.wantVersion)
+			}
+			if got.Package.Name != tt.ref.Name {
+				t.Errorf("name sent to OSV = %q, want %q", got.Package.Name, tt.ref.Name)
+			}
+			if got.Package.Ecosystem != tt.ref.Ecosystem {
+				t.Errorf("ecosystem sent to OSV = %q, want %q", got.Package.Ecosystem, tt.ref.Ecosystem)
+			}
+		})
+	}
+}
+
+// ecosystem_specific.imports exists only in the Go database. Reading it for a
+// Debian record would produce an empty Pkgs list that callers read as "OSV
+// published no import paths for this Go module" -- a meaningful signal in Go,
+// and a fabricated one everywhere else.
+func TestImportsAreExtractedOnlyForGo(t *testing.T) {
+	const body = `{"vulns":[{"id":"X","affected":[{"package":{"name":"openssl"},
+		"ecosystem_specific":{"imports":[{"path":"should/not/be/read"}]}}]}]}`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
 	}))
 	defer srv.Close()
 
 	c := NewClient()
-	c.URL = srv.URL
-	if _, err := c.Query(context.Background(), "stdlib", "go1.24.0"); err != nil {
+	c.BaseURL = srv.URL
+
+	deb, err := c.Query(context.Background(), Ref{Ecosystem: "Debian:12", Name: "openssl", Version: "3.0.11-1"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if gotVersion != "1.24.0" {
-		t.Errorf("version sent to OSV = %q, want 1.24.0", gotVersion)
+	if got := deb["X"].Pkgs; len(got) != 0 {
+		t.Errorf("Debian advisory carried import paths %v", got)
 	}
-	if gotName != "stdlib" {
-		t.Errorf("name sent to OSV = %q, want stdlib", gotName)
+
+	// Same payload, Go ref: the field is read.
+	gomod, err := c.Query(context.Background(), goRef("openssl", "v1.0.0"))
+	if err != nil {
+		t.Fatal(err)
 	}
+	if got := gomod["X"].Pkgs; len(got) != 1 || got[0] != "should/not/be/read" {
+		t.Errorf("Go advisory lost its import paths: %v", got)
+	}
+}
+
+func TestQueryCarriesAdvisoryProse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"vulns":[{"id":"DSA-1","summary":"openssl update","details":"a long story"}]}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient()
+	c.BaseURL = srv.URL
+	m, err := c.Query(context.Background(), Ref{Ecosystem: "Debian:12", Name: "openssl"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m["DSA-1"].Summary != "openssl update" || m["DSA-1"].Details != "a long story" {
+		t.Errorf("advisory prose lost: %+v", m["DSA-1"])
+	}
+}
+
+// A bad ecosystem name is a bug in our mapping table, and OSV says so in the
+// response body. It must reach the caller on the first try rather than be
+// retried into a bare "unexpected status 400".
+func TestInvalidEcosystemIsNotRetried(t *testing.T) {
+	var attempts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"code":3,"message":"invalid ecosystem"}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient()
+	c.BaseURL = srv.URL
+	_, err := c.Query(context.Background(), Ref{Ecosystem: "Debain:12", Name: "openssl"})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if attempts != 1 {
+		t.Errorf("made %d attempts, want 1", attempts)
+	}
+
+	var se *StatusError
+	if !errors.As(err, &se) {
+		t.Fatalf("error is not a *StatusError: %v", err)
+	}
+	if se.Retryable() {
+		t.Error("a 400 must not be retryable")
+	}
+	if !strings.Contains(err.Error(), "invalid ecosystem") {
+		t.Errorf("the message OSV sent was dropped: %v", err)
+	}
+}
+
+func TestServerErrorIsRetried(t *testing.T) {
+	var attempts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		if attempts < 3 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte(`{"vulns":[{"id":"GO-1"}]}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient()
+	c.BaseURL = srv.URL
+	m, err := c.Query(context.Background(), goRef("m", "v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 3 {
+		t.Errorf("made %d attempts, want 3", attempts)
+	}
+	if m["GO-1"] == nil {
+		t.Error("lost the advisory the retry recovered")
+	}
+}
+
+func TestStatusErrorRetryable(t *testing.T) {
+	for status, want := range map[int]bool{
+		400: false, 403: false, 404: false,
+		429: true, 500: true, 502: true, 503: true,
+	} {
+		if got := (&StatusError{Status: status}).Retryable(); got != want {
+			t.Errorf("status %d: Retryable() = %v, want %v", status, got, want)
+		}
+	}
+}
+
+// batchServer answers /querybatch from a ref -> ids table and /vulns/{id} from
+// an id -> record table, counting hits on each.
+type batchServer struct {
+	t *testing.T
+
+	mu         sync.Mutex
+	batchCalls int
+	vulnCalls  map[string]int
+	queries    []queryRequest
+}
+
+func newBatchServer(t *testing.T, ids map[string][]string, records map[string]string) (*Client, *batchServer) {
+	t.Helper()
+	rec := &batchServer{t: t, vulnCalls: map[string]int{}}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/querybatch", func(w http.ResponseWriter, r *http.Request) {
+		var req batchRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decoding querybatch: %v", err)
+		}
+		rec.mu.Lock()
+		rec.batchCalls++
+		rec.queries = append(rec.queries, req.Queries...)
+		rec.mu.Unlock()
+
+		var parts []string
+		for _, q := range req.Queries {
+			var vulns []string
+			for _, id := range ids[q.Package.Ecosystem+"/"+q.Package.Name] {
+				vulns = append(vulns, fmt.Sprintf(`{"id":%q,"modified":"2024-01-01T00:00:00Z"}`, id))
+			}
+			parts = append(parts, `{"vulns":[`+strings.Join(vulns, ",")+`]}`)
+		}
+		_, _ = w.Write([]byte(`{"results":[` + strings.Join(parts, ",") + `]}`))
+	})
+	mux.HandleFunc("/vulns/", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, "/vulns/")
+		rec.mu.Lock()
+		rec.vulnCalls[id]++
+		rec.mu.Unlock()
+
+		body, ok := records[id]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &Client{HTTP: srv.Client(), BaseURL: srv.URL}, rec
+}
+
+func TestQueryBatch(t *testing.T) {
+	client, rec := newBatchServer(t,
+		map[string][]string{
+			"Debian:12/openssl": {"DSA-1", "DSA-2"},
+			"Debian:12/curl":    {"DSA-2"},
+			"Debian:12/zlib":    nil,
+		},
+		map[string]string{
+			"DSA-1": `{"id":"DSA-1","aliases":["CVE-2024-0001"],"summary":"one"}`,
+			"DSA-2": `{"id":"DSA-2","aliases":["CVE-2024-0002"],"summary":"two"}`,
+		})
+
+	refs := []Ref{
+		{Ecosystem: "Debian:12", Name: "openssl", Version: "3.0.11-1"},
+		{Ecosystem: "Debian:12", Name: "curl", Version: "7.88-1"},
+		{Ecosystem: "Debian:12", Name: "zlib", Version: "1.2.13-1"},
+	}
+	got, err := client.QueryBatch(context.Background(), refs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(got) != len(refs) {
+		t.Fatalf("got %d result sets for %d refs", len(got), len(refs))
+	}
+	if rec.batchCalls != 1 {
+		t.Errorf("made %d querybatch calls, want 1", rec.batchCalls)
+	}
+	// DSA-2 covers two packages. Hydrating it twice is exactly the cost
+	// batching exists to avoid.
+	if rec.vulnCalls["DSA-2"] != 1 {
+		t.Errorf("fetched DSA-2 %d times, want 1", rec.vulnCalls["DSA-2"])
+	}
+
+	if got[0]["DSA-1"] == nil || got[0]["CVE-2024-0001"] == nil || got[0]["DSA-2"] == nil {
+		t.Errorf("openssl advisories = %v", sortedKeys(got[0]))
+	}
+	if len(got[1]) != 2 || got[1]["CVE-2024-0002"] == nil {
+		t.Errorf("curl advisories = %v", sortedKeys(got[1]))
+	}
+	if len(got[2]) != 0 {
+		t.Errorf("zlib should have no advisories, got %v", sortedKeys(got[2]))
+	}
+	if got[0]["DSA-1"].Summary != "one" {
+		t.Errorf("hydration lost the summary: %+v", got[0]["DSA-1"])
+	}
+}
+
+func TestQueryBatchEmpty(t *testing.T) {
+	client, rec := newBatchServer(t, nil, nil)
+	got, err := client.QueryBatch(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %d results for no refs", len(got))
+	}
+	if rec.batchCalls != 0 {
+		t.Errorf("queried the API with nothing to ask about")
+	}
+}
+
+// A hydration failure fails the whole batch. Dropping the unreadable record
+// and returning the rest would under-report advisories, and an advisory that
+// is never seen can never be triaged.
+func TestQueryBatchFailsWhenHydrationFails(t *testing.T) {
+	client, _ := newBatchServer(t,
+		map[string][]string{"Debian:12/openssl": {"DSA-1", "DSA-MISSING"}},
+		map[string]string{"DSA-1": `{"id":"DSA-1"}`})
+
+	_, err := client.QueryBatch(context.Background(),
+		[]Ref{{Ecosystem: "Debian:12", Name: "openssl", Version: "3.0.11-1"}})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "DSA-MISSING") {
+		t.Errorf("error does not name the record it could not fetch: %v", err)
+	}
+}
+
+func TestQueryBatchChunksAtTheAPILimit(t *testing.T) {
+	client, rec := newBatchServer(t, nil, nil)
+
+	refs := make([]Ref, batchLimit+1)
+	for i := range refs {
+		refs[i] = Ref{Ecosystem: "Debian:12", Name: fmt.Sprintf("pkg%d", i)}
+	}
+	got, err := client.QueryBatch(context.Background(), refs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(refs) {
+		t.Fatalf("got %d results for %d refs", len(got), len(refs))
+	}
+	if rec.batchCalls != 2 {
+		t.Errorf("made %d querybatch calls for %d refs, want 2", rec.batchCalls, len(refs))
+	}
+	if len(rec.queries) != len(refs) {
+		t.Errorf("sent %d queries for %d refs", len(rec.queries), len(refs))
+	}
+}
+
+// The result must stay index-aligned with the input, or every advisory lands
+// on the wrong package.
+func TestQueryBatchResultsStayAlignedWithRefs(t *testing.T) {
+	client, _ := newBatchServer(t,
+		map[string][]string{"Debian:12/b": {"DSA-B"}},
+		map[string]string{"DSA-B": `{"id":"DSA-B"}`})
+
+	refs := []Ref{
+		{Ecosystem: "Debian:12", Name: "a"},
+		{Ecosystem: "Debian:12", Name: "b"},
+		{Ecosystem: "Debian:12", Name: "c"},
+	}
+	got, err := client.QueryBatch(context.Background(), refs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []int{0, 1, 0} {
+		if len(got[i]) != want {
+			t.Errorf("refs[%d] (%s) got %d advisories, want %d", i, refs[i].Name, len(got[i]), want)
+		}
+	}
+}
+
+func TestRefString(t *testing.T) {
+	cases := map[Ref]string{
+		{Ecosystem: "Go", Name: "golang.org/x/net", Version: "v0.7.0"}: "Go/golang.org/x/net@v0.7.0",
+		{Ecosystem: "Debian:12", Name: "openssl"}:                      "Debian:12/openssl",
+	}
+	for ref, want := range cases {
+		if got := ref.String(); got != want {
+			t.Errorf("Ref.String() = %q, want %q", got, want)
+		}
+	}
+}
+
+func sortedKeys(m map[string]*Advisory) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

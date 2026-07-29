@@ -96,7 +96,7 @@ func TestEvaluate(t *testing.T) {
 		},
 		{
 			name: "package granularity, not linked",
-			adv:  &osv.Advisory{GoID: goID, Pkgs: []string{"golang.org/x/net/http2"}},
+			adv:  &osv.Advisory{ID: goID, Pkgs: []string{"golang.org/x/net/http2"}},
 			blob: unrelatedBlob,
 			want: Finding{
 				Binary: binRel, Module: module, Version: version, CVE: cve, GoID: goID,
@@ -109,7 +109,7 @@ func TestEvaluate(t *testing.T) {
 		},
 		{
 			name: "package granularity, linked, govulncheck says unreachable",
-			adv:  &osv.Advisory{GoID: goID, Pkgs: []string{"golang.org/x/net/http2"}},
+			adv:  &osv.Advisory{ID: goID, Pkgs: []string{"golang.org/x/net/http2"}},
 			blob: linkedBlob,
 			// govulncheck reports the CVE id here.
 			notAff: map[string]struct{}{cve: {}},
@@ -125,7 +125,7 @@ func TestEvaluate(t *testing.T) {
 		},
 		{
 			name: "govulncheck match on the GO id, not the CVE id",
-			adv:  &osv.Advisory{GoID: goID, Pkgs: []string{"golang.org/x/net/http2"}},
+			adv:  &osv.Advisory{ID: goID, Pkgs: []string{"golang.org/x/net/http2"}},
 			blob: linkedBlob,
 			// Only the GO- id is present; inNotAffected checks both.
 			notAff: map[string]struct{}{goID: {}},
@@ -141,7 +141,7 @@ func TestEvaluate(t *testing.T) {
 		},
 		{
 			name:   "package granularity, linked, govulncheck silent",
-			adv:    &osv.Advisory{GoID: goID, Pkgs: []string{"golang.org/x/net/http2"}},
+			adv:    &osv.Advisory{ID: goID, Pkgs: []string{"golang.org/x/net/http2"}},
 			blob:   linkedBlob,
 			notAff: map[string]struct{}{},
 			want: Finding{
@@ -155,7 +155,7 @@ func TestEvaluate(t *testing.T) {
 		},
 		{
 			name:     "stripped binary skips govulncheck entirely",
-			adv:      &osv.Advisory{GoID: goID, Pkgs: []string{"golang.org/x/net/http2"}},
+			adv:      &osv.Advisory{ID: goID, Pkgs: []string{"golang.org/x/net/http2"}},
 			blob:     linkedBlob,
 			stripped: true,
 			// Even though govulncheck would say not_affected, a stripped binary
@@ -173,7 +173,7 @@ func TestEvaluate(t *testing.T) {
 		},
 		{
 			name: "multiple vulnerable packages are sorted, any one linking is enough",
-			adv: &osv.Advisory{GoID: goID, Pkgs: []string{
+			adv: &osv.Advisory{ID: goID, Pkgs: []string{
 				"golang.org/x/net/proxy", "golang.org/x/net/http2",
 			}},
 			blob:   linkedBlob,
@@ -189,7 +189,7 @@ func TestEvaluate(t *testing.T) {
 		},
 		{
 			name: "module granularity, not present",
-			adv:  &osv.Advisory{GoID: goID}, // OSV published no import paths
+			adv:  &osv.Advisory{ID: goID}, // OSV published no import paths
 			blob: unrelatedBlob,
 			want: Finding{
 				Binary: binRel, Module: module, Version: version, CVE: cve, GoID: goID,
@@ -202,7 +202,7 @@ func TestEvaluate(t *testing.T) {
 		},
 		{
 			name: "module granularity, present, never consults govulncheck",
-			adv:  &osv.Advisory{GoID: goID},
+			adv:  &osv.Advisory{ID: goID},
 			blob: linkedBlob,
 			// Module granularity is too coarse to trust govulncheck's
 			// package-level verdict, so it is skipped even unstripped.
@@ -265,8 +265,8 @@ func TestPackagePresentDoesNotLeakFromParent(t *testing.T) {
 }
 
 func TestResolveRequests(t *testing.T) {
-	advA := &osv.Advisory{GoID: "GO-2023-0001", Aliases: []string{"CVE-2023-0001"}}
-	advB := &osv.Advisory{GoID: "GO-2023-0002", Aliases: []string{"CVE-2023-0002"}}
+	advA := &osv.Advisory{ID: "GO-2023-0001", Aliases: []string{"CVE-2023-0001"}}
+	advB := &osv.Advisory{ID: "GO-2023-0002", Aliases: []string{"CVE-2023-0002"}}
 	advMap := map[string]*osv.Advisory{
 		"GO-2023-0001":  advA,
 		"CVE-2023-0001": advA,

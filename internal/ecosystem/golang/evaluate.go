@@ -31,11 +31,11 @@ func resolveRequests(ids []string, advMap map[string]*osv.Advisory) []request {
 	seen := map[string]bool{}
 	var out []request
 	for _, adv := range advMap {
-		if seen[adv.GoID] {
+		if seen[adv.ID] {
 			continue
 		}
-		seen[adv.GoID] = true
-		out = append(out, request{id: adv.GoID, adv: adv})
+		seen[adv.ID] = true
+		out = append(out, request{id: adv.ID, adv: adv})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].id < out[j].id })
 	return out
@@ -72,7 +72,7 @@ func evaluate(_ context.Context, ec evalCtx, id string, adv *osv.Advisory) ecosy
 		f.Reason = "no_osv_package_mapping"
 		return f
 	}
-	f.GoID = adv.GoID
+	f.GoID = adv.ID
 
 	var pkgs []string
 	var linked bool
@@ -102,7 +102,7 @@ func evaluate(_ context.Context, ec evalCtx, id string, adv *osv.Advisory) ecosy
 		} else {
 			f.Method = "pclntab"
 		}
-	case f.Granularity == "package" && !ec.stripped && inNotAffected(ec.govuln(), id, adv.GoID):
+	case f.Granularity == "package" && !ec.stripped && inNotAffected(ec.govuln(), id, adv.ID):
 		f.Status = ecosystem.StatusNotInPath
 		f.Justification = "vulnerable_code_not_in_execute_path"
 		f.Method = "govulncheck"
