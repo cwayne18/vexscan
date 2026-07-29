@@ -584,9 +584,10 @@ func TestRegistryCapabilities(t *testing.T) {
 	}
 
 	// Go analyzes from either end. OS packages only exist in an image: there
-	// is no source checkout of "the distribution's openssl".
-	if ids(image) != "golang,os" {
-		t.Errorf("image analyzers = %s, want golang,os", ids(image))
+	// is no source checkout of "the distribution's openssl". PyPI will grow a
+	// source side once lockfile mode lands; today it is image-only.
+	if ids(image) != "golang,os,pypi" {
+		t.Errorf("image analyzers = %s, want golang,os,pypi", ids(image))
 	}
 	if ids(source) != "golang" {
 		t.Errorf("source analyzers = %s, want golang", ids(source))

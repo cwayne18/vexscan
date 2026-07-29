@@ -19,6 +19,10 @@ var formatAliases = map[string]string{
 	"dpkg": "os",
 	"rpm":  "os",
 	"go":   "golang",
+	// PyPI is an OSV ecosystem and matches on its own; "python" and "pip" are
+	// what a user reaches for first, and neither names anything else here.
+	"python": "pypi",
+	"pip":    "pypi",
 }
 
 // ParseSubject turns one --package value into a Subject.

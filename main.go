@@ -21,7 +21,7 @@ import (
 func main() {
 	var packages, ecosystems, roots stringList
 	flag.Var(&packages, "package", "package to check: a purl, an ecosystem:name shorthand (deb:openssl, golang:golang.org/x/net), or a bare name resolved against the inventory; repeatable")
-	flag.Var(&ecosystems, "ecosystem", "restrict the scan to these ecosystems (golang, os, or a distro family like debian); repeatable, default all")
+	flag.Var(&ecosystems, "ecosystem", "restrict the scan to these ecosystems (golang, os, pypi, or a distro family like debian); repeatable, default all")
 	flag.Var(&roots, "roots", "extra entrypoints for the shared-library closure, for an image whose real command comes from outside its config; repeatable")
 	var (
 		image      = flag.String("image", "", "container image reference to inspect (mutually exclusive with --repo)")
@@ -443,8 +443,9 @@ func usage() {
 
 Every ecosystem brings its own deterministic presence test: pclntab
 dead-code-elimination evidence and govulncheck for Go, the dynamic linker's
-DT_NEEDED closure for OS packages. The LLM, if enabled, only ever comments on
-what those tests could not rule out.
+DT_NEEDED closure for OS packages, the installed-distribution manifest for
+Python. The LLM, if enabled, only ever comments on what those tests could not
+rule out.
 
 Usage:
   vexscan --image REF  (--package SPEC... | --cves LIST | --all) [flags]
@@ -454,6 +455,7 @@ A --package SPEC is a purl, an "ecosystem:name" shorthand, or a bare name
 resolved against whatever inventory contains it:
 
   golang:golang.org/x/net    deb:openssl    apk:musl    openssl
+  pypi:PyYAML                pkg:pypi/pyyaml@6.0.1
   pkg:golang/golang.org%2Fx%2Fnet@v0.17.0
 
 Examples:
@@ -470,6 +472,9 @@ Examples:
   # Everything the image installs, OS packages only
   vexscan --image registry.access.redhat.com/ubi9/ubi:latest --all --ecosystem os
 
+  # One Python distribution, by any spelling of its name
+  vexscan --image python:3.12-slim --package pypi:PyYAML
+
   # Source repo (govulncheck source-mode reachability)
   vexscan --repo github.com/rancher/rancher \
     --package golang:golang.org/x/net --cves CVE-2023-39325
@@ -478,7 +483,7 @@ Examples:
   vexscan --image myorg/app:latest --package golang:stdlib --cves CVE-2025-22870
   vexscan --repo github.com/rancher/rancher --package golang:stdlib --go-version 1.24.0
 
-  # List the OS packages in an image, with the names OSV will be queried by
+  # List the packages in an image, with the names OSV will be queried by
   vexscan --image debian:12 --format inventory
 
   # Share the report as a public gist (needs GITHUB_TOKEN/GH_TOKEN with gist scope)
