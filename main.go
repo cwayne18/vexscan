@@ -415,7 +415,9 @@ func strippedNote(stripped *bool) string {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `vexscan - check whether a CVE's vulnerable code is actually present in an image or source repo
+	// WriteString rather than Fprint: the purl example contains %2F, which vet
+	// reads as a stray formatting directive in anything Printf-shaped.
+	os.Stderr.WriteString(`vexscan - check whether a CVE's vulnerable code is actually present in an image or source repo
 
 Every ecosystem brings its own deterministic presence test: pclntab
 dead-code-elimination evidence and govulncheck for Go, the dynamic linker's
