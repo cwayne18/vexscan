@@ -1,130 +1,346 @@
 # vexscan
 
-`vexscan` checks whether a given CVE in a Go module is **actually present and
-reachable**, rather than merely being listed as a dependency. Point it at either:
+`vexscan` answers one question, for a container image or a source repo: **is
+this CVE's vulnerable code actually present, and can it actually run?**
 
-- a **container image** (`--image`) — inspects the shipped Go binaries, or
-- a **source repository** (`--repo`) — clones it and runs govulncheck's
-  call-graph reachability analysis.
+Scanners flag a CVE whenever a vulnerable *version* is installed. That is the
+right default for a scanner and the wrong basis for a triage decision — the
+linker may have dead-code-eliminated the vulnerable package, the vulnerable
+function may be unreachable, or the shared library may sit on disk with nothing
+loading it. `vexscan` distinguishes those cases so you can publish accurate
+[VEX](https://www.cisa.gov/resources-tools/resources/minimum-requirements-vulnerability-exploitability-exchange-vex)
+statements instead of hand-waving at a scan report.
 
-It is a generic, Go rewrite of the `vex_candidates.py` triage script from
-[`cwayne18/rke2-toolbox`](https://github.com/cwayne18/rke2-toolbox): instead of
-parsing a Trivy scan report, you point it directly at a target, a module, and
-(optionally) a list of CVEs.
+**Every ecosystem brings its own deterministic presence test.** That is the
+governing rule of the tool. An LLM never decides a status; it only comments on
+what the deterministic tests could not rule out.
 
-Package/CVE scanners flag a module as vulnerable whenever the *module* is a
-dependency, even if the linker dead-code-eliminated the vulnerable *package* or
-the vulnerable functions are never reachable. `vexscan` distinguishes those
-cases so you can produce accurate [VEX](https://www.cisa.gov/resources-tools/resources/minimum-requirements-vulnerability-exploitability-exchange-vex)
-statements.
+| Ecosystem | Selector | Deterministic test |
+|---|---|---|
+| Go modules and stdlib | `--package golang:PATH` | pclntab dead-code-elimination evidence; govulncheck call-graph reachability |
+| OS packages (deb, rpm, apk) | `--package deb:NAME` etc. | package-database inventory; the dynamic linker's `DT_NEEDED` closure from the image entrypoint |
 
-## How it works
+`vexscan` was previously released as `gomod-vex`, which did the Go half only.
+Existing `--module` command lines and `GOMODVEX_*` environment variables keep
+working.
 
-### Image mode (`--image`)
+## Quick start
 
-For every Go binary in the image that links the target module, `vexscan`:
+```sh
+# Where does this CVE land, anywhere in the image? (searches every ecosystem)
+vexscan --image debian:12 --cves CVE-2024-5535
 
-1. **Resolves the vulnerable packages** from the [OSV](https://osv.dev) Go
-   database, keyed by module + the version embedded in the binary's build info.
-2. **govulncheck (binary mode)** — for non-stripped binaries, a linked but
-   unreachable package is reported `vulnerable_code_not_in_execute_path`.
-3. **pclntab presence test** — a Go binary keeps its function-name table even
+# One Go module in a container image
+vexscan --image rancher/hardened-kubernetes:v1.30.1 \
+  --package golang:golang.org/x/net --cves CVE-2023-39325,CVE-2023-44487
+
+# One OS package, with the shared-library closure as the presence test
+vexscan --image debian:12 --package deb:openssl
+
+# Everything the image installs, OS packages only
+vexscan --image registry.access.redhat.com/ubi9/ubi:latest --all --ecosystem os
+
+# Source repo (govulncheck source-mode reachability)
+vexscan --repo github.com/rancher/rancher \
+  --package golang:golang.org/x/net --cves CVE-2023-39325
+
+# Just list what is installed, with the names OSV will be queried by
+vexscan --image debian:12 --format inventory
+```
+
+## Selecting what to check
+
+A `--package SPEC` is a purl, an `ecosystem:name` shorthand, or a bare name
+resolved against whatever inventory contains it:
+
+```
+golang:golang.org/x/net    deb:openssl    apk:musl    rpm:glibc    openssl
+pkg:golang/golang.org%2Fx%2Fnet@v0.17.0
+```
+
+`deb`, `dpkg`, `rpm` and `apk` are package *formats* rather than OSV ecosystem
+names; they all select the OS plugin, which is the only thing that could answer
+them. `go` is accepted for `golang`, and `std` for `stdlib`.
+
+`--package` is repeatable and accepts comma-separated values, so
+`--package a --package b` and `--package a,b` are the same.
+
+Three ways to say what to check, and you need exactly one of them:
+
+| | Meaning |
+|---|---|
+| `--package SPEC...` | these components, every advisory that applies to them (or just `--cves`) |
+| `--cves LIST` alone | resolve these ids against the whole target, wherever they land |
+| `--all` | everything each selected ecosystem can enumerate |
+
+`--ecosystem` (repeatable) restricts which plugins run. Naming one that no
+plugin provides is an error rather than a silent empty report — as is a
+`--package` aimed at an ecosystem that is not selected.
+
+## How the tests work
+
+### Go, image mode
+
+For every Go binary that links the target module:
+
+1. **Resolve the vulnerable packages** from the [OSV](https://osv.dev) Go
+   database, keyed by module plus the version embedded in the binary's build
+   info (`debug/buildinfo`) — no Trivy report or manual version input needed.
+2. **govulncheck (binary mode)**, for non-stripped binaries: linked but
+   unreachable is `vulnerable_code_not_in_execute_path`.
+3. **pclntab presence test.** A Go binary keeps its function-name table even
    when fully stripped (`-ldflags=-s -w`). If none of a CVE's vulnerable
    packages appear in it, the linker eliminated them:
    `vulnerable_code_not_present`.
 
-Module versions are read straight from each binary's embedded build info
-(`debug/buildinfo`), so no Trivy report or manual version input is required.
+With `--all`, the module list comes from each binary's build info — its
+dependencies, its own main module, and the toolchain (`stdlib`), since stdlib
+advisories apply to every Go binary by definition.
 
-### Repo mode (`--repo`)
+### Go, repo mode
 
 The repo is cloned (shallow) and analyzed with **govulncheck source mode**,
 whose call-graph reachability is authoritative for a source tree — strictly
-better than the pclntab heuristic (which only exists because shipped binaries
-are stripped). Each advisory in the dependency graph is classified as
-`reachable` (the vulnerable symbol is actually called),
-`not_in_execute_path` (imported but unreachable) or `not_present` (unused).
-A local checkout path or `file://` URL is scanned in place without cloning.
+better than the pclntab test, which only exists because shipped binaries are
+stripped. Each advisory is classified `reachable` (the vulnerable symbol is
+actually called), `not_in_execute_path` (imported but unreachable), or
+`not_present` (unused). A local checkout path or `file://` URL is scanned in
+place without cloning.
 
-> **Large repos:** source-mode analysis builds a whole-program call graph and can
-> need several GB of RAM. Very large repos (e.g. `rancher/rancher`) may exhaust
-> memory — govulncheck gets OOM-killed (`signal: killed`). Give the process more
-> memory (in a container, raise the memory limit, e.g. `docker run --memory=8g`),
-> scope the scan with `--repo-path <subdir>`, or fall back to `--image` mode.
+> **Large repos:** source-mode analysis builds a whole-program call graph and
+> can need several GB of RAM. Very large repos (e.g. `rancher/rancher`) may
+> exhaust memory — govulncheck gets OOM-killed (`signal: killed`). Give the
+> process more memory (in a container, e.g. `docker run --memory=8g`), scope the
+> scan with `--repo-path <subdir>`, or fall back to `--image` mode.
 
-### Standard library (`--module stdlib`)
+### OS packages
 
-Go standard-library CVEs are supported in both modes — pass `--module stdlib`
-(the name OSV and govulncheck use; `--module std` is accepted as an alias):
+The package database is read in-process — `/var/lib/dpkg/status`,
+`/lib/apk/db/installed`, or the rpm database (sqlite, BDB, or ndb). **OSV keys
+deb and rpm advisories on the *source* package** while the database lists binary
+packages, so the source mapping (`Source:`, `SOURCERPM`, apk's `o:`) is applied
+before querying; `--format inventory` shows both names.
 
-```sh
-# Image mode: the Go version comes from each binary's build info, and pclntab
-# tells you which vulnerable stdlib packages (net/http, crypto/x509, ...) are
-# actually linked into each binary.
-vexscan --image myorg/app:latest --module stdlib --cves CVE-2025-22870
+Presence is then decided by a **`DT_NEEDED` closure**: every ELF in the image is
+read for `DT_SONAME` / `DT_NEEDED` / `DT_RPATH` / `DT_RUNPATH`, resolved in
+`ld.so`'s search order (RPATH → `LD_LIBRARY_PATH` → RUNPATH → `ld.so.conf` →
+default dirs, matching the referrer's ELF class and machine), and reached
+transitively from the image's Entrypoint and Cmd. Directories the dynamic loader
+opens by name rather than by `DT_NEEDED` — `libnss_*`, PAM modules, gconv
+converters, OpenSSL engines and providers, `*.node`, `site-packages/**/*.so` —
+are always roots.
 
-# Repo mode: govulncheck reports stdlib reachability. Results depend on the Go
-# toolchain used, so pin it with --go-version to target a specific release.
-vexscan --repo github.com/rancher/rancher --module stdlib --go-version 1.24.0
+| Situation | Status | Justification | Method |
+|---|---|---|---|
+| not installed at all | `not_present` | `component_not_present` | `pkgdb-inventory` |
+| installed, owns no ELF (docs, data, scripts) | `not_present` | `vulnerable_code_not_present` | `pkgdb-no-code` |
+| owns ELFs, none reachable, nothing blocking | `not_in_execute_path` | `vulnerable_code_not_in_execute_path` | `elf-needed-closure` |
+| a validated mined symbol is defined by nothing the package installs | `not_present` | `vulnerable_code_not_present` | `elf-dynsym-absent` |
+| reachable, or anything blocking | `linked` | *(none — treat as affected)* | `elf-needed-closure` |
+
+#### Taints
+
+A taint never sets a status. It *blocks* the closure from concluding
+`not_affected`, and is always emitted as evidence, so the report says why it
+could not answer rather than answering wrongly.
+
+| Taint | Trigger | Effect |
+|---|---|---|
+| `unresolved-needed` | a `DT_NEEDED` that resolved to nothing | scoped to that soname |
+| `dlopen` | a reachable ELF references `dlopen`/`dlmopen` | global, unless `--dlopen-policy=assume-none` |
+| `static-elf` | a reachable ELF has no `PT_INTERP`/`.dynamic` | blocks all C-library conclusions |
+| `shell-entrypoint` | argv[0] is a shell or init shim (`sh`, `busybox`, `tini`, `s6-*`) | every ELF in the standard bin dirs becomes a root |
+| `no-entrypoint` | the image config has neither Entrypoint nor Cmd | same escalation |
+
+`--roots /path/to/bin` adds entrypoints for an image whose real command comes
+from outside its own config — a Kubernetes `command:`, a sidecar, an operator.
+Supplying them is usually the difference between a useful answer and
+`shell-entrypoint` tainting everything.
+
+## Known limits — read this before trusting an OS result
+
+**The closure is a weaker signal than Go's pclntab test, and the gap matters.**
+
+pclntab is ground truth about what the linker *removed from the shipped
+artifact*: if the package name is not in the table, the code is not in the file.
+The closure proves nothing about the file's contents. It is ground truth only
+for an image that is fully dynamically linked, does not call `dlopen`, and has a
+known entrypoint. Concretely:
+
+- **Alpine and distroless images are the worst case.** Static binaries embed
+  musl, OpenSSL and zlib while the corresponding `.so` sits unreferenced on
+  disk. The `static-elf` taint catches this and the result is `linked` — correct
+  but useless — on exactly the images people most want a clean answer for.
+- **Distro base images are nearly as bad.** `debian:12` and `ubi9` ship with
+  `bash` as Cmd, which triggers `shell-entrypoint`: every binary in `/usr/bin`
+  becomes a root, and almost everything is reachable. On `ubi9:latest --all`,
+  292 findings come back as 58 `not_present` (via `pkgdb-no-code`) and 234
+  `linked`. That is the honest answer for a general-purpose base image — it
+  really can run anything — but it is not a useful one. **The closure earns its
+  keep on purpose-built application images with a real entrypoint**, not on base
+  images.
+- `glibc` is reachable from everything and always will be. Do not expect the
+  closure to rule out a libc CVE.
+
+If a whole class of images comes back `linked`, the answer is vendor VEX feeds
+(Red Hat CSAF, Debian tracker, Alpine secdb) rather than more heuristics. The
+`evidence` array on every finding is the extension point for that: a future
+vendor-feed source contributes `Evidence{Origin: "vendor-vex"}` alongside the
+local evidence, under one policy — local deterministic evidence outranks a
+vendor claim, and a vendor `not_affected` never downgrades a finding below
+`linked` on its own.
+
+Python and npm are not implemented. They fit the same `Plugin` interface when
+someone writes a deterministic presence test for them.
+
+## LLM layer (optional, `--llm`)
+
+The LLM is an overlay and never a source of truth. It runs only on findings the
+deterministic tests could not clear, and it cannot change a status.
+
+- **`--llm`** — for CVEs whose vulnerable code is genuinely linked or reachable,
+  a [GitHub Models](https://github.com/marketplace/models) chat model gives an
+  advisory `likely` / `unlikely` / `unknown` exploitability verdict, recorded
+  under `llm` on the finding.
+- **`--mine-advisories`** — lets the model read an advisory's prose and extract
+  symbols, sonames and filenames worth checking. Distro OSV records give a fixed
+  version and nothing about what inside the package is vulnerable, so for OS
+  packages this is often the only route to a below-package-level answer.
+
+**Mined hints are contained, not trusted.** A hint may only support a
+`not_affected`-flavored status *after validation*: the symbol must appear
+literally in the advisory text, and it must be found in the **defined** `.dynsym`
+of a library the package actually installs. An unvalidatable mined symbol is
+indistinguishable from a hallucination and is recorded as inconclusive, so a
+hallucinated hint is inert rather than dangerous.
+
+`elf-import-absent` — reachable, but nothing imports the vulnerable symbol —
+stays evidence-only unless you pass `--trust-import-absence`. Absence of a
+*direct* dynamic import does not prove unreachability, because the vulnerable
+function is usually called from inside the same library.
+
+GitHub Models enforces a low per-minute burst limit, so a scan assessing many
+CVEs can hit `429 Too Many Requests` (sometimes phrased as a Terms of Service or
+"scraping" notice — that is GitHub's secondary rate limit). `vexscan` caches
+verdicts per CVE, spaces requests out (default 1s), and retries `429`/`5xx` with
+backoff honoring `Retry-After` up to two minutes. A failed assessment is
+non-fatal: the finding is still reported, just without a verdict.
+
+## Output
+
+`--format text` is for reading; `--format json` is for keeping. The JSON is
+`schema_version: 2`:
+
+```jsonc
+{
+  "schema_version": 2,
+  "target": "...", "mode": "image",
+  "findings": [ /* flat, sorted — jq '.findings[]' still works */ ],
+  "ecosystems": [ { "id": "os", "components": 65, "error": "" } ]
+}
 ```
 
-In repo mode the stdlib version analyzed is the one of the Go toolchain that
-runs govulncheck. `GOTOOLCHAIN=auto` only ever *upgrades*, so without
-`--go-version` a repo is scanned with the newest locally-available toolchain
-(inside the container image, the base Go version). Pin `--go-version` to assess
-a particular release. Note that a pinned older toolchain may be too old to build
-the latest `govulncheck`; pair it with `VEXSCAN_GOVULNCHECK_VERSION` (e.g.
-`v1.1.4`) if `go run` reports a version requirement.
+Each finding carries ecosystem-neutral identity (`ecosystem`, `id`, `package`,
+`version`, `location`, `purl`) plus `status`, `method`, `justification` and
+`evidence`. The v1 Go spellings (`cve`, `module`, `binary`, `go_id`, `packages`,
+`granularity`, `stripped`) are still emitted for Go findings, mirrored from the
+neutral fields so they cannot drift.
 
-### LLM exploitability check (optional, `--llm`)
+| Status | Meaning | VEX justification |
+|---|---|---|
+| `not_present` | vulnerable code is not in the artifact | `vulnerable_code_not_present` or `component_not_present` |
+| `not_in_execute_path` | present but nothing can reach it | `vulnerable_code_not_in_execute_path` |
+| `linked` | genuinely present, image mode | *(none — treat as affected)* |
+| `reachable` | vulnerable symbol is called, repo mode | *(none — treat as affected)* |
+| `undetermined` | nothing could be concluded | *(manual review)* |
 
-For CVEs whose vulnerable code is genuinely linked (image mode) or reachable
-(repo mode), a [GitHub Models](https://github.com/marketplace/models) chat model
-gives an advisory `likely` / `unlikely` / `unknown` exploitability verdict.
+`component_not_present` is expressed through `justification` rather than a sixth
+status, because VEX consumers already read that field.
 
-GitHub Models enforces a low per-minute burst limit, so a scan that assesses
-many CVEs can hit `429 Too Many Requests` (sometimes phrased as a Terms of
-Service / "scraping" notice — that is GitHub's secondary rate limit). `vexscan`
-mitigates this by:
+**An empty report is never silently produced.** If an ecosystem is detected but
+cannot be read, no findings are emitted for it, `ecosystems[].error` says why,
+the text report prints an `INCOMPLETE:` line, and the process exits 1. A CVE id
+that matched no component anywhere still appears once, as `undetermined` with
+`no_component_matched`, so a missing id never reads as a clean one.
 
-- **caching verdicts** per CVE — in image mode the same CVE linked into many
-  binaries is assessed once and reused;
-- **spacing out requests** (default 1s between calls); tune or disable this with
-  `VEXSCAN_LLM_MIN_INTERVAL` (a Go duration, e.g. `2s`, or `0` to disable);
-- **retrying** `429`/`5xx` with backoff, honoring the server's `Retry-After`
-  (up to two minutes) so a rate-limit window is actually outlasted.
+Exit status: `0` the scan completed, `1` the scan failed or an ecosystem could
+not be read, `2` the command line was wrong.
 
-A failed assessment is non-fatal: the finding is still reported (e.g. `LINKED`),
-just without an LLM verdict.
+## Flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--image` | | Container image to inspect (mutually exclusive with `--repo`) |
+| `--repo` | | Git source repo to analyze via govulncheck source mode |
+| `--package` | | Package to check: purl, `ecosystem:name`, or bare name; repeatable |
+| `--cves` | | CVE / GHSA / GO / RHSA / DSA ids; alone, resolved against the whole target |
+| `--all` | `false` | Check everything each ecosystem can enumerate |
+| `--ecosystem` | *(all)* | Restrict to these ecosystems (`golang`, `os`, or a distro family); repeatable |
+| `--module` | | **Deprecated** alias for `--package golang:MODULE` |
+| `--cves-file` | | File with one id per line (merged with `--cves`; `#` comments allowed) |
+| `--ref` | *(default branch)* | Branch, tag, or commit to check out for `--repo` |
+| `--repo-path` | `.` | Module subdirectory within `--repo` to scan |
+| `--version` | *(auto)* | Override the module version (image mode) instead of reading build info |
+| `--go-version` | *(auto)* | Pin the Go toolchain for `--repo`, e.g. `1.24.0` (useful with `golang:stdlib`) |
+| `--osv-ecosystem` | *(auto)* | Override the OSV ecosystem derived from os-release, e.g. `Debian:12` |
+| `--roots` | | Extra entrypoints for the closure; repeatable |
+| `--dlopen-policy` | `taint` | `taint` (block conclusions) or `assume-none` |
+| `--trust-import-absence` | `false` | Let a missing dynamic import conclude `not_in_execute_path` (weaker than it looks) |
+| `--os` / `--arch` | `linux` / `amd64` | Image platform variant to pull |
+| `--llm` | `false` | Consult a GitHub Models LLM on genuinely-affected CVEs |
+| `--llm-model` | `openai/gpt-4o` | GitHub Models model id for `--llm` |
+| `--mine-advisories` | `false` | With `--llm`, mine advisory prose for symbols to check |
+| `--format` | `text` | `text`, `json`, or `inventory` |
+| `--out` | *(stdout)* | Write output to a file |
+| `--gist` | `false` | Also upload the output to a public gist and print its URL (token needs `gist` scope) |
+| `--gist-secret` | `false` | With `--gist`, create a secret (unlisted) gist |
+| `--quiet` | `false` | Suppress progress logging on stderr |
+
+`--gist` uploads whatever would otherwise be printed, respecting `--format`,
+using the same `GITHUB_TOKEN` / `GH_TOKEN` as `--llm`. It composes with `--out`
+(written to the file *and* uploaded).
+
+### Standard library
+
+Go standard-library CVEs work in both modes via `--package golang:stdlib` (the
+name OSV and govulncheck use; `std` is an alias):
+
+```sh
+vexscan --image myorg/app:latest --package golang:stdlib --cves CVE-2025-22870
+vexscan --repo github.com/rancher/rancher --package golang:stdlib --go-version 1.24.0
+```
+
+In repo mode the stdlib version analyzed is that of the toolchain running
+govulncheck. `GOTOOLCHAIN=auto` only ever *upgrades*, so without `--go-version` a
+repo is scanned with the newest locally-available toolchain. A pinned older
+toolchain may be too old to build the latest `govulncheck`; pair it with
+`VEXSCAN_GOVULNCHECK_VERSION` (e.g. `v1.1.4`) if `go run` complains.
 
 ### Environment variables
 
-`vexscan` was previously released as `gomod-vex`. Its own variables are now
-prefixed `VEXSCAN_`, and the corresponding `GOMODVEX_` names are still honored
-as a fallback so existing CI configuration keeps working:
+Its own variables are prefixed `VEXSCAN_`; the `GOMODVEX_` names are still
+honored as a fallback so existing CI keeps working.
 
 | Variable | Legacy name | Purpose |
 |---|---|---|
-| `VEXSCAN_LLM_MIN_INTERVAL` | `GOMODVEX_LLM_MIN_INTERVAL` | Minimum spacing between `--llm` API calls (Go duration; `0` disables) |
-| `VEXSCAN_GOVULNCHECK_VERSION` | `GOMODVEX_GOVULNCHECK_VERSION` | Pin the govulncheck module version used by `--repo` |
+| `VEXSCAN_LLM_MIN_INTERVAL` | `GOMODVEX_LLM_MIN_INTERVAL` | Minimum spacing between `--llm` calls (Go duration; `0` disables) |
+| `VEXSCAN_GOVULNCHECK_VERSION` | `GOMODVEX_GOVULNCHECK_VERSION` | Pin the govulncheck version used by `--repo` |
 
 `GITHUB_TOKEN` / `GH_TOKEN` are unchanged.
 
 ## Requirements
 
-- A Go toolchain on `PATH` (also required at **runtime** for `--repo` source
-  analysis). Repo mode builds and runs `govulncheck` itself via `go run` with
-  `GOTOOLCHAIN=auto`, so Go will fetch whatever toolchain the scanned module
-  requires — no manual version matching needed.
 - [`skopeo`](https://github.com/containers/skopeo) on `PATH` — image mode
-- `git` on `PATH` — repo mode (unless scanning a local path)
-- [`govulncheck`](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck) on `PATH`
-  — used only in image (binary) mode; optional. Repo mode does not need it
-  preinstalled.
-- Network access for `--repo` (to clone, download the module graph, and fetch a
-  toolchain if the module needs a newer Go than is installed)
-- `GITHUB_TOKEN` (or `GH_TOKEN`) when using `--llm` (or `--gist`; that also needs
-  `gist` scope)
+- A Go toolchain on `PATH` — required at **runtime** for `--repo`, which builds
+  and runs `govulncheck` itself via `go run` with `GOTOOLCHAIN=auto`
+- `git` on `PATH` — repo mode, unless scanning a local path
+- [`govulncheck`](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck) on
+  `PATH` — optional, used only for Go binary mode
+- Network access for OSV lookups, and for `--repo` cloning
+- `GITHUB_TOKEN` / `GH_TOKEN` for `--llm` and `--gist`
+
+All three package databases are parsed in-process — no `dpkg`, `rpm` or `apk`
+binary is needed.
 
 ## Install
 
@@ -132,7 +348,7 @@ as a fallback so existing CI configuration keeps working:
 go install github.com/cwayne18/vexscan@latest
 ```
 
-Or build from source:
+Or from source:
 
 ```sh
 git clone https://github.com/cwayne18/vexscan
@@ -140,121 +356,39 @@ cd vexscan
 go build -o vexscan .
 ```
 
+Building with `-tags norpm` drops the rpm database reader and its dependencies;
+rpm images then report as an unreadable ecosystem rather than being silently
+skipped.
+
 ### Container image (GHCR)
 
 A self-contained image bundling `skopeo`, `git`, `govulncheck` and a Go
-toolchain (so both image and repo modes work) is published to
+toolchain is published to
 [`ghcr.io/cwayne18/vexscan`](https://github.com/cwayne18/vexscan/pkgs/container/vexscan)
 on every push to `main` and every `v*` tag:
 
 ```sh
 docker run --rm ghcr.io/cwayne18/vexscan:latest \
-  --image rancher/hardened-coredns:v1.14.6 \
-  --module golang.org/x/net --cves CVE-2023-39325
-```
+  --image rancher/hardened-coredns:v1.8.6-build20231009 \
+  --package golang:golang.org/x/net --cves CVE-2023-39325
 
-Pass a token through the environment to enable `--llm`:
-
-```sh
 docker run --rm -e GITHUB_TOKEN ghcr.io/cwayne18/vexscan:latest \
-  --image myorg/myapp:latest --module golang.org/x/crypto --llm
+  --image myorg/myapp:latest --package golang:golang.org/x/crypto --llm
 ```
-
-## Usage
-
-```sh
-vexscan --image REF  --module PATH [--cves LIST] [flags]   # image mode
-vexscan --repo  REPO --module PATH [--cves LIST] [flags]   # repo mode
-```
-
-Check two specific `x/net` CVEs in an image:
-
-```sh
-vexscan \
-  --image rancher/hardened-kubernetes:v1.30.1-rke2r1 \
-  --module golang.org/x/net \
-  --cves CVE-2023-39325,CVE-2023-44487
-```
-
-Check a CVE against a source repo via reachability analysis:
-
-```sh
-vexscan \
-  --repo github.com/rancher/rancher \
-  --module golang.org/x/net \
-  --cves CVE-2023-45288
-```
-
-`--repo` accepts `github.com/owner/repo`, a full clone URL, a bare
-`owner/repo` (assumed GitHub), or a local checkout path / `file://` URL. Use
-`--ref` for a branch, tag or commit and `--repo-path` for a module in a
-subdirectory.
-
-Check every advisory known for `x/crypto`, as JSON, with the LLM layer:
-
-```sh
-export GITHUB_TOKEN=...    # a token with models:read
-vexscan \
-  --image myorg/myapp:latest \
-  --module golang.org/x/crypto \
-  --llm --format json
-```
-
-### Flags
-
-| Flag | Default | Description |
-|---|---|---|
-| `--image` | | Container image to inspect (mutually exclusive with `--repo`) |
-| `--repo` | | Git source repo to analyze via govulncheck source mode |
-| `--ref` | *(default branch)* | Branch, tag, or commit to check out for `--repo` |
-| `--repo-path` | `.` | Module subdirectory within `--repo` to scan |
-| `--module` | *(required)* | Go module import path to evaluate (or `stdlib` for the standard library) |
-| `--cves` | *(all)* | Comma-separated CVE / GHSA / GO ids; empty checks every advisory for the version |
-| `--cves-file` | | File with one id per line (merged with `--cves`; `#` comments allowed) |
-| `--version` | *(auto)* | Override the module version (image mode) instead of reading build info |
-| `--go-version` | *(auto)* | Pin the Go toolchain for `--repo` analysis, e.g. `1.24.0` (useful with `--module stdlib`) |
-| `--os` / `--arch` | `linux` / `amd64` | Image platform variant to pull (image mode) |
-| `--llm` | `false` | Consult a GitHub Models LLM on genuinely-affected CVEs |
-| `--llm-model` | `openai/gpt-4o` | GitHub Models model id for `--llm` |
-| `--format` | `text` | `text` or `json` |
-| `--out` | *(stdout)* | Write output to a file |
-| `--gist` | `false` | Also upload the output to a public GitHub gist and print its URL (needs a token with `gist` scope) |
-| `--gist-secret` | `false` | With `--gist`, create a secret (unlisted) gist instead of a public one |
-| `--quiet` | `false` | Suppress progress logging on stderr |
-
-Exactly one of `--image` or `--repo` is required.
-
-`--gist` uploads whatever would otherwise be printed (respecting `--format`) to a
-gist using the same `GITHUB_TOKEN` / `GH_TOKEN` as `--llm`; the token needs
-`gist` scope. The gist URL is printed to stdout after the report. It composes
-with `--out` (the report is written to the file *and* uploaded).
-
-## Output statuses
-
-| Status | Meaning | Suggested VEX justification |
-|---|---|---|
-| `not_present` | Vulnerable package absent (pclntab / govulncheck source) | `vulnerable_code_not_present` |
-| `not_in_execute_path` | Linked/imported but govulncheck marks it unreachable | `vulnerable_code_not_in_execute_path` |
-| `linked` | Vulnerable package genuinely linked, image mode (real finding) | *(none — treat as affected)* |
-| `reachable` | Vulnerable symbol is called, repo mode (real finding) | *(none — treat as affected)* |
-| `undetermined` | No mapping for the id at this version | *(manual review)* |
-
-In image mode, when OSV publishes no package-level import paths for an advisory
-(e.g. some GitHub-only GHSA records), presence is asserted at **module**
-granularity instead; these are coarser, so validate before transferring.
 
 ## Caveats
 
-- The LLM verdict is advisory only. Never auto-file a VEX statement solely on an
-  LLM verdict; it supplements, and does not replace, the deterministic checks.
-- pclntab matching (image mode) is a heuristic. It is deliberately conservative
-  (a genuinely-linked package is never reported absent), but validate candidates
-  before publishing VEX.
-- Repo mode needs a Go toolchain, `git` and network access at runtime. It runs
-  `govulncheck` via `go run` from inside the target module with
-  `GOTOOLCHAIN=auto`, so Go automatically fetches a newer toolchain when the
-  scanned module requires one. Override the govulncheck version with
-  `VEXSCAN_GOVULNCHECK_VERSION` if needed.
+- **The LLM verdict is advisory only.** Never file a VEX statement on an LLM
+  verdict alone; it supplements the deterministic checks and does not replace
+  them.
+- **The pclntab test is conservative, not exact.** A genuinely-linked package is
+  never reported absent, but validate candidates before publishing.
+- **The `DT_NEEDED` closure is weaker still.** See [Known
+  limits](#known-limits--read-this-before-trusting-an-os-result) — this is the
+  most important section in this README.
+- When OSV publishes no package-level import paths for a Go advisory (some
+  GitHub-only GHSA records), presence is asserted at **module** granularity;
+  those findings say `granularity: module` and are coarser.
 
 ## License
 

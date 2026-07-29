@@ -7,6 +7,11 @@
 #     version that module requires (see internal/source). GOTOOLCHAIN=auto lets
 #     Go fetch a newer toolchain when a scanned repo needs one.
 # The runtime image ships all of them so both modes work out of the box.
+#
+# No dpkg/rpm/apk tooling is installed, and none is needed: the OS-package
+# plugin parses all three databases in-process (see internal/pkgdb). The rpm
+# reader uses a pure-Go sqlite driver specifically so this image can keep
+# CGO_ENABLED=0 and cross-compile.
 
 ARG GO_VERSION=1.26
 
@@ -16,8 +21,9 @@ ARG TARGETARCH
 ENV CGO_ENABLED=0
 WORKDIR /src
 
-# Cache modules first (vexscan has no external deps, so this is just go.mod).
-COPY go.mod ./
+# Cache modules first: go-rpmdb and its sqlite driver are the only third-party
+# dependencies, and they change far less often than the source does.
+COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
@@ -40,7 +46,7 @@ COPY --from=build /out/vexscan /usr/local/bin/vexscan
 COPY --from=build /out/govulncheck /usr/local/bin/govulncheck
 
 LABEL org.opencontainers.image.source="https://github.com/cwayne18/vexscan" \
-      org.opencontainers.image.description="Check whether Go-module CVEs are actually present/exploitable in a container image or source repo" \
+      org.opencontainers.image.description="Check whether a CVE's vulnerable code is actually present and reachable in a container image or source repo (Go modules and OS packages)" \
       org.opencontainers.image.licenses="MIT"
 
 ENTRYPOINT ["vexscan"]

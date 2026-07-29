@@ -319,8 +319,15 @@ func renderText(res *analyze.Result) string {
 	b.WriteString("\n")
 
 	if len(res.Findings) == 0 {
-		b.WriteString("No findings: nothing selected was found in this target,\n")
-		b.WriteString("or no matching advisories were published for it.\n")
+		// Empty because nothing was wrong and empty because nothing was read
+		// look identical, and only one of them is good news.
+		if res.Failed() {
+			b.WriteString("No findings, but the scan was incomplete: see above.\n")
+			b.WriteString("This is not a clean result.\n")
+		} else {
+			b.WriteString("No findings: nothing selected was found in this target,\n")
+			b.WriteString("or no matching advisories were published for it.\n")
+		}
 		return b.String()
 	}
 

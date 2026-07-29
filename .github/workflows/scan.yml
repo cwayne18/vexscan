@@ -11,9 +11,22 @@ on:
         description: "Container image to scan (pclntab/OSV mode), e.g. wlambert/velociraptor:latest. Mutually exclusive with repo."
         required: false
         type: string
-      module:
-        description: "Go module import path to evaluate, or 'stdlib'"
-        required: true
+      package:
+        description: "Package(s) to check, comma-separated: 'golang:golang.org/x/net', 'golang:stdlib', 'deb:openssl'. Leave empty to use cves or all."
+        required: false
+        type: string
+      cves:
+        description: "CVE/GHSA/GO ids, comma-separated. On their own, they are resolved against the whole target."
+        required: false
+        type: string
+      all:
+        description: "Check everything each ecosystem can enumerate (cannot be combined with package)"
+        required: false
+        type: boolean
+        default: false
+      ecosystem:
+        description: "Restrict to these ecosystems, comma-separated: golang, os. Empty runs all of them."
+        required: false
         type: string
       ref:
         description: "Optional branch, tag, or commit to check out for repo mode"
@@ -147,7 +160,10 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           REPO: ${{ inputs.repo }}
           IMAGE: ${{ inputs.image }}
-          MODULE: ${{ inputs.module }}
+          PACKAGE: ${{ inputs.package }}
+          CVES: ${{ inputs.cves }}
+          ALL: ${{ inputs.all }}
+          ECOSYSTEM: ${{ inputs.ecosystem }}
           REF: ${{ inputs.ref }}
           LLM: ${{ inputs.llm }}
         run: |
@@ -162,7 +178,20 @@ jobs:
               args+=(--ref "$REF")
             fi
           fi
-          args+=(--module "$MODULE")
+          # --package/--cves/--ecosystem each take a comma-separated list, so
+          # the dispatch inputs pass straight through.
+          if [ -n "$PACKAGE" ]; then
+            args+=(--package "$PACKAGE")
+          fi
+          if [ -n "$CVES" ]; then
+            args+=(--cves "$CVES")
+          fi
+          if [ "$ALL" = "true" ]; then
+            args+=(--all)
+          fi
+          if [ -n "$ECOSYSTEM" ]; then
+            args+=(--ecosystem "$ECOSYSTEM")
+          fi
           if [ "$LLM" = "true" ]; then
             args+=(--llm)
           fi
