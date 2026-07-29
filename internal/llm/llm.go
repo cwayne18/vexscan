@@ -175,6 +175,24 @@ Note that a library being loaded says nothing about which of its functions are c
 Respond with ONLY a JSON object, no prose, of the form:
 {"exploitable":"likely|unlikely|unknown","confidence":"low|medium|high","rationale":"one or two sentences"}`
 
+// pypiPrompt asks the same question about an installed Python distribution.
+//
+// The two lines that are not in the OS prompt are the two things that are
+// actually different about Python. The first is that the evidence is weaker
+// still: "imported" means a static import graph reached a module, which says
+// nothing about which functions run. The second is the shape Python advisories
+// keep taking -- one unsafe entry point beside a safe default, yaml.load
+// against yaml.safe_load being the archetype -- because whether the
+// application uses the unsafe one is exactly the question the deterministic
+// layer cannot answer and the only reason to ask a model at all.
+const pypiPrompt = `You are a security analyst assessing Python package vulnerabilities in a container image (VEX triage).
+You are given a CVE against an installed Python distribution whose modules the code the image runs imports.
+Judge how plausibly the vulnerability is actually EXPLOITABLE in a typical deployment of this image.
+Consider: whether the vulnerable API is likely called with attacker-controlled input rather than only from a command-line tool or a test path, whether an application would use the affected entry point at all (many Python advisories affect one unsafe function that has a safe documented default beside it), and whether exploitation requires a specific configuration or a non-default feature.
+Note that Python removes no dead code, so a distribution being installed and imported says nothing about which of its functions are called.
+Respond with ONLY a JSON object, no prose, of the form:
+{"exploitable":"likely|unlikely|unknown","confidence":"low|medium|high","rationale":"one or two sentences"}`
+
 // promptFor selects the system prompt for an ecosystem.
 //
 // The empty ecosystem is Go: that is what every caller meant before this
@@ -184,6 +202,8 @@ func promptFor(ecosystem string) string {
 	switch strings.ToLower(ecosystem) {
 	case "os":
 		return osPrompt
+	case "pypi":
+		return pypiPrompt
 	default:
 		return goPrompt
 	}
@@ -207,6 +227,16 @@ func userMessage(r Request) string {
 		}
 		return fmt.Sprintf(
 			"CVE: %s\nPackage: %s %s\nImage: %s\nStatic analysis says the vulnerable code is: %s\nAssess exploitability.",
+			r.CVE, r.Module, r.Version, where, reach,
+		)
+	}
+	if strings.EqualFold(r.Ecosystem, "pypi") {
+		where := r.Binary
+		if where == "" {
+			where = "the image"
+		}
+		return fmt.Sprintf(
+			"CVE: %s\nDistribution: %s %s\nImage: %s\nStatic analysis says the vulnerable code is: %s\nAssess exploitability.",
 			r.CVE, r.Module, r.Version, where, reach,
 		)
 	}

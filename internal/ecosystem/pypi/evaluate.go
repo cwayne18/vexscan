@@ -40,6 +40,8 @@ type evaluator struct {
 	// g is the import closure, or nil when no component in this run needed one
 	// and it was never built.
 	g *modgraph.Graph
+
+	trust bool // --trust-import-absence
 }
 
 // evaluate decides one advisory against one installed distribution.
@@ -129,11 +131,92 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 			c.Name, strings.Join(c.Locations, ", "), modules(code)),
 	}}
 
+	// The mined-module layer runs before the closure, because it answers a
+	// stronger question: whether the vulnerable module is in this build at
+	// all. Both of its conclusions defer to a blocking taint, the same as the
+	// closure's do.
+	f, done := e.mined(f, c, code, req)
+	if done {
+		return f
+	}
+
 	// Everything above answers "is the code here". What follows answers "does
 	// anything import it", which is the only remaining lever: Python strips no
 	// dead code at build time, so an installed distribution's modules are on
 	// disk whether or not they ever run.
 	return e.reachability(f, c, code)
+}
+
+// mined applies the mined-module layer, returning done when it decided the
+// finding on its own.
+//
+// It changes nothing without --mine-advisories, and nothing when validation
+// rejected every hint -- but it records what it did either way, because a
+// reader has to be able to tell "the model found nothing usable" from "the
+// model was never asked".
+func (e evaluator) mined(f ecosystem.Finding, c ecosystem.Component, code []string, req ecosystem.Request) (ecosystem.Finding, bool) {
+	m := e.checkModules(req.Advisory, req.Hints, code)
+	if !m.Usable {
+		if req.Hints != nil {
+			f.Evidence = append(f.Evidence, ecosystem.Evidence{Origin: MethodMined, Detail: m.Why})
+		}
+		return f, false
+	}
+	f.Evidence = append(f.Evidence, ecosystem.Evidence{Origin: MethodMined, Detail: m.Why})
+
+	var blockers []ecosystem.Evidence
+	if e.g != nil {
+		blockers = e.blockers()
+	}
+
+	if len(m.Present) == 0 {
+		// The advisory's own module is not among the files this distribution
+		// installed. A reconstructed file list cannot support that -- it can
+		// be missing a module because the walk looked in the wrong place --
+		// and neither can a run whose graph is already blocked, since whatever
+		// blocked it may equally be loading a copy of the code.
+		if e.st.filesKnown() && len(blockers) == 0 {
+			f.Status = ecosystem.StatusNotPresent
+			f.Justification = "vulnerable_code_not_present"
+			f.Method = MethodModuleAbsent
+			f.Evidence = append(f.Evidence, ecosystem.Evidence{
+				Origin: MethodModuleAbsent,
+				Detail: fmt.Sprintf("%s installs %d files and none of them provides %s",
+					c.Name, len(e.st.files()), strings.Join(m.Validated, ", ")),
+			})
+			return f, true
+		}
+		f.Evidence = append(f.Evidence, blockers...)
+		return f, false
+	}
+
+	// The vulnerable module is installed. Whether anything imports *it* is a
+	// sharper question than whether anything imports the distribution, and it
+	// is the one case where a distribution the closure reaches can still be
+	// concluded on.
+	if e.g == nil {
+		return f, false
+	}
+	// Only interesting while the distribution itself is reached: if nothing
+	// imports any of it, the ordinary closure row already says so, and saying
+	// it again about one module adds nothing.
+	if len(e.g.Classify(code).Reachable) == 0 {
+		return f, false
+	}
+	if files := e.g.Classify(m.Files); len(files.Module) > 0 && len(files.Reachable) == 0 {
+		f.Evidence = append(f.Evidence, ecosystem.Evidence{
+			Origin: MethodImportAbsent,
+			Detail: fmt.Sprintf("nothing reachable from %s imports %s, though other modules of %s are reached",
+				e.entrypoint(), strings.Join(m.Present, ", "), c.Name),
+		})
+		if e.trust && len(blockers) == 0 {
+			f.Status = ecosystem.StatusNotInPath
+			f.Justification = "vulnerable_code_not_in_execute_path"
+			f.Method = MethodImportAbsent
+			return f, true
+		}
+	}
+	return f, false
 }
 
 // reachability applies the import graph to a distribution known to ship code.

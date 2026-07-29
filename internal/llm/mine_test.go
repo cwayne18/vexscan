@@ -86,6 +86,38 @@ func TestMineExtractsIdentifiers(t *testing.T) {
 	}
 }
 
+// A Python advisory is mined with its own instruction, and only that one asks
+// for modules. Changing a word of the OS instruction would move every OS
+// result the tool has produced, so the two must not be the same string.
+func TestMineAsksAPythonAdvisoryForModules(t *testing.T) {
+	cap := newCapture(t, chatReply(
+		`{"modules":["yaml.cyaml"],"symbols":["safe_load"],"files":[],"note":"named the C loader"}`))
+
+	c := testClient(cap.srv.URL)
+	h, err := c.Mine(context.Background(), MineRequest{
+		ID: "CVE-2020-14343", Ecosystem: "pypi", Package: "pyyaml",
+		Summary: "yaml.cyaml executes arbitrary code",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(h.Modules, []string{"yaml.cyaml"}) {
+		t.Errorf("modules = %v", h.Modules)
+	}
+	if h.Empty() {
+		t.Error("hints carrying a module report themselves empty")
+	}
+	if len(cap.system) != 1 || !strings.Contains(cap.system[0], "modules:") {
+		t.Errorf("the Python advisory was not mined for modules: %q", cap.system)
+	}
+	if minePromptFor("os") != minePrompt || minePromptFor("") != minePrompt {
+		t.Error("an OS advisory no longer gets the original mining instruction")
+	}
+	if minePromptFor("pypi") == minePrompt {
+		t.Error("a Python advisory gets the OS mining instruction")
+	}
+}
+
 // A second lookup of the same advisory must not cost a second call: one
 // advisory routinely applies to several packages across several images in a
 // single run.

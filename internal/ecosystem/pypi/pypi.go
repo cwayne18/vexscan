@@ -39,6 +39,14 @@ type Plugin struct {
 	// conclusions.
 	DynamicPolicy modgraph.DynamicPolicy
 
+	// Mine opts into the mined-module layer (--mine-advisories with --llm).
+	Mine bool
+
+	// TrustImportAbsence lets an installed but unimported vulnerable module
+	// decide a status. Off by default: the vulnerable function is usually
+	// reached from inside the same distribution, where nothing records it.
+	TrustImportAbsence bool
+
 	// Logf receives progress messages. Never nil after New.
 	Logf func(format string, args ...any)
 
@@ -48,9 +56,11 @@ type Plugin struct {
 
 // Options configure a Plugin.
 type Options struct {
-	Roots         []string
-	DynamicPolicy modgraph.DynamicPolicy
-	Logf          func(format string, args ...any)
+	Roots              []string
+	DynamicPolicy      modgraph.DynamicPolicy
+	Mine               bool
+	TrustImportAbsence bool
+	Logf               func(format string, args ...any)
 }
 
 // New returns a configured PyPI plugin.
@@ -59,7 +69,13 @@ func New(opts Options) *Plugin {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	return &Plugin{Roots: opts.Roots, DynamicPolicy: opts.DynamicPolicy, Logf: logf}
+	return &Plugin{
+		Roots:              opts.Roots,
+		DynamicPolicy:      opts.DynamicPolicy,
+		Mine:               opts.Mine,
+		TrustImportAbsence: opts.TrustImportAbsence,
+		Logf:               logf,
+	}
 }
 
 // ID implements ecosystem.Plugin.
@@ -68,6 +84,17 @@ func (p *Plugin) ID() string { return "pypi" }
 // Ecosystems implements ecosystem.Plugin. PyPI is not versioned by distro the
 // way the OS ecosystems are, so there is exactly one string.
 func (p *Plugin) Ecosystems() []string { return []string{"PyPI"} }
+
+// WantsHints implements ecosystem.HintConsumer.
+//
+// A PyPI advisory names a version range and nothing about what inside the
+// distribution is vulnerable. Python ships every module it installs, so the
+// one thing left to check is whether the module the prose names is in this
+// build at all -- optional C accelerators and format plugins are exactly the
+// modules that vary. That is what the mined modules are for, after
+// checkModules has established they came from the advisory and from this
+// distribution.
+func (p *Plugin) WantsHints() bool { return p.Mine }
 
 // state is the plugin-private payload on each Component.
 type state struct {
@@ -86,6 +113,14 @@ type state struct {
 	// only matter to an absent component: something that could not be named
 	// cannot be ruled out as the thing being asked about.
 	unreadable []string
+}
+
+// name is what to call this component in prose.
+func (s *state) name() string {
+	if len(s.pkgs) == 0 {
+		return "this distribution"
+	}
+	return s.pkgs[0].Name
 }
 
 // importNames are the names this distribution's code is imported by, which is
@@ -356,7 +391,7 @@ func (p *Plugin) AnalyzeImage(_ context.Context, img *target.Image, items []ecos
 	var out []ecosystem.Finding
 	for _, item := range items {
 		st := item.Component.Extra.(*state)
-		ev := evaluator{st: st, g: g}
+		ev := evaluator{st: st, g: g, trust: p.TrustImportAbsence}
 		for _, req := range item.Requests() {
 			out = append(out, ev.evaluate(item.Component, req))
 		}

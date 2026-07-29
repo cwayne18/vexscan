@@ -179,6 +179,29 @@ func TestOSMessageNamesAPackageAndAnImage(t *testing.T) {
 	}
 }
 
+// A Python distribution is neither a Go module nor an OS package, and the
+// prompt has to say what makes it different: nothing was eliminated at build
+// time, so being imported says nothing about what runs.
+func TestPyPIPromptAndMessage(t *testing.T) {
+	if promptFor("pypi") == goPrompt || promptFor("pypi") == osPrompt {
+		t.Error("a Python distribution gets another ecosystem's prompt")
+	}
+	if !strings.Contains(promptFor("pypi"), "removes no dead code") {
+		t.Error("the PyPI prompt does not say how weak the evidence behind it is")
+	}
+
+	got := userMessage(Request{Ecosystem: "pypi", CVE: "CVE-1", Module: "pyyaml",
+		Version: "6.0.1", Binary: "python:3.12-slim", Reachable: "imported"})
+	for _, want := range []string{"Distribution: pyyaml 6.0.1", "Image: python:3.12-slim", "imported"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("message %q is missing %q", got, want)
+		}
+	}
+	if strings.Contains(got, "Module:") {
+		t.Errorf("message calls a Python distribution a module: %q", got)
+	}
+}
+
 // The same CVE against a Go module and against an OS package of the same name
 // are different questions, so one must not serve the other's cached answer.
 func TestCacheKeySeparatesEcosystems(t *testing.T) {

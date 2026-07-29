@@ -36,6 +36,11 @@ type Hints struct {
 	Symbols []string `json:"symbols"`
 	// Sonames are shared-library names the advisory names ("libssl.so.3").
 	Sonames []string `json:"sonames"`
+	// Modules are importable module paths the advisory names, for the
+	// language ecosystems: a dotted Python path ("yaml.cyaml") or an npm
+	// subpath. Only the language mining prompts ask for these, so they are
+	// empty for an OS advisory.
+	Modules []string `json:"modules"`
 	// Files are paths or file names the advisory names.
 	Files []string `json:"files"`
 	// Note is the model's own account of what it did, kept for the record so a
@@ -46,7 +51,8 @@ type Hints struct {
 
 // Empty reports whether the hints carry nothing checkable.
 func (h *Hints) Empty() bool {
-	return h == nil || (len(h.Symbols) == 0 && len(h.Sonames) == 0 && len(h.Files) == 0)
+	return h == nil || (len(h.Symbols) == 0 && len(h.Sonames) == 0 &&
+		len(h.Modules) == 0 && len(h.Files) == 0)
 }
 
 // minePrompt is written to make a wrong answer cheap and an invented one
@@ -65,6 +71,40 @@ Do NOT include CVE ids, package names, version numbers, URLs, or commit hashes.
 If the advisory names none of a category, return an empty array for it. Returning all three empty is a correct and expected answer.
 Respond with ONLY a JSON object, no prose, of the form:
 {"symbols":[],"sonames":[],"files":[],"note":"one sentence on what the advisory did or did not name"}`
+
+// pyMinePrompt is the same instruction for a Python distribution.
+//
+// It is a separate constant rather than a generalization of minePrompt for the
+// reason goPrompt and osPrompt are separate: a word changed in the shared one
+// would move every OS result the tool has produced.
+//
+// The one addition that matters is the modules category, and the line telling
+// the model that a function or attribute is not a module. Python's dotted
+// names make "yaml.cyaml" and "yaml.load" look alike, and only the first is
+// something an import statement can name -- so the plugin's validation is
+// built to survive the model getting this wrong, and the prompt is written to
+// make it wrong less often.
+const pyMinePrompt = `You extract checkable identifiers from security advisory text. You do not analyze, judge, or infer.
+You are given the text of one advisory and the name of one affected Python distribution.
+List ONLY identifiers that appear LITERALLY in the advisory text and belong to that distribution:
+- modules: importable Python module paths, exactly as written (e.g. "yaml.cyaml", "PIL.WebPImagePlugin"). A module is something an "import" statement can name. A function, class, method or attribute is NOT a module and belongs in symbols, even when the advisory writes it as a dotted path.
+- symbols: names of vulnerable functions, classes or methods, exactly as written (e.g. "safe_load")
+- files: source or installed file names or paths, exactly as written
+Do NOT guess, expand, complete, correct, or infer any identifier. Do NOT include a name that is merely typical of the distribution.
+Do NOT include CVE ids, distribution names, version numbers, URLs, or commit hashes.
+If the advisory names none of a category, return an empty array for it. Returning all three empty is a correct and expected answer.
+Respond with ONLY a JSON object, no prose, of the form:
+{"modules":[],"symbols":[],"files":[],"note":"one sentence on what the advisory did or did not name"}`
+
+// minePromptFor selects the mining instruction for an ecosystem.
+func minePromptFor(ecosystem string) string {
+	switch strings.ToLower(ecosystem) {
+	case "pypi":
+		return pyMinePrompt
+	default:
+		return minePrompt
+	}
+}
 
 // Mine extracts the identifiers an advisory names. Results are cached per
 // advisory, because one advisory routinely applies to several packages and to
@@ -91,7 +131,7 @@ func (c *Client) Mine(ctx context.Context, r MineRequest) (*Hints, error) {
 	}
 
 	user := fmt.Sprintf("Advisory: %s\nAffected package: %s\nAdvisory text:\n%s", r.ID, r.Package, text)
-	raw, err := c.chat(ctx, minePrompt, user)
+	raw, err := c.chat(ctx, minePromptFor(r.Ecosystem), user)
 	if err != nil {
 		return nil, err
 	}
@@ -142,6 +182,7 @@ func parseHints(content string) (*Hints, error) {
 	}
 	h.Symbols = cleanIdents(h.Symbols)
 	h.Sonames = cleanIdents(h.Sonames)
+	h.Modules = cleanIdents(h.Modules)
 	h.Files = cleanIdents(h.Files)
 	h.Note = strings.TrimSpace(h.Note)
 	return &h, nil

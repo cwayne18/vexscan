@@ -190,9 +190,11 @@ func registryFor(opts Options) *ecosystem.Registry {
 			Logf:               opts.Logf,
 		}),
 		pypi.New(pypi.Options{
-			Roots:         opts.Roots,
-			DynamicPolicy: opts.DynamicPolicy,
-			Logf:          opts.Logf,
+			Roots:              opts.Roots,
+			DynamicPolicy:      opts.DynamicPolicy,
+			Mine:               opts.MineAdvisories && opts.UseLLM,
+			TrustImportAbsence: opts.TrustImportAbsence,
+			Logf:               opts.Logf,
 		}),
 	)
 }
