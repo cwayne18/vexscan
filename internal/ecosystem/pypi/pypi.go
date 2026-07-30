@@ -154,6 +154,16 @@ func (s *state) filesKnown() bool {
 	return len(s.pkgs) > 0
 }
 
+// There is deliberately no importNamesKnown gate beside filesKnown, though
+// langdb.Package carries the flag and the same reasoning would seem to apply.
+// It would be dead code. A guessed import name only ever arises when
+// top_level.txt is absent, and then either RECORD is absent too -- in which
+// case filesKnown already withholds every negative conclusion -- or RECORD
+// exists and named no importable top-level directory, in which case the
+// distribution has no module for the graph to address and reachability is
+// already declined a few lines above. The flag stays on the inventory output,
+// where a consumer can still see it.
+
 // prepared is the per-image work done once and shared by every component.
 type prepared struct {
 	img *target.Image

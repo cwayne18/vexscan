@@ -42,7 +42,21 @@ type python struct {
 	// image resolves the same "os" or "typing" import thousands of times.
 	resolved map[string][]string
 
+	// byImport and byName index the installed distributions, and scopes
+	// memoizes the dependency closures computed from them. All three are built
+	// on first use: a computed import is common, but an image with none of
+	// them should not pay for the index.
+	byImport map[string]langdb.Package
+	byName   map[string]langdb.Package
+	scopes   map[string]scopeResult
+
 	logf func(format string, args ...any)
+}
+
+// scopeResult is one memoized dependency closure.
+type scopeResult struct {
+	names    []string
+	complete bool
 }
 
 // maxSource caps how much of one file is scanned. A .py larger than this is
@@ -89,7 +103,7 @@ func (p *python) buildSearchPath() {
 	sort.Strings(roots)
 	dirs = append(dirs, roots...)
 
-	p.search = dedupePaths(dirs)
+	p.search = dedupe(dirs)
 	p.readPthFiles()
 }
 
@@ -190,7 +204,7 @@ func (p *python) readPthFiles() {
 			}
 		}
 	}
-	p.search = dedupePaths(p.search)
+	p.search = dedupe(p.search)
 }
 
 // Roots turns argv into entry modules.
@@ -394,7 +408,7 @@ func (p *python) prependSearch(dir string) {
 	if dir == "" || dir == "." {
 		return
 	}
-	p.search = dedupePaths(append([]string{path.Clean(dir)}, p.search...))
+	p.search = dedupe(append([]string{path.Clean(dir)}, p.search...))
 	p.resolved = map[string][]string{}
 }
 
@@ -549,16 +563,22 @@ func (p *python) Imports(file string) ([]modgraph.Spec, []modgraph.Taint, error)
 	var taints []modgraph.Taint
 
 	if len(sr.computed) > 0 {
+		detail := fmt.Sprintf("imports a module named at runtime (line %d)", sr.computed[0])
+		scope, complete := p.dynamicScope(file)
+		if complete && len(scope) > 0 {
+			detail += ", which could be this distribution or anything it requires"
+		}
 		taints = append(taints, modgraph.Taint{
 			Kind:     modgraph.TaintDynamicImport,
-			Detail:   fmt.Sprintf("imports a module named at runtime (line %d)", sr.computed[0]),
+			Detail:   detail,
 			Path:     file,
-			Scope:    p.owners(file),
+			Scope:    scope,
 			Blocking: true,
-			// A computed import inside one distribution says nothing about the
-			// rest of the image -- but one in application code, which no
-			// distribution owns, could load anything installed.
-			Global: len(p.owners(file)) == 0,
+			// Code no installed distribution owns -- the application's own, or
+			// the stdlib's -- is bounded by nothing and could import anything
+			// installed. So is a distribution whose own requirements could not
+			// be walked.
+			Global: !complete,
 		})
 	}
 
@@ -608,6 +628,112 @@ func (p *python) owners(file string) []string {
 		top = top[:i]
 	}
 	return []string{strings.TrimSuffix(top, ".py")}
+}
+
+// dynamicScope is the set of import names a computed import inside file could
+// name, and whether that set is known to be complete.
+//
+// Scoping a dynamic import to the distribution that contains it -- which is
+// what owners alone gives, and what this shipped as -- is inert. A taint only
+// blocks a conclusion about a distribution in its scope, and the distribution
+// running the computed import is reached by definition, since its file had to
+// be read for the taint to be found at all. It could never withhold a
+// conclusion from anything. The npm plugin had the identical defect and
+// node:22-slim demonstrated the cost: tar reported not_in_execute_path behind
+// the very require that loads it.
+//
+// What a computed import can reach is bounded by what the distribution says it
+// requires, so the scope is the transitive closure over Requires-Dist. That
+// stays narrow for a leaf library and correctly widens to nearly everything for
+// an application distribution at the top of the tree.
+//
+// Completeness is where Python differs from npm. A declared requirement that is
+// not installed is not automatically a broken environment: an unselected extra
+// and a marker-gated dependency are *supposed* to be absent, which is why
+// langdb.Requirement records whether a marker was present. An unconditional
+// requirement that is missing, or metadata that would not parse, means the
+// closure is not knowable and the caller must taint globally.
+func (p *python) dynamicScope(file string) (names []string, complete bool) {
+	own := p.owners(file)
+	if len(own) == 0 {
+		return nil, false
+	}
+	p.indexDists()
+	dist, ok := p.byImport[own[0]]
+	if !ok {
+		// Under a site-packages directory but owned by no distribution the
+		// inventory found: a stray module, or one whose metadata was
+		// unreadable. Either way there is no requirement list to bound it.
+		return own, false
+	}
+	return p.requireClosure(dist)
+}
+
+// requireClosure walks Requires-Dist transitively from one distribution.
+func (p *python) requireClosure(dist langdb.Package) (names []string, complete bool) {
+	if hit, ok := p.scopes[dist.Name]; ok {
+		return hit.names, hit.complete
+	}
+	// Memoized before the walk as well as after. Circular requirements are
+	// legal and do occur, and this is what stops one from recursing forever.
+	p.scopes[dist.Name] = scopeResult{complete: true}
+
+	seen := map[string]bool{}
+	complete = true
+
+	queue := []langdb.Package{dist}
+	for len(queue) > 0 {
+		d := queue[0]
+		queue = queue[1:]
+		if seen[d.Name] {
+			continue
+		}
+		seen[d.Name] = true
+		names = append(names, d.ImportNames...)
+
+		if !d.RequiresKnown {
+			complete = false
+			continue
+		}
+		for _, req := range d.Requires {
+			next, ok := p.byName[req.Name]
+			if ok {
+				queue = append(queue, next)
+				continue
+			}
+			if !req.Conditional {
+				complete = false
+			}
+		}
+	}
+
+	names = dedupe(names)
+	sort.Strings(names)
+	p.scopes[dist.Name] = scopeResult{names: names, complete: complete}
+	return names, complete
+}
+
+// indexDists builds the name lookups the closure walks.
+func (p *python) indexDists() {
+	if p.byName != nil {
+		return
+	}
+	p.byName = make(map[string]langdb.Package, len(p.res.Packages))
+	p.byImport = make(map[string]langdb.Package, len(p.res.Packages))
+	p.scopes = map[string]scopeResult{}
+	for _, pkg := range p.res.Packages {
+		if _, ok := p.byName[pkg.Name]; !ok {
+			p.byName[pkg.Name] = pkg
+		}
+		for _, n := range pkg.ImportNames {
+			// First writer wins, matching sys.path order after the inventory's
+			// sort: two distributions claiming one import name means only the
+			// first is importable under it.
+			if _, ok := p.byImport[n]; !ok {
+				p.byImport[n] = pkg
+			}
+		}
+	}
 }
 
 // entryPointModules lists every module named on the left of a colon in an
@@ -718,7 +844,7 @@ func (p *python) resolveAbsolute(name string) []string {
 	// A namespace package merges across every sys.path entry, so the search
 	// does not stop at the first hit. For an ordinary module the extra probes
 	// find nothing, and the memo makes the cost one-time.
-	out = dedupePaths(out)
+	out = dedupe(out)
 	p.resolved[name] = out
 	return out
 }
@@ -780,7 +906,7 @@ func topName(name string) string {
 	return name
 }
 
-func dedupePaths(in []string) []string {
+func dedupe(in []string) []string {
 	seen := map[string]bool{}
 	out := make([]string, 0, len(in))
 	for _, s := range in {

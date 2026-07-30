@@ -349,6 +349,105 @@ func TestABlockingTaintStopsTheUnreachedConclusion(t *testing.T) {
 	}
 }
 
+// lazyTree installs a distribution that imports by computed name, declaring
+// requires as its Requires-Dist. The requirement chain fetcher -> deeper is
+// what the closure has to walk.
+func lazyTree(requires string, extra map[string]string) map[string]string {
+	dist := func(name, version, req string) map[string]string {
+		meta := fmt.Sprintf("Name: %s\nVersion: %s\n", name, version)
+		if req != "" {
+			meta += req
+		}
+		return map[string]string{
+			sp + "/" + name + "-" + version + ".dist-info/METADATA":      meta,
+			sp + "/" + name + "-" + version + ".dist-info/top_level.txt": name + "\n",
+			sp + "/" + name + "-" + version + ".dist-info/RECORD":        record(name + "/__init__.py"),
+		}
+	}
+	files := appTree("import lazyapp\n", map[string]string{
+		"/usr/lib/python3.12/importlib/__init__.py": "",
+		sp + "/lazyapp/__init__.py":                 "import importlib\nmod = importlib.import_module(chosen)\n",
+		sp + "/fetcher/__init__.py":                 "",
+		sp + "/deeper/__init__.py":                  "",
+	})
+	for _, m := range []map[string]string{
+		dist("lazyapp", "1.0", requires),
+		dist("fetcher", "2.0", "Requires-Dist: deeper\n"),
+		dist("deeper", "3.0", ""),
+	} {
+		for k, v := range m {
+			files[k] = v
+		}
+	}
+	for k, v := range extra {
+		files[k] = v
+	}
+	return files
+}
+
+// A computed import inside an installed distribution has to block conclusions
+// about that distribution's *requirements*, not merely about itself.
+//
+// Scoping the taint to the distribution containing the computed import made it
+// inert: that distribution is reached by definition, since its file had to be
+// read for the taint to be found, so the taint could never withhold a
+// conclusion from anything. The npm plugin had the same defect and node:22-slim
+// showed what it costs -- tar reported not_in_execute_path behind exactly the
+// require that loads it.
+func TestADynamicImportBlocksTheDistributionsItCouldReach(t *testing.T) {
+	img := pyImage(t, lazyTree("Requires-Dist: fetcher (>=2.0)\n", nil))
+	img.Config = target.ImageConfig{Entrypoint: []string{"python3", "/app/main.py"}}
+
+	got := statuses(t, img, []ecosystem.Subject{{Raw: "all"}})
+	for _, name := range []string{"fetcher", "deeper"} {
+		f := got[name]
+		det, blocking := evidence(f)
+		if f.Status != ecosystem.StatusLinked {
+			t.Errorf("%s = %s, want linked: lazyapp could import it at runtime:%s", name, f.Status, det)
+		}
+		if !blocking {
+			t.Errorf("%s was withheld by no evidence, so nothing recorded why:%s", name, det)
+		}
+	}
+	// Neither is required by lazyapp, so the taint has to leave both of them
+	// concludable. A scope that swallowed these would be the global taint this
+	// fix exists to avoid.
+	for _, name := range []string{"requests", "pyyaml"} {
+		if f := got[name]; f.Status != ecosystem.StatusNotInPath {
+			det, _ := evidence(f)
+			t.Errorf("%s = %s, want not_in_execute_path: lazyapp does not require it:%s", name, f.Status, det)
+		}
+	}
+}
+
+// The two ways a requirement can be missing are not the same fact.
+//
+// An unconditional Requires-Dist naming something that is not installed means
+// the environment is not what the metadata describes, and nothing about it
+// bounds anything. A marker-gated one is the marker working: an unselected
+// extra is supposed to be absent, and treating that as unknown would push
+// almost every Python image into a global taint.
+func TestAMissingRequirementIsOnlyUnknownWhenItIsUnconditional(t *testing.T) {
+	run := func(t *testing.T, requires string) ecosystem.Finding {
+		t.Helper()
+		img := pyImage(t, lazyTree(requires, nil))
+		img.Config = target.ImageConfig{Entrypoint: []string{"python3", "/app/main.py"}}
+		return statuses(t, img, []ecosystem.Subject{{Raw: "all"}})["requests"]
+	}
+
+	f := run(t, "Requires-Dist: absent-from-this-image\n")
+	det, blocking := evidence(f)
+	if f.Status != ecosystem.StatusLinked || !blocking {
+		t.Errorf("requests = %s (blocking=%v), want linked: the closure could not be walked:%s", f.Status, blocking, det)
+	}
+
+	f = run(t, "Requires-Dist: pytest; extra == \"test\"\n")
+	if f.Status != ecosystem.StatusNotInPath {
+		det, _ := evidence(f)
+		t.Errorf("requests = %s, want not_in_execute_path: an unselected extra is expected to be absent:%s", f.Status, det)
+	}
+}
+
 // Silence about a file list that was guessed is not evidence: the modules the
 // graph checked may not be the ones the distribution installs.
 func TestReconstructedFileListCannotSayUnreached(t *testing.T) {

@@ -77,12 +77,14 @@ func (r *PyPI) Read(fsys target.RootFS, roots []string) (Result, error) {
 func (r *PyPI) readDist(fsys target.RootFS, root, dir string, isDir bool) (Package, bool) {
 	pkg := Package{Format: FormatPyPI, Dir: dir, DB: root}
 
-	var rawName, version string
+	var meta pyMeta
 	if isDir {
-		rawName, version = readPyMetadata(fsys, dir)
+		meta = readPyMetadata(fsys, dir)
 	} else {
-		rawName, version = parsePyMetadata(fsys, dir)
+		meta = parsePyMetadata(fsys, dir)
 	}
+	rawName, version := meta.name, meta.version
+	pkg.Requires, pkg.RequiresKnown = meta.requires, meta.known
 	if rawName == "" || version == "" {
 		// The directory name is the last resort, and it is a real one: PEP 427
 		// requires it to be "{name}-{version}.dist-info", so a distribution
@@ -133,15 +135,26 @@ func (r *PyPI) readDist(fsys target.RootFS, root, dir string, isDir bool) (Packa
 	return pkg, true
 }
 
-// readPyMetadata reads Name and Version out of a .dist-info/.egg-info
-// directory, trying the modern spelling before the setuptools one.
-func readPyMetadata(fsys target.RootFS, dir string) (name, version string) {
+// pyMeta is what one core-metadata file says.
+type pyMeta struct {
+	name     string
+	version  string
+	requires []Requirement
+
+	// known reports that the header block was read, which is what separates
+	// "declares no dependencies" from "did not say".
+	known bool
+}
+
+// readPyMetadata reads a .dist-info/.egg-info directory's core metadata,
+// trying the modern spelling before the setuptools one.
+func readPyMetadata(fsys target.RootFS, dir string) pyMeta {
 	for _, f := range []string{"METADATA", "PKG-INFO"} {
-		if name, version = parsePyMetadata(fsys, path.Join(dir, f)); name != "" {
-			return name, version
+		if m := parsePyMetadata(fsys, path.Join(dir, f)); m.name != "" {
+			return m
 		}
 	}
-	return "", ""
+	return pyMeta{}
 }
 
 // parsePyMetadata reads the RFC822 header block of a core-metadata file.
@@ -149,13 +162,14 @@ func readPyMetadata(fsys target.RootFS, dir string) (name, version string) {
 // Only the headers are read: everything after the first blank line is the long
 // description, which on a large distribution is the whole README and can
 // contain lines that look exactly like headers.
-func parsePyMetadata(fsys target.RootFS, file string) (name, version string) {
+func parsePyMetadata(fsys target.RootFS, file string) pyMeta {
 	f, err := fsys.Open(file)
 	if err != nil {
-		return "", ""
+		return pyMeta{}
 	}
 	defer f.Close()
 
+	var m pyMeta
 	sc := bufio.NewScanner(io.LimitReader(f, 1<<20))
 	sc.Buffer(make([]byte, 0, 4096), 1<<20)
 	for sc.Scan() {
@@ -163,6 +177,7 @@ func parsePyMetadata(fsys target.RootFS, file string) (name, version string) {
 		if strings.TrimSpace(line) == "" {
 			break
 		}
+		m.known = true
 		if line[0] == ' ' || line[0] == '\t' {
 			continue // a folded continuation of the previous header
 		}
@@ -172,15 +187,41 @@ func parsePyMetadata(fsys target.RootFS, file string) (name, version string) {
 		}
 		switch strings.ToLower(strings.TrimSpace(key)) {
 		case "name":
-			name = strings.TrimSpace(value)
+			m.name = strings.TrimSpace(value)
 		case "version":
-			version = strings.TrimSpace(value)
-		}
-		if name != "" && version != "" {
-			break
+			m.version = strings.TrimSpace(value)
+		case "requires-dist", "requires":
+			// "Requires" is the metadata 1.1 spelling, still emitted by old
+			// egg-info directories, and its value is a bare project name.
+			if r, ok := parseRequirement(value); ok {
+				m.requires = append(m.requires, r)
+			}
 		}
 	}
-	return name, version
+	return m
+}
+
+// pyReqName matches the project name at the head of a PEP 508 requirement.
+var pyReqName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*`)
+
+// parseRequirement reads one Requires-Dist value.
+//
+// PEP 508 permits a great deal more than this reads -- URLs, nested marker
+// expressions, arbitrary whitespace -- but everything past the name and the
+// presence of a marker is version-solving, and no version is being solved
+// here. The question is only which installed distributions this one may
+// import, so the grammar that matters is: a name, optionally extras and a
+// specifier, optionally a semicolon and a marker.
+func parseRequirement(value string) (Requirement, bool) {
+	expr, marker, hasMarker := strings.Cut(value, ";")
+	name := pyReqName.FindString(strings.TrimSpace(expr))
+	if name == "" {
+		return Requirement{}, false
+	}
+	return Requirement{
+		Name:        NormalizePyPI(name),
+		Conditional: hasMarker && strings.TrimSpace(marker) != "",
+	}, true
 }
 
 // pyDirVersion matches the trailing "-<version>" of a dist-info directory

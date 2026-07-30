@@ -91,6 +91,43 @@ type Package struct {
 	// DB is the site-packages or node_modules directory this came from, for
 	// evidence and error messages.
 	DB string `json:"db,omitempty"`
+
+	// Requires are the packages this one declares it may load, named the way
+	// Name is. It bounds what a computed import inside this package could
+	// reach, which is the only thing that makes a dynamic-import taint able to
+	// block anything narrower than the whole image.
+	//
+	// Only the PyPI reader fills this in. npm's resolver reads dependencies
+	// from package.json itself, because for npm a name is not enough: which
+	// copy of "tar" a file sees depends on the directory it is required from,
+	// and that is precisely what nested node_modules means. Python's sys.path
+	// is a single global search order, so a name resolves the same everywhere
+	// and can be indexed once.
+	Requires []Requirement `json:"requires,omitempty"`
+
+	// RequiresKnown reports whether Requires came from readable metadata.
+	//
+	// Same asymmetry as FilesKnown. An empty Requires means "this package
+	// depends on nothing", which narrows a taint's scope to the package
+	// itself; only metadata that was actually read can support that.
+	RequiresKnown bool `json:"requires_known"`
+}
+
+// Requirement is one declared dependency.
+type Requirement struct {
+	Name string `json:"name"`
+
+	// Conditional reports whether the declaration carries an environment
+	// marker -- an extra, a Python version bound, a platform test.
+	//
+	// It exists to separate two very different kinds of absence. An
+	// unconditional dependency that is not installed means the environment is
+	// not what the metadata describes, and nothing about it can be trusted to
+	// bound anything. A conditional one that is not installed is the marker
+	// working as designed: an unselected extra is *expected* to be missing,
+	// and treating that as an unknown would push nearly every Python image
+	// into a global taint.
+	Conditional bool `json:"conditional,omitempty"`
 }
 
 // OSVNames returns the names to query OSV with, likeliest first.
