@@ -425,11 +425,10 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 	}
 	defer cleanup()
 
-	analyzers := ecosystem.SourceAnalyzers(plugins)
 	result := &Result{SchemaVersion: SchemaVersion, Target: opts.Repo, Mode: "repo", Module: opts.Module}
 
 	applied := 0
-	for _, a := range analyzers {
+	for _, a := range ecosystem.SourceAnalyzers(plugins) {
 		ok, err := a.DetectSource(ctx, src)
 		if err != nil {
 			return nil, fmt.Errorf("%s: detect: %w", a.ID(), err)
@@ -445,6 +444,27 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 		}
 		result.Findings = append(result.Findings, stamp(a.ID(), findings)...)
 	}
+
+	// The inventory-driven analyzers run through the same three phases as an
+	// image scan, sharing one advisory cache between them.
+	run := &sourceRun{
+		subjects: subjects,
+		targeted: targeted(subjects),
+		resolver: newResolver(),
+		cves:     opts.CVEs,
+		logf:     logf,
+	}
+	for _, a := range ecosystem.InventorySourceAnalyzers(plugins) {
+		findings, ok, err := run.analyze(ctx, a, src)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", a.ID(), err)
+		}
+		if !ok {
+			continue
+		}
+		applied++
+		result.Findings = append(result.Findings, findings...)
+	}
 	// No analyzer recognizing the tree must not read as a clean scan: an empty
 	// findings array is indistinguishable from "checked, nothing wrong".
 	if applied == 0 {
@@ -455,6 +475,52 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 	llmOverlay(ctx, llmClient, result.Findings, "source tree", logf)
 	sortFindings(result.Findings)
 	return result, nil
+}
+
+// sourceRun is imageRun's counterpart for the checkout analyzers: the same
+// shared advisory cache, over a source tree instead of an image.
+//
+// It has no miner, and that is a decision rather than an omission. A mined hint
+// may only support a not_affected-flavored status after the plugin validates it
+// against something it can observe, and what repo mode observes is a lock file:
+// a list of names and versions with no file list to check a module path
+// against. Every hint would therefore be inert, so asking the model for one
+// would be a round trip per advisory spent on an answer nothing can use.
+type sourceRun struct {
+	subjects []ecosystem.Subject
+	targeted bool
+	resolver *advisoryResolver
+	cves     []string
+	logf     func(string, ...any)
+}
+
+// analyze runs one plugin's three phases. The bool reports whether the plugin
+// applied to the checkout at all.
+//
+// Unlike imageRun.analyze this returns errors rather than recording them,
+// matching the rest of repo mode: an image scan has many ecosystems and can
+// afford to lose one, while a checkout usually has exactly the ecosystem the
+// user came for, and swallowing its failure would leave nothing to report.
+func (r *sourceRun) analyze(ctx context.Context, a ecosystem.InventorySourceAnalyzer, src *target.Source) ([]Finding, bool, error) {
+	ok, err := a.DetectSource(ctx, src)
+	if err != nil {
+		return nil, false, fmt.Errorf("detect: %w", err)
+	}
+	if !ok {
+		return nil, false, nil
+	}
+
+	components, err := a.InventorySource(ctx, src, r.subjects)
+	if err != nil {
+		return nil, false, fmt.Errorf("inventory: %w", err)
+	}
+
+	items := r.resolver.workItems(ctx, components, r.cves, r.targeted, r.logf)
+	findings, err := a.AnalyzeSource(ctx, src, items)
+	if err != nil {
+		return nil, false, fmt.Errorf("analyze: %w", err)
+	}
+	return stamp(a.ID(), findings), true, nil
 }
 
 // advisoryResolver turns an inventory into per-component advisory sets.

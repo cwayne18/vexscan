@@ -98,3 +98,15 @@ func SourceAnalyzers(plugins []Plugin) []SourceAnalyzer {
 	}
 	return out
 }
+
+// InventorySourceAnalyzers filters plugins to those that analyze a checkout
+// through an inventory rather than a call-graph tool.
+func InventorySourceAnalyzers(plugins []Plugin) []InventorySourceAnalyzer {
+	var out []InventorySourceAnalyzer
+	for _, p := range plugins {
+		if sa, ok := p.(InventorySourceAnalyzer); ok {
+			out = append(out, sa)
+		}
+	}
+	return out
+}

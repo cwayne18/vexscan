@@ -112,6 +112,38 @@ type SourceAnalyzer interface {
 	AnalyzeSource(ctx context.Context, src *target.Source, subjects []Subject, requested []string) ([]Finding, error)
 }
 
+// InventorySourceAnalyzer analyzes a source checkout in the same three phases
+// as an image, for an ecosystem whose source-mode evidence is a lock file
+// rather than a call-graph tool.
+//
+// It exists because SourceAnalyzer's two-phase shape encodes an assumption that
+// only holds for Go: that the analysis tool supplies the advisories. A lock
+// file supplies coordinates and nothing else, so an ecosystem reading one needs
+// the orchestrator to sit in the middle and resolve them -- which is exactly
+// what ImageAnalyzer's three phases are for. Reusing the phase structure means
+// repo mode gets --cves filtering, the shared advisory cache and the LLM
+// overlay for free, and means a plugin still cannot query OSV itself.
+//
+// AnalyzeSource deliberately collides with SourceAnalyzer's method of the same
+// name at a different signature, so a type can satisfy one interface or the
+// other but never both. That is the correct constraint: govulncheck and a lock
+// file are two answers to one question, and an ecosystem has to pick.
+type InventorySourceAnalyzer interface {
+	Plugin
+
+	// DetectSource reports whether this plugin applies to src.
+	DetectSource(ctx context.Context, src *target.Source) (bool, error)
+
+	// InventorySource lists the components the checkout declares, restricted
+	// to subjects when any are given. The same rule as InventoryImage applies:
+	// a lock file that was found and could not be parsed is an error, never an
+	// empty inventory.
+	InventorySource(ctx context.Context, src *target.Source, subjects []Subject) ([]Component, error)
+
+	// AnalyzeSource decides each work item. Findings must carry no LLM verdict.
+	AnalyzeSource(ctx context.Context, src *target.Source, items []WorkItem) ([]Finding, error)
+}
+
 // Subject is what the user asked to scan, before anything has been resolved
 // against a real target: the --package / --module selection.
 type Subject struct {

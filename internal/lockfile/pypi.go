@@ -1,0 +1,284 @@
+package lockfile
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"regexp"
+	"strings"
+
+	"github.com/cwayne18/vexscan/internal/langdb"
+	"github.com/cwayne18/vexscan/internal/target"
+)
+
+// PyPI reads the three lock files Python actually ships with: requirements.txt,
+// poetry.lock, and Pipfile.lock.
+//
+// pyproject.toml is deliberately not among them. It declares constraints rather
+// than resolutions, so it can say a package is *wanted* but not at which
+// version -- and a version is what an advisory range is compared against.
+type PyPI struct{}
+
+func (*PyPI) Format() Format { return FormatPyPI }
+
+func (p *PyPI) Read(fsys target.RootFS, dir string) ([]Result, error) {
+	var out []Result
+
+	for _, file := range findGlob(fsys, dir, "requirements", ".txt") {
+		res, err := readRequirements(fsys, file)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, res)
+	}
+	for _, file := range find(fsys, dir, []string{"poetry.lock"}) {
+		res, err := readPoetryLock(fsys, file)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, res)
+	}
+	for _, file := range find(fsys, dir, []string{"Pipfile.lock"}) {
+		res, err := readPipfileLock(fsys, file)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, res)
+	}
+	return out, nil
+}
+
+// reqName matches the project name at the head of a PEP 508 requirement.
+var reqName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*`)
+
+// reqPin matches a "==" pin anywhere in a version specifier set.
+var reqPin = regexp.MustCompile(`==\s*([A-Za-z0-9][A-Za-z0-9._!+-]*)`)
+
+// readRequirements parses a pip requirements file.
+//
+// The result carries DevKnown false, always. A requirements file has no notion
+// of a development dependency -- the convention of a second
+// requirements-dev.txt is a convention, not a declaration, and this will not
+// infer a production/development partition from a file name.
+func readRequirements(fsys target.RootFS, file string) (Result, error) {
+	f, err := fsys.Open(file)
+	if err != nil {
+		return Result{}, fmt.Errorf("reading %s: %w", file, err)
+	}
+	defer f.Close()
+
+	res := Result{Format: FormatPyPI, File: file}
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+
+	var joined string
+	for sc.Scan() {
+		line := sc.Text()
+		if i := strings.Index(line, " #"); i >= 0 {
+			line = line[:i]
+		}
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		// A trailing backslash continues the requirement, which is how
+		// pip-compile writes the --hash lines that follow almost every pin.
+		if strings.HasSuffix(line, `\`) {
+			joined += strings.TrimSuffix(line, `\`) + " "
+			continue
+		}
+		joined += line
+		if req, ok := parseRequirementLine(joined); ok {
+			res.Packages = append(res.Packages, req)
+		}
+		joined = ""
+	}
+	if err := sc.Err(); err != nil {
+		return Result{}, fmt.Errorf("reading %s: %w", file, err)
+	}
+	if joined != "" {
+		if req, ok := parseRequirementLine(joined); ok {
+			res.Packages = append(res.Packages, req)
+		}
+	}
+	return res, nil
+}
+
+// parseRequirementLine reads one logical requirements.txt line.
+func parseRequirementLine(line string) (Package, bool) {
+	line = strings.TrimSpace(line)
+	if line == "" || strings.HasPrefix(line, "#") {
+		return Package{}, false
+	}
+	// Options: -r/-c include another file, -e installs from a path, --index-url
+	// and friends configure pip. None of them names a resolved package here;
+	// an included file is read on its own if it sits in the same directory.
+	if strings.HasPrefix(line, "-") {
+		return Package{}, false
+	}
+	// Drop the hash pins pip-compile appends before anything else looks at the
+	// specifier, since "--hash=sha256:..." contains characters a version
+	// pattern would otherwise be happy to match.
+	if i := strings.Index(line, "--hash"); i >= 0 {
+		line = line[:i]
+	}
+	// An environment marker gates installation but does not change the name or
+	// the version, and repo mode has no environment to evaluate it against.
+	// Reporting the package is the conservative direction.
+	expr, _, _ := strings.Cut(line, ";")
+	expr = strings.TrimSpace(expr)
+
+	name := reqName.FindString(expr)
+	if name == "" {
+		// A bare URL or local path. pip can install from one, but the file
+		// gives no project name to key an advisory on.
+		return Package{}, false
+	}
+	rest := expr[len(name):]
+	// A PEP 508 direct reference -- "name @ https://..." -- names the project
+	// but pins no version.
+	if i := strings.Index(rest, "@"); i >= 0 {
+		rest = rest[:i]
+	}
+	version := ""
+	if m := reqPin.FindStringSubmatch(rest); m != nil {
+		version = m[1]
+	}
+	return Package{Name: langdb.NormalizePyPI(name), Version: version}, true
+}
+
+// poetryKey matches a bare `key = value` at the head of a line.
+var poetryKey = regexp.MustCompile(`^([A-Za-z0-9_-]+)\s*=\s*(.*)$`)
+
+// readPoetryLock parses poetry.lock without a TOML dependency.
+//
+// The file is machine-generated by a single writer, and the shape this needs is
+// the narrowest part of it: `[[package]]` headers and four scalar keys beneath
+// each. A general TOML parser would be a new module dependency to read four
+// fields whose grammar here is `key = "value"` and nothing else.
+//
+// The reader is written to fail closed on shapes it does not recognise: an
+// unrecognised line is skipped, and a package block that yields no name is
+// dropped rather than guessed at.
+func readPoetryLock(fsys target.RootFS, file string) (Result, error) {
+	f, err := fsys.Open(file)
+	if err != nil {
+		return Result{}, fmt.Errorf("reading %s: %w", file, err)
+	}
+	defer f.Close()
+
+	res := Result{Format: FormatPyPI, File: file}
+
+	var cur Package
+	var inPackage, haveGroups bool
+	flush := func() {
+		if inPackage && cur.Name != "" {
+			res.Packages = append(res.Packages, cur)
+		}
+		cur, inPackage = Package{}, false
+	}
+
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if strings.HasPrefix(line, "[") {
+			// Any table header closes the current block: [[package]] opens the
+			// next one, and [package.dependencies] or [metadata] begins a
+			// nested table whose own `name` key is a different package's.
+			flush()
+			inPackage = line == "[[package]]"
+			continue
+		}
+		if !inPackage {
+			continue
+		}
+		m := poetryKey.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		key, value := m[1], strings.TrimSpace(m[2])
+		switch key {
+		case "name":
+			cur.Name = langdb.NormalizePyPI(tomlString(value))
+		case "version":
+			cur.Version = tomlString(value)
+		case "groups":
+			// Poetry 1.5 and later. A package not in "main" is unreachable
+			// from a `poetry install --only main`.
+			haveGroups = true
+			cur.Dev = !tomlArrayHas(value, "main")
+		case "category":
+			// Poetry 1.1's spelling of the same fact, one group per package.
+			haveGroups = true
+			cur.Dev = tomlString(value) != "main"
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return Result{}, fmt.Errorf("reading %s: %w", file, err)
+	}
+	flush()
+
+	res.DevKnown = haveGroups
+	return res, nil
+}
+
+// tomlString unquotes a TOML basic or literal string, leaving anything else
+// alone.
+func tomlString(v string) string {
+	if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
+		return v[1 : len(v)-1]
+	}
+	return v
+}
+
+// tomlArrayHas reports whether a single-line TOML string array contains want.
+func tomlArrayHas(v, want string) bool {
+	v = strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(v), "["), "]")
+	for _, part := range strings.Split(v, ",") {
+		if tomlString(strings.TrimSpace(part)) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// pipfileLock is the subset of Pipfile.lock this needs.
+type pipfileLock struct {
+	Default map[string]pipfileEntry `json:"default"`
+	Develop map[string]pipfileEntry `json:"develop"`
+}
+
+type pipfileEntry struct {
+	// Version is a specifier, not a bare version: pipenv writes "==2.31.0".
+	Version string `json:"version"`
+}
+
+func readPipfileLock(fsys target.RootFS, file string) (Result, error) {
+	data, err := fsys.ReadFile(file)
+	if err != nil {
+		return Result{}, fmt.Errorf("reading %s: %w", file, err)
+	}
+	var lock pipfileLock
+	if err := json.Unmarshal(data, &lock); err != nil {
+		return Result{}, fmt.Errorf("parsing %s: %w", file, err)
+	}
+
+	res := Result{Format: FormatPyPI, File: file, DevKnown: true}
+	add := func(m map[string]pipfileEntry, dev bool) {
+		for name, e := range m {
+			version := ""
+			if mm := reqPin.FindStringSubmatch(e.Version); mm != nil {
+				version = mm[1]
+			}
+			res.Packages = append(res.Packages, Package{
+				Name:    langdb.NormalizePyPI(name),
+				Version: version,
+				Dev:     dev,
+			})
+		}
+	}
+	add(lock.Default, false)
+	add(lock.Develop, true)
+	return res, nil
+}
