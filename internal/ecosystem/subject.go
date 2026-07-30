@@ -23,6 +23,10 @@ var formatAliases = map[string]string{
 	// what a user reaches for first, and neither names anything else here.
 	"python": "pypi",
 	"pip":    "pypi",
+	// And npm the same way: OSV's ecosystem is "npm", but the thing people
+	// reach for is the runtime's name.
+	"node":   "npm",
+	"nodejs": "npm",
 }
 
 // ParseSubject turns one --package value into a Subject.

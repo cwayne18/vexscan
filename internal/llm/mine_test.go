@@ -118,6 +118,32 @@ func TestMineAsksAPythonAdvisoryForModules(t *testing.T) {
 	}
 }
 
+// An npm advisory is mined for subpaths, and the instruction has to carry the
+// one rule that makes the answer checkable: a module contains a slash, and a
+// dotted name is a property access that no file can be found for.
+func TestMineAsksAnNPMAdvisoryForSubpaths(t *testing.T) {
+	cap := newCapture(t, chatReply(
+		`{"modules":["lodash/template"],"symbols":[],"files":[],"note":"named the template module"}`))
+
+	c := testClient(cap.srv.URL)
+	h, err := c.Mine(context.Background(), MineRequest{
+		ID: "CVE-2021-23337", Ecosystem: "npm", Package: "lodash",
+		Summary: "lodash/template allows command injection",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(h.Modules, []string{"lodash/template"}) {
+		t.Errorf("modules = %v", h.Modules)
+	}
+	if len(cap.system) != 1 || !strings.Contains(cap.system[0], "always contains a slash") {
+		t.Errorf("the npm instruction does not state the slash rule: %q", cap.system)
+	}
+	if minePromptFor("npm") == minePrompt || minePromptFor("npm") == pyMinePrompt {
+		t.Error("an npm advisory gets another ecosystem's mining instruction")
+	}
+}
+
 // A second lookup of the same advisory must not cost a second call: one
 // advisory routinely applies to several packages across several images in a
 // single run.

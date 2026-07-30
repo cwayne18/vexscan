@@ -17,6 +17,7 @@ import (
 
 	"github.com/cwayne18/vexscan/internal/ecosystem"
 	"github.com/cwayne18/vexscan/internal/ecosystem/golang"
+	"github.com/cwayne18/vexscan/internal/ecosystem/npm"
 	"github.com/cwayne18/vexscan/internal/ecosystem/ospkg"
 	"github.com/cwayne18/vexscan/internal/ecosystem/pypi"
 	"github.com/cwayne18/vexscan/internal/elfgraph"
@@ -173,7 +174,7 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	return nil, fmt.Errorf("one of --image or --repo is required")
 }
 
-// registryFor builds the plugin set for a run. npm registers here.
+// registryFor builds the plugin set for a run.
 func registryFor(opts Options) *ecosystem.Registry {
 	return ecosystem.NewRegistry(
 		golang.New(golang.Options{
@@ -190,6 +191,13 @@ func registryFor(opts Options) *ecosystem.Registry {
 			Logf:               opts.Logf,
 		}),
 		pypi.New(pypi.Options{
+			Roots:              opts.Roots,
+			DynamicPolicy:      opts.DynamicPolicy,
+			Mine:               opts.MineAdvisories && opts.UseLLM,
+			TrustImportAbsence: opts.TrustImportAbsence,
+			Logf:               opts.Logf,
+		}),
+		npm.New(npm.Options{
 			Roots:              opts.Roots,
 			DynamicPolicy:      opts.DynamicPolicy,
 			Mine:               opts.MineAdvisories && opts.UseLLM,

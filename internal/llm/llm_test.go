@@ -202,6 +202,31 @@ func TestPyPIPromptAndMessage(t *testing.T) {
 	}
 }
 
+// npm's distinguishing fact is the depth of the tree: a package five levels
+// down is installed because something needed something that needed it, and the
+// prompt has to say that being installed and required is not being called.
+func TestNPMPromptAndMessage(t *testing.T) {
+	for _, other := range []string{"golang", "os", "pypi"} {
+		if promptFor("npm") == promptFor(other) {
+			t.Errorf("an npm package gets the %s prompt", other)
+		}
+	}
+	if !strings.Contains(promptFor("npm"), "removes no dead code") {
+		t.Error("the npm prompt does not say how weak the evidence behind it is")
+	}
+
+	got := userMessage(Request{Ecosystem: "npm", CVE: "CVE-1", Module: "lodash",
+		Version: "4.17.20", Binary: "node:22-slim", Reachable: "required"})
+	for _, want := range []string{"Package: lodash 4.17.20", "Image: node:22-slim", "required"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("message %q is missing %q", got, want)
+		}
+	}
+	if strings.Contains(got, "Module:") {
+		t.Errorf("message calls an npm package a module: %q", got)
+	}
+}
+
 // The same CVE against a Go module and against an OS package of the same name
 // are different questions, so one must not serve the other's cached answer.
 func TestCacheKeySeparatesEcosystems(t *testing.T) {

@@ -193,6 +193,22 @@ Note that Python removes no dead code, so a distribution being installed and imp
 Respond with ONLY a JSON object, no prose, of the form:
 {"exploitable":"likely|unlikely|unknown","confidence":"low|medium|high","rationale":"one or two sentences"}`
 
+// npmPrompt asks the same question about an installed Node package.
+//
+// The line that is not in the Python prompt is npm's own distinguishing fact:
+// the dependency tree is deep and mostly transitive, so the package the
+// advisory names is usually not one the application chose. Whether the one
+// call path that reaches it passes attacker input is the question, and a model
+// that does not know the package is transitive will answer as though the
+// application uses it directly.
+const npmPrompt = `You are a security analyst assessing Node.js package vulnerabilities in a container image (VEX triage).
+You are given a CVE against an installed npm package whose modules the code the image runs requires.
+Judge how plausibly the vulnerability is actually EXPLOITABLE in a typical deployment of this image.
+Consider: whether the vulnerable API is likely called with attacker-controlled input rather than only from a build script, a CLI tool or a test path, whether the package is a deep transitive dependency reached only through one narrow call path, and whether exploitation requires a specific configuration, a non-default option, or a prototype-pollution sink the application does not have.
+Note that npm removes no dead code, so a package being installed and required says nothing about which of its functions are called.
+Respond with ONLY a JSON object, no prose, of the form:
+{"exploitable":"likely|unlikely|unknown","confidence":"low|medium|high","rationale":"one or two sentences"}`
+
 // promptFor selects the system prompt for an ecosystem.
 //
 // The empty ecosystem is Go: that is what every caller meant before this
@@ -204,6 +220,8 @@ func promptFor(ecosystem string) string {
 		return osPrompt
 	case "pypi":
 		return pypiPrompt
+	case "npm":
+		return npmPrompt
 	default:
 		return goPrompt
 	}
@@ -237,6 +255,16 @@ func userMessage(r Request) string {
 		}
 		return fmt.Sprintf(
 			"CVE: %s\nDistribution: %s %s\nImage: %s\nStatic analysis says the vulnerable code is: %s\nAssess exploitability.",
+			r.CVE, r.Module, r.Version, where, reach,
+		)
+	}
+	if strings.EqualFold(r.Ecosystem, "npm") {
+		where := r.Binary
+		if where == "" {
+			where = "the image"
+		}
+		return fmt.Sprintf(
+			"CVE: %s\nPackage: %s %s\nImage: %s\nStatic analysis says the vulnerable code is: %s\nAssess exploitability.",
 			r.CVE, r.Module, r.Version, where, reach,
 		)
 	}

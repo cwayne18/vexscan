@@ -96,11 +96,33 @@ If the advisory names none of a category, return an empty array for it. Returnin
 Respond with ONLY a JSON object, no prose, of the form:
 {"modules":[],"symbols":[],"files":[],"note":"one sentence on what the advisory did or did not name"}`
 
+// npmMinePrompt is the same instruction for an npm package.
+//
+// It asks for the one thing about an npm advisory that is mechanically
+// checkable: the subpath. JavaScript writes a module with a slash and a
+// property with a dot, so "lodash/template" is a file the package either ships
+// or does not, while "lodash.template" is an expression. That syntactic split
+// is what the Python prompt has to plead for and cannot enforce, and it is why
+// this prompt can state the rule in one clause.
+const npmMinePrompt = `You extract checkable identifiers from security advisory text. You do not analyze, judge, or infer.
+You are given the text of one advisory and the name of one affected npm package.
+List ONLY identifiers that appear LITERALLY in the advisory text and belong to that package:
+- modules: importable subpaths of that package, exactly as written and including the package name (e.g. "lodash/template", "@babel/traverse/lib/path"). A module is something require() or import can name, and it always contains a slash. A property access written with a dot ("lodash.template") is NOT a module and belongs in symbols.
+- symbols: names of vulnerable functions, classes or methods, exactly as written (e.g. "sanitizeUrl")
+- files: source or installed file names or paths, exactly as written
+Do NOT guess, expand, complete, correct, or infer any identifier. Do NOT include a name that is merely typical of the package.
+Do NOT include CVE ids, bare package names, version numbers, URLs, or commit hashes.
+If the advisory names none of a category, return an empty array for it. Returning all three empty is a correct and expected answer.
+Respond with ONLY a JSON object, no prose, of the form:
+{"modules":[],"symbols":[],"files":[],"note":"one sentence on what the advisory did or did not name"}`
+
 // minePromptFor selects the mining instruction for an ecosystem.
 func minePromptFor(ecosystem string) string {
 	switch strings.ToLower(ecosystem) {
 	case "pypi":
 		return pyMinePrompt
+	case "npm":
+		return npmMinePrompt
 	default:
 		return minePrompt
 	}

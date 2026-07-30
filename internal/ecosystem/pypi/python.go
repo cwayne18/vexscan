@@ -408,7 +408,9 @@ func (p *python) escalate() []modgraph.Root {
 			if p.IsModule(f) {
 				roots = append(roots, modgraph.Root{
 					Path: f,
-					Why:  "the entrypoint could not be resolved, so every installed module is treated as reachable",
+					// Phrased as a noun: the evidence renders this as
+					// "<file> is <why>".
+					Why:  "an installed module, rooted because this image's own entrypoint could not be resolved",
 					Kind: modgraph.RootEscalated,
 				})
 			}

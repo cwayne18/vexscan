@@ -22,7 +22,7 @@ import (
 func main() {
 	var packages, ecosystems, roots stringList
 	flag.Var(&packages, "package", "package to check: a purl, an ecosystem:name shorthand (deb:openssl, golang:golang.org/x/net), or a bare name resolved against the inventory; repeatable")
-	flag.Var(&ecosystems, "ecosystem", "restrict the scan to these ecosystems (golang, os, pypi, or a distro family like debian); repeatable, default all")
+	flag.Var(&ecosystems, "ecosystem", "restrict the scan to these ecosystems (golang, os, pypi, npm, or a distro family like debian); repeatable, default all")
 	flag.Var(&roots, "roots", "extra entrypoints for the reachability closures (shared libraries and language imports), for an image whose real command comes from outside its config; repeatable")
 	var (
 		image      = flag.String("image", "", "container image reference to inspect (mutually exclusive with --repo)")
@@ -450,9 +450,9 @@ func usage() {
 
 Every ecosystem brings its own deterministic presence test: pclntab
 dead-code-elimination evidence and govulncheck for Go, the dynamic linker's
-DT_NEEDED closure for OS packages, the installed-distribution manifest for
-Python. The LLM, if enabled, only ever comments on what those tests could not
-rule out.
+DT_NEEDED closure for OS packages, and the installed-distribution manifest plus
+a static import closure for Python and npm. The LLM, if enabled, only ever
+comments on what those tests could not rule out.
 
 Usage:
   vexscan --image REF  (--package SPEC... | --cves LIST | --all) [flags]
@@ -463,6 +463,7 @@ resolved against whatever inventory contains it:
 
   golang:golang.org/x/net    deb:openssl    apk:musl    openssl
   pypi:PyYAML                pkg:pypi/pyyaml@6.0.1
+  npm:@babel/traverse        pkg:npm/lodash@4.17.20
   pkg:golang/golang.org%2Fx%2Fnet@v0.17.0
 
 Examples:
@@ -481,6 +482,9 @@ Examples:
 
   # One Python distribution, by any spelling of its name
   vexscan --image python:3.12-slim --package pypi:PyYAML
+
+  # Every Node package the image installs, with the require closure applied
+  vexscan --image node:22-slim --all --ecosystem npm
 
   # Source repo (govulncheck source-mode reachability)
   vexscan --repo github.com/rancher/rancher \
