@@ -128,6 +128,46 @@ func TestCoordinateTiers(t *testing.T) {
 	}
 }
 
+// Tomcat's own jars, which are the reason tier 3 has to be careful with the
+// fields it trusts. Measured against tomcat:10-jre21: 36 of its 42 archives
+// carry nothing but an OSGi manifest, so this shape decides whether the most
+// widely deployed Java image inventories or comes back empty.
+func TestManifestTierReadsAnOSGiIdentity(t *testing.T) {
+	res := readMaven(t, map[string]string{
+		"/usr/local/tomcat/lib/catalina.jar": jarBytes(t, map[string]string{
+			// Implementation-Title is a product name, not an artifactId, and
+			// letting it through would both misname the artifact and suppress
+			// the symbolic name that names it correctly.
+			"META-INF/MANIFEST.MF": "Manifest-Version: 1.0\r\n" +
+				"Bundle-SymbolicName: org.apache.tomcat-catalina\r\n" +
+				"Bundle-Version: 10.1.57\r\n" +
+				"Implementation-Title: Apache Tomcat\r\n",
+			"org/apache/catalina/Server.class": "",
+		}),
+	})
+	if len(res.Unidentified) != 0 {
+		t.Fatalf("unidentified = %v", res.Unidentified)
+	}
+	if len(res.Packages) != 1 {
+		t.Fatalf("got %d packages, want 1", len(res.Packages))
+	}
+	p := res.Packages[0]
+	if p.CoordsKnown {
+		t.Error("CoordsKnown = true; an OSGi symbolic name is not a Maven coordinate")
+	}
+	// A symbolic name cannot spell the groupId/artifactId boundary, so the dot
+	// split lands one segment too shallow. org.apache.tomcat:tomcat-catalina is
+	// what OSV keys Tomcat's advisories on, and it is reachable only because
+	// Maven artifactIds conventionally repeat the last segment of their group.
+	want := []string{"org.apache:tomcat-catalina", "org.apache.tomcat:tomcat-catalina"}
+	if got := p.OSVNames(); !reflect.DeepEqual(got, want) {
+		t.Errorf("OSVNames() = %v, want %v", got, want)
+	}
+	if p.Version != "10.1.57" {
+		t.Errorf("version = %q, want 10.1.57", p.Version)
+	}
+}
+
 // The weakest tier is demonstrably fallible -- guava's classes live under
 // com.google.common while its groupId is com.google.guava -- so it offers every
 // plausible prefix. One extra name costs one entry in a batch query; missing the

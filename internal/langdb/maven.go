@@ -195,26 +195,78 @@ func manifestCoords(mf map[string]string) (Package, bool) {
 		return Package{}, false
 	}
 
-	group := firstOf(mf, "Implementation-Vendor-Id")
-	artifact := firstOf(mf, "Implementation-Title", "Automatic-Module-Name")
-	if symbolic := firstOf(mf, "Bundle-SymbolicName"); symbolic != "" {
-		// OSGi allows directives after a semicolon ("org.foo.bar;singleton:=true").
-		symbolic, _, _ = strings.Cut(symbolic, ";")
-		if group == "" && artifact == "" {
-			// A symbolic name is usually the whole dotted coordinate with the
-			// separator lost, so the best that can be done is to guess where it
-			// was: "org.apache.commons.lang3" -> org.apache.commons:lang3.
-			if g, aid := splitDotted(symbolic); g != "" {
-				group, artifact = g, aid
-			}
-		} else if artifact == "" {
-			artifact = symbolic
-		}
+	group := coordToken(firstOf(mf, "Implementation-Vendor-Id"))
+	artifact := coordToken(firstOf(mf, "Implementation-Title", "Automatic-Module-Name"))
+
+	// OSGi allows directives after a semicolon ("org.foo.bar;singleton:=true").
+	symbolic, _, _ := strings.Cut(firstOf(mf, "Bundle-SymbolicName"), ";")
+	symbolic = coordToken(strings.TrimSpace(symbolic))
+
+	// A symbolic name is usually the whole dotted coordinate with the separator
+	// lost, so the best that can be done is to guess where it was:
+	// "org.apache.commons.lang3" -> org.apache.commons:lang3. Each half is
+	// taken only where the manifest's own fields left a hole, so a jar that
+	// states its vendor id keeps it.
+	sGroup, sArtifact := splitDotted(symbolic)
+	if group == "" {
+		group = sGroup
+	}
+	if artifact == "" {
+		artifact = orDefault(sArtifact, symbolic)
 	}
 	if group == "" || artifact == "" {
 		return Package{}, false
 	}
-	return Package{Name: group + ":" + artifact, Version: version}, true
+
+	pkg := Package{Name: group + ":" + artifact, Version: version}
+	// Maven's own naming convention is that an artifactId's first hyphenated
+	// segment repeats the last segment of its groupId -- org.apache.tomcat
+	// publishes tomcat-catalina, org.apache.commons publishes commons-lang3 --
+	// and an OSGi symbolic name has no way to spell that boundary, so
+	// "org.apache.tomcat-catalina" splits one segment too shallow. The deeper
+	// reading is offered alongside rather than instead: one more name in a
+	// batch query costs nothing, and querying only the wrong one reports a
+	// vulnerable artifact as clean.
+	if head, _, ok := strings.Cut(artifact, "-"); ok && head != "" {
+		if _, last, found := lastSegment(group); !found || last != head {
+			pkg.AltNames = append(pkg.AltNames, group+"."+head+":"+artifact)
+		}
+	}
+	return pkg, true
+}
+
+// coordToken keeps a manifest value only if it could be a groupId or
+// artifactId.
+//
+// Maven allows letters, digits, hyphens, underscores and dots and nothing
+// else, which is enough to throw out the field that most often derails this
+// tier: Implementation-Title is a product name ("Apache Tomcat") at least as
+// often as it is an artifactId, and letting one through both names the
+// artifact wrongly and suppresses the Bundle-SymbolicName that would have
+// named it right.
+func coordToken(s string) string {
+	if s == "" {
+		return ""
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.' || r == '-' || r == '_':
+		default:
+			return ""
+		}
+	}
+	return s
+}
+
+// lastSegment splits a dotted name into everything before the final dot and
+// the final segment.
+func lastSegment(s string) (head, last string, ok bool) {
+	i := strings.LastIndex(s, ".")
+	if i < 0 {
+		return "", s, false
+	}
+	return s[:i], s[i+1:], true
 }
 
 // filenameCoords is the last resort: the Maven Central file-naming convention

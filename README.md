@@ -21,6 +21,7 @@ what the deterministic tests could not rule out.
 | OS packages (deb, rpm, apk) | `--package deb:NAME` etc. | package-database inventory; the dynamic linker's `DT_NEEDED` closure from the image entrypoint |
 | Python (PyPI) | `--package pypi:NAME` | `dist-info`/`RECORD` inventory; a static import closure from the image entrypoint |
 | npm | `--package npm:NAME` | `node_modules` manifest inventory; a static require/import closure from the image entrypoint |
+| Java (Maven) | `--package maven:GROUP:ARTIFACT` | jar/war/ear coordinate inventory; class presence in the archive's central directory |
 
 Python and npm answer a **narrower** question than Go does, and the tool is
 built to say so rather than to guess. Neither language removes dead code at
@@ -28,6 +29,19 @@ build time, so `not_present` can only mean "not installed"; reachability is the
 one remaining lever, and it is blocked far more often than the `DT_NEEDED`
 closure is. Read [Known limits](#known-limits--read-this-before-trusting-a-result)
 before trusting a clean answer from either.
+
+Java answers a narrower question again — there is no reference graph, so nothing
+here comes from reachability — but its presence test is the only one in the
+table that routinely **contradicts** a version scanner. The mitigation Apache
+published for Log4Shell was
+
+```sh
+zip -d log4j-core.jar org/apache/logging/log4j/core/lookup/JndiLookup.class
+```
+
+and the artifact is still `org.apache.logging.log4j:log4j-core@2.14.1`
+afterwards. Listing a zip's central directory settles that; comparing versions
+cannot.
 
 `vexscan` was previously released as `gomod-vex`, which did the Go half only.
 Existing `--module` command lines and `GOMODVEX_*` environment variables keep
@@ -55,6 +69,9 @@ vexscan --image apache/airflow:latest --package pypi:requests
 # Every npm package in the image
 vexscan --image node:22-slim --all --ecosystem npm
 
+# Every Java artifact in the image, jars nested inside a war or fat jar included
+vexscan --image jenkins/jenkins:lts --all --ecosystem maven
+
 # Source repo (govulncheck source-mode reachability)
 vexscan --repo github.com/rancher/rancher \
   --package golang:golang.org/x/net --cves CVE-2023-39325
@@ -73,20 +90,29 @@ resolved against whatever inventory contains it:
 
 ```
 golang:golang.org/x/net    deb:openssl    apk:musl    rpm:glibc    openssl
-pypi:PyYAML    npm:@babel/core
+pypi:PyYAML    npm:@babel/core    maven:org.apache.logging.log4j:log4j-core
+org.apache.logging.log4j:log4j-core    log4j-core
 pkg:golang/golang.org%2Fx%2Fnet@v0.17.0    pkg:pypi/pyyaml@6.0.3    pkg:npm/%40babel/core@7.24.0
+pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1
 ```
 
 `deb`, `dpkg`, `rpm` and `apk` are package *formats* rather than OSV ecosystem
 names; they all select the OS plugin, which is the only thing that could answer
 them. `go` is accepted for `golang`, `std` for `stdlib`, `python` and `pip` for
-`pypi`, and `node` and `nodejs` for `npm`.
+`pypi`, `node` and `nodejs` for `npm`, and `java` and `jar` for `maven`.
 
 PyPI names are matched after PEP 503 normalization — lowercased, with runs of
 `-`, `_` and `.` collapsed to a single `-` — so `PyYAML` and `pyyaml` select the
 same distribution, as do `typing_extensions` and `typing-extensions`. npm names
 are matched verbatim, scope included, because that is how the registry and OSV
 key them.
+
+A Maven coordinate is itself colon-separated, so
+`org.apache.logging.log4j:log4j-core` needs no `maven:` prefix — a prefix with a
+dot in it is read as a groupId rather than an ecosystem, since no ecosystem name
+contains one. A bare artifactId (`log4j-core`) also selects, which is ambiguous
+in principle because two groups can publish the same artifactId, and in practice
+resolves into extra findings rather than missing ones.
 
 `--package` is repeatable and accepts comma-separated values, so
 `--package a --package b` and `--package a,b` are the same.
@@ -257,6 +283,72 @@ is on disk inside each `dist-info`, so the set of plugins discovery *could*
 return is knowable, and rooting those distributions is a real answer where a
 global taint would be a shrug.
 
+### Java (Maven), image mode
+
+A jar is a zip, and its central directory names every class the artifact ships.
+Listing it executes nothing and runs no parser over attacker-supplied bytes, so
+**"this artifact does not contain the vulnerable class" is a fact read off the
+disk** rather than an inference. That is the whole reason the ecosystem is here,
+and it is the one presence test in this tool that regularly disagrees with a
+version scanner.
+
+There is no reference graph. Nothing reads a constant pool, so an artifact that
+ships the class is reported `linked` — present and loadable, with no claim about
+whether anything calls it.
+
+**Inventory.** Every `.jar`, `.war` and `.ear` anywhere in the image, plus one
+level of the dependency archives they carry inside: `BOOT-INF/lib/` (Spring Boot
+fat jars), `WEB-INF/lib/` (wars) and `APP-INF/lib/` and `lib/` (ears). A nested
+archive is addressed with the JVM's own spelling —
+`/usr/share/jenkins/jenkins.war!/WEB-INF/lib/spring-core-7.0.8.jar` — and each
+one is bounded at 256 MiB decompressed. Without this a Spring Boot image
+inventories as one component and misses everything it actually runs. Measured on
+`jenkins/jenkins:lts`: **3 archives on disk, 123 packages inside them.**
+
+Multi-release classes under `META-INF/versions/N/` count, because a new enough
+JVM loads them in preference to the base copy.
+
+**Coordinates come in tiers, and the tier travels with the data.** Unlike a
+`dist-info` or a `package.json`, a jar frequently carries no statement of its
+own groupId.
+
+| Tier | Source | `CoordsKnown` |
+|---|---|---|
+| 1 | `META-INF/maven/<g>/<a>/pom.properties` — Maven's own record | yes |
+| 2 | `META-INF/native-image/<g>/<a>/` — the Gradle/Spring/GraalVM convention, same two coordinates | yes |
+| 3 | `MANIFEST.MF`: `Implementation-Vendor-Id`/`-Title`, else the OSGi `Bundle-SymbolicName` | **no** |
+| 4 | the `<artifactId>-<version>.jar` file name plus the classes' shared package prefix | **no** |
+
+Tiers 3 and 4 still produce a queryable name, and every other plausible reading
+is offered alongside it as an alternate to query — one more entry in a batch
+request costs nothing, and querying only the wrong name reports a vulnerable
+artifact as clean. What they cannot do is support a claim of *absence*: saying
+"this artifact ships no such class" about an artifact the scan only believes the
+jar to be is two guesses stacked, and the second hides the first.
+
+Tier 3 is load-bearing in practice. Tomcat's own jars carry nothing but an OSGi
+manifest: `catalina.jar` states `Bundle-SymbolicName: org.apache.tomcat-catalina`
+and no coordinate. A symbolic name cannot spell the groupId/artifactId boundary,
+so the dot split lands one segment shallow at `org.apache:tomcat-catalina`;
+`org.apache.tomcat:tomcat-catalina`, which is what OSV keys Tomcat's advisories
+on, is reachable only because Maven artifactIds conventionally repeat the last
+segment of their groupId, and is queried as an alternate. **The name printed for
+a tier-3 or tier-4 artifact may therefore be a coordinate nobody publishes
+under** — the finding carries evidence saying the coordinates were reconstructed.
+
+| Situation | Status | Justification | Method |
+|---|---|---|---|
+| no archive in the image declares the artifact | `not_present` | `component_not_present` | `jar-inventory` |
+| …but some archive could not be read or declares no coordinates | `undetermined` | — | reason `unidentified_archive` |
+| the archive holds no `.class` entry at all (sources, javadoc, resources jar) | `not_present` | `vulnerable_code_not_present` | `jar-no-code` |
+| a validated mined class is absent under every package spelling | `not_present` | `vulnerable_code_not_present` | `jar-class-absent` |
+| the archive is present but its listing could not be read | `linked` + blocking evidence | — | `jar-inventory` |
+| otherwise | `linked` | *(none — treat as affected)* | `jar-inventory` |
+
+Repo mode is deliberately absent. Maven has no lock file, and resolving a
+`pom.xml` means parent POMs and version ranges — that is running the build.
+Gradle's `gradle.lockfile` is real but rare. Deferred, not refused on principle.
+
 ### Python and npm, repo mode
 
 A checkout gets **lock file inventory and no import graph.** Resolving a
@@ -366,6 +458,56 @@ local evidence, under one policy — local deterministic evidence outranks a
 vendor claim, and a vendor `not_affected` never downgrades a finding below
 `linked` on its own.
 
+**Java's presence test is sharp and its inventory is the weak part.** The class
+check is the strongest below-package test in this tool after pclntab, and it
+fires only when an advisory names a class — which OSV's Maven records never do
+in structured form, so it needs `--llm --mine-advisories`. Without that flag the
+plugin is an inventory. With it, the numbers below are still dominated by
+`linked`, because these images genuinely do ship the vulnerable classes.
+
+| Image | Archives | Artifacts | Unidentified | `not_present` / `not_in_execute_path` / `linked` |
+|---|---|---|---|---|
+| `tomcat:10.1.30-jre21 --ecosystem maven` | 42 | 29 | 13 | 0 / 0 / 33 |
+| `jenkins/jenkins:lts --ecosystem maven` | 3 (123 nested) | 111 | 4 | 0 / 0 / 8 |
+| `ghcr.io/christophetd/log4shell-vulnerable-app --ecosystem maven` | 23 (+nested) | 27 | 24 | 0 / 0 / 79 |
+| `eclipse-temurin:21-jre --ecosystem maven` | 0 | 0 | 0 | plugin does not apply |
+
+Read the unidentified column, because it is the one that bites:
+
+- **A JRE image's own jars dominate it, and they should.** On the Log4Shell demo
+  image (JDK 8) 21 of the 24 are `rt.jar`, `charsets.jar`, `jre/lib/ext/*.jar`
+  and the security policy jars. Those are not Maven artifacts and have no
+  coordinates to find. But **an unidentified archive blocks `component_not_present`
+  for anything the scan is asked about and does not find** — the archive that
+  could not be named could be the one being asked about. So on a JDK 8 base
+  image, "that artifact is not here" is an answer this tool will not give.
+  Modern JREs are modular (`eclipse-temurin:21-jre` has no jars at all), which
+  is why that row is empty rather than noisy.
+- **`tomcat:10-jre21` leaves 13**, of which 10 are the `tomcat-i18n-*.jar`
+  resource bundles: they ship no classes, so tier 4 has no package prefix to
+  work from. The remainder are `jrt-fs.jar` and a sample war.
+- **A jar whose classes span two unrelated package roots falls out of tier 4.**
+  `spring-aop` bundles `org.aopalliance` alongside `org.springframework.aop`, so
+  the shared prefix is `org` and no coordinate is offered. That is 4 of 127 on
+  Jenkins and 1 of 27 on the demo image. Refusing beats guessing here, but it is
+  a gap, not a design win.
+
+**Shading is handled for the class test and not for the inventory.**
+`maven-shade-plugin` relocates `org.apache.commons.X` to
+`com.foo.shaded.org.apache.commons.X`; a relocated copy still ends in
+`/X.class`, so searching every package spelling means a shaded jar comes back
+`linked` with evidence naming the relocated entry rather than a false
+`not_present`. Shading usually preserves the merged `META-INF/maven` entries, so
+an uber-jar still declares every artifact it absorbed and each becomes its own
+component. When a build strips them, it does not.
+
+**A bare class name concludes about one artifact only.** Log4Shell's advisory
+lists 5 affected Maven artifacts and writes the class as bare `JndiLookup`, so
+finding no such class proves only that *this* artifact ships none. If an
+advisory names a class belonging solely to a sibling artifact, the conclusion is
+wrong. The coordinate and listing gates bound that; OSV has already asserted
+this artifact is affected. It is not eliminated.
+
 **Repo mode is narrower by design.** A lock file gives coordinates and a
 development partition, nothing more, so the best case there is
 `npm-dev-only` — and that only fires for lock formats that declare the
@@ -392,19 +534,37 @@ deterministic tests could not clear, and it cannot change a status.
   module path or a package subpath — `yaml.constructor`, `lodash/template` — and
   it is the only route to a `not_present` for a distribution that is installed
   and does ship code, since neither language eliminates dead code at build time.
+  For Java the mined value is a **class name**, and this is the ecosystem that
+  needs mining most while getting the least help with it: OSV's Maven records
+  carry no `ecosystem_specific` function data at all, unlike RustSec, so a class
+  name can only come from prose. When one arrives it is checkable against
+  something exact — a class is an entry in a zip.
 
 **Mined hints are contained, not trusted.** A hint may only support a
 `not_affected`-flavored status *after validation*: it must appear literally in
 the advisory text, and it must be found in something the package actually
 installs — the **defined** `.dynsym` of one of its libraries for an OS package,
-its own installed file list for a Python or npm module path. An unvalidatable
-mined hint is indistinguishable from a hallucination and is recorded as
-inconclusive, so a hallucinated hint is inert rather than dangerous.
+its own installed file list for a Python or npm module path, an entry in the
+archive for a Java class. An unvalidatable mined hint is indistinguishable from
+a hallucination and is recorded as inconclusive, so a hallucinated hint is inert
+rather than dangerous.
 
 The Python and npm validations additionally defer to any blocking taint, and to
 a file list that had to be reconstructed rather than read. Both are cases where
 "the module is not here" could equally mean "we did not look in the right
 place".
+
+The Java validation adds two gates of its own. A mined name must be **shaped
+like a class** — a dotted name whose last segment is capitalised — because there
+is no `doLookup.class` and concluding absence from a method name's absence would
+be a plain lie. And the artifact's **coordinates must have been read** rather
+than reconstructed (tiers 1–2 above), on the same principle: an absence claim
+about an artifact whose identity is a guess is two guesses stacked.
+
+The class is then looked for under **every** package spelling in the archive,
+not only the one the advisory wrote. That is what makes a bare `JndiLookup`
+usable at all — GHSA-jfh8-c2jp-5v3q never writes the package — and it is
+simultaneously the shading guard described above.
 
 `elf-import-absent`, `py-import-absent` and `npm-import-absent` — reachable, but
 nothing imports the vulnerable symbol or module — stay evidence-only unless you
@@ -473,7 +633,7 @@ not be read, `2` the command line was wrong.
 | `--package` | | Package to check: purl, `ecosystem:name`, or bare name; repeatable |
 | `--cves` | | CVE / GHSA / GO / RHSA / DSA ids; alone, resolved against the whole target |
 | `--all` | `false` | Check everything each ecosystem can enumerate |
-| `--ecosystem` | *(all)* | Restrict to these ecosystems (`golang`, `os`, `pypi`, `npm`, or a distro family); repeatable |
+| `--ecosystem` | *(all)* | Restrict to these ecosystems (`golang`, `os`, `pypi`, `npm`, `maven`, or a distro family); repeatable |
 | `--module` | | **Deprecated** alias for `--package golang:MODULE` |
 | `--cves-file` | | File with one id per line (merged with `--cves`; `#` comments allowed) |
 | `--ref` | *(default branch)* | Branch, tag, or commit to check out for `--repo` |
@@ -539,9 +699,9 @@ honored as a fallback so existing CI keeps working.
 - `GITHUB_TOKEN` / `GH_TOKEN` for `--llm` and `--gist`
 
 All three package databases are parsed in-process — no `dpkg`, `rpm` or `apk`
-binary is needed. So are the Python and npm inventories and lock files: no
-`python`, `pip`, `node` or `npm` is required, and nothing from the target is
-ever executed.
+binary is needed. So are the Python and npm inventories and lock files, and the
+Java archives: no `python`, `pip`, `node`, `npm`, `java` or `unzip` is required,
+and nothing from the target is ever executed.
 
 ## Install
 
