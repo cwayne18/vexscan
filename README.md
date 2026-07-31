@@ -1,7 +1,8 @@
 # vexscan
 
-`vexscan` answers one question, for a container image or a source repo: **is
-this CVE's vulnerable code actually present, and can it actually run?**
+`vexscan` answers one question, for a container image, a filesystem tree, or a
+source repo: **is this CVE's vulnerable code actually present, and can it
+actually run?**
 
 Scanners flag a CVE whenever a vulnerable *version* is installed. That is the
 right default for a scanner and the wrong basis for a triage decision — the
@@ -18,9 +19,9 @@ what the deterministic tests could not rule out.
 | Ecosystem | Selector | Deterministic test |
 |---|---|---|
 | Go modules and stdlib | `--package golang:PATH` | pclntab dead-code-elimination evidence; govulncheck call-graph reachability |
-| OS packages (deb, rpm, apk) | `--package deb:NAME` etc. | package-database inventory; the dynamic linker's `DT_NEEDED` closure from the image entrypoint |
-| Python (PyPI) | `--package pypi:NAME` | `dist-info`/`RECORD` inventory; a static import closure from the image entrypoint |
-| npm | `--package npm:NAME` | `node_modules` manifest inventory; a static require/import closure from the image entrypoint |
+| OS packages (deb, rpm, apk) | `--package deb:NAME` etc. | package-database inventory; the dynamic linker's `DT_NEEDED` closure from the entrypoint (or `--roots`) |
+| Python (PyPI) | `--package pypi:NAME` | `dist-info`/`RECORD` inventory; a static import closure from the entrypoint (or `--roots`) |
+| npm | `--package npm:NAME` | `node_modules` manifest inventory; a static require/import closure from the entrypoint (or `--roots`) |
 | Java (Maven) | `--package maven:GROUP:ARTIFACT` | jar/war/ear coordinate inventory; class presence in the archive's central directory |
 
 Python and npm answer a **narrower** question than Go does, and the tool is
@@ -72,6 +73,10 @@ vexscan --image node:22-slim --all --ecosystem npm
 # Every Java artifact in the image, jars nested inside a war or fat jar included
 vexscan --image jenkins/jenkins:lts --all --ecosystem maven
 
+# A filesystem tree rather than an image — an unpacked image, a mounted
+# volume, a machine's own / (see below: no entrypoint, so pass --roots)
+vexscan --rootfs /mnt/rootfs --all --roots /usr/bin/myapp
+
 # Source repo (govulncheck source-mode reachability)
 vexscan --repo github.com/rancher/rancher \
   --package golang:golang.org/x/net --cves CVE-2023-39325
@@ -81,6 +86,7 @@ vexscan --repo github.com/npm/cli --all --ecosystem npm
 
 # Just list what is installed, with the names OSV will be queried by
 vexscan --image debian:12 --format inventory
+vexscan --rootfs /mnt/rootfs --format inventory
 ```
 
 ## Selecting what to check
@@ -128,6 +134,100 @@ Three ways to say what to check, and you need exactly one of them:
 `--ecosystem` (repeatable) restricts which plugins run. Naming one that no
 plugin provides is an error rather than a silent empty report — as is a
 `--package` aimed at an ecosystem that is not selected.
+
+## Scanning a filesystem instead of an image (`--rootfs`)
+
+`--rootfs DIR` runs everything image mode runs, against a tree already on disk:
+an unpacked image, a mounted volume or snapshot, a chroot, a machine's own `/`.
+No pull, no extraction, no registry credentials.
+
+```sh
+vexscan --rootfs /mnt/rootfs --all --ecosystem os
+vexscan --rootfs / --package deb:openssl --roots /usr/sbin/nginx
+docker export "$(docker create myapp:latest)" | tar -x -C /tmp/rootfs
+vexscan --rootfs /tmp/rootfs --all
+```
+
+Every ecosystem works: the package databases, the `DT_NEEDED` closure, the
+Python and npm import graphs, the jar reader, and the Go binary walk all read
+paths, not registries. `--format inventory` works the same way. The report says
+`"mode": "rootfs"` and names the directory as its target.
+
+**Nothing is deleted.** The directory you name is yours; only the temporary
+directory image mode extracts into is ever removed.
+
+### What it costs: there is no image config
+
+A directory does not carry an Entrypoint, a Cmd, an env or a PATH, and `vexscan`
+does not invent one. That is the whole difference between the two modes, and it
+lands on the reachability tests:
+
+| Ecosystem | Without a config |
+|---|---|
+| OS packages | the ELF closure roots **every** program it finds, records the `no-entrypoint` taint, and keeps going — the taint is non-blocking, so `not_in_execute_path` is still reachable, just rarer |
+| Python, npm | `no-entrypoint` is a **blocking** taint: no `not_in_execute_path` at all until you supply a root |
+| Go, Java | unaffected — neither reads the config |
+
+`--roots` is the remedy, and it is the same flag image mode already uses for an
+image whose real command comes from outside its config:
+
+```sh
+vexscan --rootfs /mnt/rootfs --all --roots /usr/bin/myapp --roots /usr/bin/worker
+```
+
+Name what actually runs. A root that is a wrapper script rather than a real
+program makes things *worse*, not better — see the npm measurement below.
+
+### Measured against the same image, both ways
+
+`docker export` of `debian:12` into a directory, scanned with `--rootfs`, versus
+`--image debian:12`:
+
+| | packages | findings | `not_present` | `linked` |
+|---|---|---|---|---|
+| `--image debian:12` | 88 | 159 | 7 | 152 |
+| `--rootfs` (exported) | 88 | 159 | 7 | 152 |
+
+The reports are identical except for one string: the ELF closure records its
+root reason as `no entrypoint` rather than `shell entrypoint`. Both escalate to
+rooting every program, so every conclusion matches. That is a happy case rather
+than a general result — `debian:12` ships `bash` as Cmd, which was already
+telling the closure nothing.
+
+`node:22-slim`, same comparison, `--ecosystem npm`: 14 findings, all `linked`,
+in both modes. The blocking taint differs (`no-entrypoint` versus the image's
+`foreign-entrypoint`, since `docker-entrypoint.sh` is not a Node script) and
+changes nothing, because both block.
+
+Adding `--roots /usr/local/bin/npm` to the rootfs run narrows the graph from 215
+roots to 1 — and still concludes nothing, because npm's launcher has no
+`node_modules` beside it, which is its own blocking taint. A root has to be the
+real program with its dependencies in place.
+
+### Permissions: a tree you cannot fully read
+
+A rootfs owned by root and scanned by someone else is the common case, and the
+one that matters most here. A directory the walk cannot list contributes no
+findings — exactly what a directory with nothing wrong in it contributes.
+
+So every path a walk could not enter is recorded, named in both the text report
+and the inventory above the results, carried in the JSON as `unreadable`, and
+**exits 1**. A scan that could not read the tree never exits 0.
+
+```
+INCOMPLETE: 3 path(s) could not be read, so this report does not account for them:
+  /opt/vendor
+  /srv/data
+  /root
+```
+
+Run as root, or `sudo`, or fix the modes — but do not read the result as clean
+until that line is gone. (Image mode effectively never prints it: extraction
+creates every directory `0755`.)
+
+`/proc`, `/sys` and `/dev` are skipped rather than reported. They ship no code,
+and `/proc` alone is tens of thousands of synthetic entries that stat as regular
+files.
 
 ## How the tests work
 
@@ -202,10 +302,11 @@ could not answer rather than answering wrongly.
 | `dlopen` | a reachable ELF references `dlopen`/`dlmopen` | global, unless `--dlopen-policy=assume-none` |
 | `static-elf` | a reachable ELF has no `PT_INTERP`/`.dynamic` | blocks all C-library conclusions |
 | `shell-entrypoint` | argv[0] is a shell or init shim (`sh`, `busybox`, `tini`, `s6-*`) | every ELF in the standard bin dirs becomes a root |
-| `no-entrypoint` | the image config has neither Entrypoint nor Cmd | same escalation |
+| `no-entrypoint` | the image config has neither Entrypoint nor Cmd — or there is no config at all, as in `--rootfs` mode | same escalation |
 
 `--roots /path/to/bin` adds entrypoints for an image whose real command comes
-from outside its own config — a Kubernetes `command:`, a sidecar, an operator.
+from outside its own config — a Kubernetes `command:`, a sidecar, an operator —
+and for a `--rootfs` tree, which has no config to read.
 Supplying them is usually the difference between a useful answer and
 `shell-entrypoint` tainting everything.
 
@@ -270,7 +371,7 @@ distributions has no readable name.
 | `dynamic-import` | `importlib.import_module(x)` / `__import__(x)` / `require(x)` with a **computed** argument; also `python -c`, a program on stdin, and a `.pth` file that runs something other than a plain import | scoped to the importing distribution and everything it requires, or global when the importing code belongs to no installed distribution. `--dynamic-import-policy=assume-none` demotes it to non-blocking |
 | `plugin-discovery` | reachable code calls `entry_points()` / `pkgutil.iter_modules` | roots every entry-point module declared on disk; blocking and global only when there was nothing to enumerate |
 | `foreign-entrypoint` | argv[0] is not this language's interpreter | global; every installed module becomes a root |
-| `no-entrypoint` | no Entrypoint and no Cmd, or a bare interactive interpreter | same escalation |
+| `no-entrypoint` | no Entrypoint and no Cmd, a bare interactive interpreter, or no config at all (`--rootfs`) | same escalation |
 | `bundled-entrypoint` | (npm) a reachable root's tree contains no `node_modules` | global |
 | `unreadable-module` | a reachable file that could not be read | global — everything downstream of it is missing |
 
@@ -409,6 +510,10 @@ known entrypoint. Concretely:
   images.
 - `glibc` is reachable from everything and always will be. Do not expect the
   closure to rule out a libc CVE.
+- **`--rootfs` has no entrypoint to start from**, so it begins where a base
+  image ends up: everything is a root. `--roots` is the way out, and naming the
+  wrong thing does not help. See
+  [`--rootfs`](#scanning-a-filesystem-instead-of-an-image---rootfs).
 
 **Python and npm are weaker still, and the numbers below are the point.**
 
@@ -587,9 +692,10 @@ non-fatal: the finding is still reported, just without a verdict.
 ```jsonc
 {
   "schema_version": 2,
-  "target": "...", "mode": "image",
+  "target": "...", "mode": "image",          // or "rootfs", or "repo"
   "findings": [ /* flat, sorted — jq '.findings[]' still works */ ],
-  "ecosystems": [ { "id": "os", "components": 65, "error": "" } ]
+  "ecosystems": [ { "id": "os", "components": 65, "error": "" } ],
+  "unreadable": { "count": 3, "paths": ["/opt/vendor"] }  // omitted when nothing was skipped
 }
 ```
 
@@ -612,7 +718,9 @@ status, because VEX consumers already read that field.
 
 **An empty report is never silently produced.** If an ecosystem is detected but
 cannot be read, no findings are emitted for it, `ecosystems[].error` says why,
-the text report prints an `INCOMPLETE:` line, and the process exits 1. A CVE id
+the text report prints an `INCOMPLETE:` line, and the process exits 1. The same
+applies to a directory the scan could not enter, which is reported under
+`unreadable` and exits 1 for the same reason. A CVE id
 that matched no component anywhere still appears once, as `undetermined` with
 `no_component_matched`, so a missing id never reads as a clean one.
 
@@ -621,14 +729,15 @@ the target carries, each under the directory it was read from, with the file
 count and the names OSV will be queried by. It is the fastest way to check that
 a reader found what you expected before trusting a finding — or an absent one.
 
-Exit status: `0` the scan completed, `1` the scan failed or an ecosystem could
-not be read, `2` the command line was wrong.
+Exit status: `0` the scan completed, `1` the scan failed, an ecosystem could not
+be read, or part of the tree could not be read, `2` the command line was wrong.
 
 ## Flags
 
 | Flag | Default | Description |
 |---|---|---|
-| `--image` | | Container image to inspect (mutually exclusive with `--repo`) |
+| `--image` | | Container image to inspect |
+| `--rootfs` | | Filesystem tree already on disk to inspect — see [`--rootfs`](#scanning-a-filesystem-instead-of-an-image---rootfs) |
 | `--repo` | | Git source repo to analyze: govulncheck source mode for Go, lock file inventory for Python and npm |
 | `--package` | | Package to check: purl, `ecosystem:name`, or bare name; repeatable |
 | `--cves` | | CVE / GHSA / GO / RHSA / DSA ids; alone, resolved against the whole target |
@@ -645,7 +754,7 @@ not be read, `2` the command line was wrong.
 | `--dlopen-policy` | `taint` | `taint` (block conclusions) or `assume-none` |
 | `--dynamic-import-policy` | `taint` | The same knob for a language import graph's computed imports. These are far more common than `dlopen`, so `assume-none` discards much more |
 | `--trust-import-absence` | `false` | Let a missing dynamic import conclude `not_in_execute_path` (weaker than it looks) |
-| `--os` / `--arch` | `linux` / `amd64` | Image platform variant to pull |
+| `--os` / `--arch` | `linux` / `amd64` | Image platform variant to pull (image mode only) |
 | `--llm` | `false` | Consult a GitHub Models LLM on genuinely-affected CVEs |
 | `--llm-model` | `openai/gpt-4o` | GitHub Models model id for `--llm` |
 | `--mine-advisories` | `false` | With `--llm`, mine advisory prose for symbols and module paths to check |
@@ -748,6 +857,10 @@ docker run --rm -e GITHUB_TOKEN ghcr.io/cwayne18/vexscan:latest \
   graphs are weaker than that.** See [Known
   limits](#known-limits--read-this-before-trusting-a-result) — this is the
   most important section in this README.
+- **`--rootfs` cannot know what the tree runs, and a tree you cannot fully read
+  is not a clean tree.** Both are reported rather than assumed away — the first
+  as taints, the second as `unreadable` plus exit 1. See
+  [`--rootfs`](#scanning-a-filesystem-instead-of-an-image---rootfs).
 - **Repo mode for Python and npm resolves no import graph at all.** A lock file
   answers "is this declared" and, where the format says so, "is it
   development-only". Nothing there speaks to reachability, and a `linked`
