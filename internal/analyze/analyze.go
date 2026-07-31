@@ -17,6 +17,7 @@ import (
 
 	"github.com/cwayne18/vexscan/internal/ecosystem"
 	"github.com/cwayne18/vexscan/internal/ecosystem/golang"
+	"github.com/cwayne18/vexscan/internal/ecosystem/maven"
 	"github.com/cwayne18/vexscan/internal/ecosystem/npm"
 	"github.com/cwayne18/vexscan/internal/ecosystem/ospkg"
 	"github.com/cwayne18/vexscan/internal/ecosystem/pypi"
@@ -203,6 +204,13 @@ func registryFor(opts Options) *ecosystem.Registry {
 			Mine:               opts.MineAdvisories && opts.UseLLM,
 			TrustImportAbsence: opts.TrustImportAbsence,
 			Logf:               opts.Logf,
+		}),
+		// No Roots and no DynamicPolicy: there is no Java reference graph here
+		// to root or to taint, so the only question this plugin answers below
+		// the artifact is whether the class is in the archive at all.
+		maven.New(maven.Options{
+			Mine: opts.MineAdvisories && opts.UseLLM,
+			Logf: opts.Logf,
 		}),
 	)
 }

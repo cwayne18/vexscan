@@ -27,6 +27,11 @@ var formatAliases = map[string]string{
 	// reach for is the runtime's name.
 	"node":   "npm",
 	"nodejs": "npm",
+	// Maven is the OSV ecosystem and matches on its own; "java" is the
+	// language and "jar" the artifact, and both are what a user reaches for
+	// before remembering which build tool named the coordinate scheme.
+	"java": "maven",
+	"jar":  "maven",
 }
 
 // ParseSubject turns one --package value into a Subject.
@@ -41,6 +46,13 @@ var formatAliases = map[string]string{
 // whichever plugin's inventory turns out to contain it, which is what makes
 // `--package openssl` work without the user knowing whether the image is
 // Debian or Alpine.
+//
+// A Maven coordinate is a bare name that contains a colon, which is why the
+// shorthand's prefix may not contain a dot. Without that,
+// `--package org.apache.logging.log4j:log4j-core` -- the way every Java tool in
+// the world spells that artifact -- would parse as an unknown ecosystem named
+// "org.apache.logging.log4j" and fail. No ecosystem selector has a dot in it,
+// and a Go module path, the other dotted thing here, has no colon at all.
 func ParseSubject(raw string) (Subject, error) {
 	s := strings.TrimSpace(raw)
 	if s == "" {
@@ -50,11 +62,12 @@ func ParseSubject(raw string) (Subject, error) {
 		return Subject{PURL: s, Raw: raw}, nil
 	}
 
-	// Only a prefix with no slash in it is an ecosystem: a bare module path
-	// never contains a colon, but a name that does -- a Windows-style path, a
-	// URL -- would have its slashes before the colon.
+	// Only a prefix with no slash and no dot in it is an ecosystem: a bare
+	// module path never contains a colon, a name that does -- a Windows-style
+	// path, a URL -- would have its slashes before the colon, and a Maven
+	// groupId has dots.
 	i := strings.Index(s, ":")
-	if i <= 0 || strings.ContainsAny(s[:i], "/@") {
+	if i <= 0 || strings.ContainsAny(s[:i], "/@.") {
 		return Subject{Name: s, Raw: raw}, nil
 	}
 

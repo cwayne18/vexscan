@@ -586,8 +586,11 @@ func TestRegistryCapabilities(t *testing.T) {
 	// Go analyzes from either end. OS packages only exist in an image: there
 	// is no source checkout of "the distribution's openssl". PyPI and npm will
 	// grow a source side once lockfile mode lands; today both are image-only.
-	if ids(image) != "golang,os,pypi,npm" {
-		t.Errorf("image analyzers = %s, want golang,os,pypi,npm", ids(image))
+	// Maven is image-only for a sturdier reason: there is no Java lock file to
+	// read, and resolving a pom.xml means parent POMs and version ranges, which
+	// means running the build.
+	if ids(image) != "golang,os,pypi,npm,maven" {
+		t.Errorf("image analyzers = %s, want golang,os,pypi,npm,maven", ids(image))
 	}
 	if ids(source) != "golang" {
 		t.Errorf("source analyzers = %s, want golang", ids(source))
