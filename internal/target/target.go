@@ -62,13 +62,24 @@ func (c ImageConfig) PathDirs() []string {
 
 // Image is an extracted container image: its filesystem plus the configuration
 // that says how it is meant to be run.
+//
+// It also carries a rootfs the user already had on disk, which is the same
+// thing minus the parts only a registry can supply. Nothing here is required:
+// no analyzer reads Ref, OS or Arch, and Config is optional by construction --
+// a plugin that wants an entrypoint and finds none taints its conclusions
+// rather than failing. So a tree with nothing but FS set is a scannable target,
+// just one that can say less.
 type Image struct {
-	// Ref is the image reference as the user named it.
+	// Ref is the target as the user named it: an image reference, or the
+	// directory a rootfs was read from.
 	Ref string
-	// OS and Arch are the platform variant that was pulled.
+	// OS and Arch are the platform variant that was pulled. Both are empty for
+	// a rootfs, which was never pulled and whose platform nobody declared.
 	OS   string
 	Arch string
 
+	// Config is how the image says it is meant to be run. It is the zero value
+	// for a rootfs: a directory carries no entrypoint, no env and no PATH.
 	Config ImageConfig
 	FS     RootFS
 }

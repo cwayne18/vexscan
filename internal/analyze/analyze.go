@@ -1,6 +1,6 @@
-// Package analyze orchestrates the vexscan pipeline: prepare a target
-// (extract an image, or check out a source tree), ask each ecosystem plugin
-// what it finds, resolve advisories for what the plugins inventory, and
+// Package analyze orchestrates the vexscan pipeline: prepare a target (extract
+// an image, open a rootfs, or check out a source tree), ask each ecosystem
+// plugin what it finds, resolve advisories for what the plugins inventory, and
 // optionally overlay an LLM assessment on the genuinely-affected results.
 //
 // The division of labour is deliberate. Plugins own the *deterministic*
@@ -13,7 +13,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/cwayne18/vexscan/internal/ecosystem"
 	"github.com/cwayne18/vexscan/internal/ecosystem/golang"
@@ -46,12 +48,17 @@ const (
 	StatusUndetermined = ecosystem.StatusUndetermined
 )
 
-// Options configure a run. Set exactly one of Image or Repo.
+// Options configure a run. Set exactly one of Image, RootFS or Repo.
 type Options struct {
 	Image string
-	Repo  string // git repo (source mode); mutually exclusive with Image
-	Ref   string // branch/tag/commit for Repo
-	Path  string // module subdirectory within Repo (default ".")
+	// RootFS is a filesystem tree already on disk -- an unpacked image, a
+	// mounted volume, a machine's own /. It runs the image analyzers against a
+	// tree nobody extracted, so it skips the pull but also arrives without an
+	// image config: see runTree.
+	RootFS string
+	Repo   string // git repo (source mode); mutually exclusive with Image
+	Ref    string // branch/tag/commit for Repo
+	Path   string // module subdirectory within Repo (default ".")
 
 	// Packages are the raw --package selectors: purls, ecosystem:name
 	// shorthand, or bare names resolved against whatever inventory contains
@@ -119,8 +126,8 @@ const SchemaVersion = 2
 // Result is the full analysis output.
 type Result struct {
 	SchemaVersion int       `json:"schema_version"`
-	Target        string    `json:"target"` // image ref or repo
-	Mode          string    `json:"mode"`   // "image" | "repo"
+	Target        string    `json:"target"` // image ref, rootfs directory, or repo
+	Mode          string    `json:"mode"`   // "image" | "rootfs" | "repo"
 	Module        string    `json:"module"`
 	Findings      []Finding `json:"findings"`
 
@@ -129,17 +136,27 @@ type Result struct {
 	// package database and could not read it reports the error here and
 	// contributes no findings at all.
 	Ecosystems []ecosystem.EcosystemResult `json:"ecosystems,omitempty"`
+
+	// Unreadable is the part of the target tree the scan could not enter,
+	// accumulated across every plugin that walked it. It is nil in repo mode,
+	// which analyzes a checkout the current user just created.
+	//
+	// It is set for the same reason it is recorded at all: a directory nothing
+	// looked inside contributes no findings, which is exactly what a directory
+	// full of nothing wrong contributes. Only one of those is good news.
+	Unreadable *target.Unreadable `json:"unreadable,omitempty"`
 }
 
-// Failed reports whether any ecosystem could not complete, which makes the
-// findings an incomplete account of the target.
+// Failed reports whether the findings are an incomplete account of the target
+// -- because an ecosystem could not complete, or because part of the tree could
+// not be read.
 func (r *Result) Failed() bool {
 	for _, e := range r.Ecosystems {
 		if e.Error != "" {
 			return true
 		}
 	}
-	return false
+	return r.Unreadable != nil && r.Unreadable.Any()
 }
 
 // Validate reports whether the options describe a coherent scan, touching
@@ -154,7 +171,8 @@ func Validate(opts Options) error {
 	return err
 }
 
-// Run dispatches to image or source-repo analysis.
+// Run dispatches to filesystem analysis -- an image or a rootfs -- or to
+// source-repo analysis.
 func Run(ctx context.Context, opts Options) (*Result, error) {
 	if opts.Logf == nil {
 		opts.Logf = func(string, ...any) {}
@@ -163,16 +181,33 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	// as a convenience alias.
 	opts.Module = golang.NormalizeModule(opts.Module)
 
-	if opts.Image != "" && opts.Repo != "" {
-		return nil, fmt.Errorf("set only one of --image or --repo")
+	if err := opts.checkTarget(); err != nil {
+		return nil, err
 	}
 	if opts.Repo != "" {
 		return runRepo(ctx, opts)
 	}
-	if opts.Image != "" {
-		return runImage(ctx, opts)
+	return runTree(ctx, opts)
+}
+
+// checkTarget reports whether exactly one target was named.
+func (o Options) checkTarget() error {
+	var named []string
+	for _, t := range []struct{ flag, val string }{
+		{"--image", o.Image}, {"--rootfs", o.RootFS}, {"--repo", o.Repo},
+	} {
+		if t.val != "" {
+			named = append(named, t.flag)
+		}
 	}
-	return nil, fmt.Errorf("one of --image or --repo is required")
+	switch len(named) {
+	case 1:
+		return nil
+	case 0:
+		return fmt.Errorf("one of --image, --rootfs or --repo is required")
+	default:
+		return fmt.Errorf("set only one of %s", strings.Join(named, ", "))
+	}
 }
 
 // registryFor builds the plugin set for a run.
@@ -270,15 +305,98 @@ func targeted(subjects []ecosystem.Subject) bool {
 	return true
 }
 
-// runImage extracts a container image and hands it to every image analyzer.
-func runImage(ctx context.Context, opts Options) (*Result, error) {
-	logf := opts.Logf
+// mode names which kind of filesystem target this run is scanning.
+func (o Options) mode() string {
+	if o.RootFS != "" {
+		return "rootfs"
+	}
+	return "image"
+}
+
+// openTree produces the tree the image analyzers run against, and a cleanup to
+// call when the scan is done.
+//
+// The two branches differ in what that cleanup does, and getting it wrong is
+// the one way this goes badly wrong: an extraction directory this created is
+// this function's to delete, and a rootfs directory the user named is not.
+//
+// It takes *Options because image mode defaults the platform and reports what
+// it chose.
+func openTree(ctx context.Context, opts *Options) (*target.Image, func(), error) {
+	if opts.RootFS != "" {
+		img, err := openRootFS(opts.RootFS)
+		if err != nil {
+			return nil, nil, err
+		}
+		opts.Logf("Scanning rootfs %s...", img.Ref)
+		return img, func() {}, nil
+	}
+
 	if opts.OS == "" {
 		opts.OS = "linux"
 	}
 	if opts.Arch == "" {
 		opts.Arch = "amd64"
 	}
+	dest, err := os.MkdirTemp("", "vexscan-fs-")
+	if err != nil {
+		return nil, nil, err
+	}
+	cleanup := func() { os.RemoveAll(dest) }
+
+	opts.Logf("Extracting %s (%s/%s)...", opts.Image, opts.OS, opts.Arch)
+	ex := image.NewExtractor()
+	ex.OS, ex.Arch = opts.OS, opts.Arch
+	img, err := ex.Extract(ctx, opts.Image, dest)
+	if err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("extract image: %w", err)
+	}
+	return img, cleanup, nil
+}
+
+// openRootFS points a target at a directory the user already has.
+//
+// The result carries no ImageConfig, because a directory does not have one.
+// That is a real loss rather than a detail: the entrypoint is what the
+// reachability closures are rooted on, so without it the language plugins taint
+// their conclusions and the ELF closure falls back to rooting every program it
+// finds. Nothing here papers over that -- inventing a plausible entrypoint
+// would turn "we could not tell" into a confident wrong answer.
+//
+// The directory is not required to look like a root filesystem. A tree with
+// nothing but an application in it is a legitimate thing to scan, and the
+// plugins already report finding no package database.
+func openRootFS(dir string) (*target.Image, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, fmt.Errorf("rootfs %s: %w", dir, err)
+	}
+	// Stat, not Lstat: a rootfs reached through a symlink is fine. What is not
+	// fine is a path that is not there, or is a file -- both of which would
+	// otherwise scan cleanly, since every walk of a non-directory finds nothing
+	// and every plugin would report that it does not apply.
+	fi, err := os.Stat(abs)
+	if err != nil {
+		return nil, fmt.Errorf("rootfs %s: %w", dir, err)
+	}
+	if !fi.IsDir() {
+		return nil, fmt.Errorf("rootfs %s is not a directory", abs)
+	}
+	return &target.Image{Ref: abs, FS: target.NewDirFS(abs)}, nil
+}
+
+// runTree hands a filesystem tree to every image analyzer. The tree is either a
+// container image this pulls and extracts, or a rootfs the user already has.
+//
+// Both go through the same analyzers because none of them reads anything an
+// image has and a directory does not: no plugin looks at Ref, OS or Arch, and
+// the only real difference -- that a rootfs declares no entrypoint -- is a case
+// the reachability closures already handle, by tainting what they cannot root.
+// The taint is the honest answer, and --roots is how a user who knows what runs
+// in the tree removes it.
+func runTree(ctx context.Context, opts Options) (*Result, error) {
+	logf := opts.Logf
 
 	// Plan the scan and build the LLM client before the extraction: a bad
 	// selector or a rejected token should fail in the first second, not after a
@@ -292,22 +410,14 @@ func runImage(ctx context.Context, opts Options) (*Result, error) {
 		return nil, err
 	}
 
-	dest, err := os.MkdirTemp("", "vexscan-fs-")
+	img, cleanup, err := openTree(ctx, &opts)
 	if err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(dest)
-
-	logf("Extracting %s (%s/%s)...", opts.Image, opts.OS, opts.Arch)
-	ex := image.NewExtractor()
-	ex.OS, ex.Arch = opts.OS, opts.Arch
-	img, err := ex.Extract(ctx, opts.Image, dest)
-	if err != nil {
-		return nil, fmt.Errorf("extract image: %w", err)
-	}
+	defer cleanup()
 
 	analyzers := ecosystem.ImageAnalyzers(plugins)
-	result := &Result{SchemaVersion: SchemaVersion, Target: opts.Image, Mode: "image", Module: opts.Module}
+	result := &Result{SchemaVersion: SchemaVersion, Target: img.Ref, Mode: opts.mode(), Module: opts.Module}
 
 	run := &imageRun{
 		subjects: subjects,
@@ -337,12 +447,22 @@ func runImage(ctx context.Context, opts Options) (*Result, error) {
 		result.Findings = append(result.Findings, findings...)
 	}
 	if applied == 0 {
-		return nil, fmt.Errorf("no ecosystem could analyze %s", opts.Image)
+		return nil, fmt.Errorf("no ecosystem could analyze %s", img.Ref)
 	}
 	if failed == applied {
-		return nil, fmt.Errorf("every ecosystem failed on %s; see the log above", opts.Image)
+		return nil, fmt.Errorf("every ecosystem failed on %s; see the log above", img.Ref)
 	}
 	result.Findings = append(result.Findings, unmapped(opts.CVEs, result.Findings)...)
+
+	// After the plugins, not before: this is the accumulation of every walk
+	// they did, so it is only complete once they are done.
+	if u := img.FS.Unreadable(); u.Any() {
+		result.Unreadable = &u
+		logf("  ! %d path(s) in %s could not be read; the scan does not account for them", u.Count, img.Ref)
+		for _, p := range u.Paths {
+			logf("    ! %s", p)
+		}
+	}
 
 	llmOverlay(ctx, llmClient, result.Findings, "", logf)
 	sortFindings(result.Findings)

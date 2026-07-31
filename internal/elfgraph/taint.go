@@ -35,8 +35,9 @@ const (
 	TaintShellEntrypoint TaintKind = "shell-entrypoint"
 
 	// TaintNoEntrypoint is an image config with neither Entrypoint nor Cmd,
-	// or one naming a file that is not in the image. There is nothing to root
-	// the closure at, so the same escalation applies.
+	// or one naming a file that is not in the image -- or, in rootfs mode, the
+	// absence of any config at all. There is nothing to root the closure at,
+	// so the same escalation applies.
 	TaintNoEntrypoint TaintKind = "no-entrypoint"
 )
 

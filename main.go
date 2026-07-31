@@ -25,8 +25,9 @@ func main() {
 	flag.Var(&ecosystems, "ecosystem", "restrict the scan to these ecosystems (golang, os, pypi, npm, maven, or a distro family like debian); repeatable, default all")
 	flag.Var(&roots, "roots", "extra entrypoints for the reachability closures (shared libraries and language imports), for an image whose real command comes from outside its config; repeatable")
 	var (
-		image      = flag.String("image", "", "container image reference to inspect (mutually exclusive with --repo)")
-		repo       = flag.String("repo", "", "git source repo to analyze via govulncheck source mode, e.g. github.com/rancher/rancher (mutually exclusive with --image)")
+		image      = flag.String("image", "", "container image reference to inspect (mutually exclusive with --rootfs and --repo)")
+		rootfs     = flag.String("rootfs", "", "filesystem tree already on disk to inspect -- an unpacked image, a mounted volume, a machine's own / (mutually exclusive with --image and --repo)")
+		repo       = flag.String("repo", "", "git source repo to analyze via govulncheck source mode, e.g. github.com/rancher/rancher (mutually exclusive with --image and --rootfs)")
 		ref        = flag.String("ref", "", "branch, tag, or commit to check out for --repo (default: repo default branch)")
 		repoPath   = flag.String("repo-path", ".", "module subdirectory within --repo to scan")
 		module     = flag.String("module", "", "deprecated alias for --package golang:MODULE")
@@ -57,8 +58,8 @@ func main() {
 	// needs no subject and no advisory lookup.
 	inventoryMode := *format == "inventory"
 
-	if (*image == "") == (*repo == "") {
-		fail("set exactly one of --image or --repo")
+	if named := countNamed(*image, *rootfs, *repo); named != 1 {
+		fail("set exactly one of --image, --rootfs or --repo")
 	}
 	switch *format {
 	case "text", "json", "inventory":
@@ -103,6 +104,7 @@ func main() {
 	if inventoryMode {
 		runInventory(ctx, analyze.Options{
 			Image:        *image,
+			RootFS:       *rootfs,
 			Repo:         *repo,
 			OS:           *goos,
 			Arch:         *arch,
@@ -114,6 +116,7 @@ func main() {
 
 	opts := analyze.Options{
 		Image:              *image,
+		RootFS:             *rootfs,
 		Repo:               *repo,
 		Ref:                *ref,
 		Path:               *repoPath,
@@ -191,8 +194,23 @@ func main() {
 				fmt.Fprintf(os.Stderr, "error: ecosystem %s did not complete: %s\n", e.ID, e.Error)
 			}
 		}
+		if u := res.Unreadable; u != nil && u.Any() {
+			fmt.Fprintf(os.Stderr, "error: %d path(s) in the target could not be read: %s\n",
+				u.Count, strings.Join(u.Paths, ", "))
+		}
 		os.Exit(1)
 	}
+}
+
+// countNamed reports how many of the target flags were given a value.
+func countNamed(vals ...string) int {
+	n := 0
+	for _, v := range vals {
+		if v != "" {
+			n++
+		}
+	}
+	return n
 }
 
 // fail prints a usage error and exits 2.
@@ -202,7 +220,7 @@ func fail(format string, args ...any) {
 	os.Exit(2)
 }
 
-// runInventory handles --format inventory, which lists the image's OS packages
+// runInventory handles --format inventory, which lists the target's OS packages
 // and exits without resolving a single advisory.
 func runInventory(ctx context.Context, opts analyze.Options, out string, logf func(string, ...any)) {
 	inv, err := analyze.Inventory(ctx, opts)
@@ -217,14 +235,31 @@ func runInventory(ctx context.Context, opts analyze.Options, out string, logf fu
 			os.Exit(1)
 		}
 		logf("Wrote %s", out)
-		return
+	} else {
+		fmt.Print(rendered)
 	}
-	fmt.Print(rendered)
+
+	// Written first, then failed: an inventory with holes in it is still worth
+	// reading, and still not something a CI job should treat as the list.
+	if u := inv.Unreadable; u != nil && u.Any() {
+		fmt.Fprintf(os.Stderr, "error: %d path(s) could not be read: %s\n",
+			u.Count, strings.Join(u.Paths, ", "))
+		os.Exit(1)
+	}
 }
 
 func renderInventory(inv *analyze.InventoryResult) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "vexscan inventory for %s\n", inv.Target)
+	if u := inv.Unreadable; u != nil && u.Any() {
+		fmt.Fprintf(&b, "INCOMPLETE: %d path(s) could not be read, so this list has an unknown number of omissions:\n", u.Count)
+		for _, p := range u.Paths {
+			fmt.Fprintf(&b, "  %s\n", p)
+		}
+		if u.Count > len(u.Paths) {
+			fmt.Fprintf(&b, "  ... and %d more\n", u.Count-len(u.Paths))
+		}
+	}
 
 	switch {
 	case inv.OS == nil:
@@ -345,6 +380,18 @@ func renderText(res *analyze.Result) string {
 			fmt.Fprintf(&b, "INCOMPLETE: ecosystem %s did not run - %s\n", e.ID, e.Error)
 		}
 	}
+	if u := res.Unreadable; u != nil && u.Any() {
+		// Same placement, same reason. The paths are named because the usual
+		// cause is scanning a root-owned tree as someone else, and the fix --
+		// re-run it as root -- is only obvious once you can see what was missed.
+		fmt.Fprintf(&b, "INCOMPLETE: %d path(s) could not be read, so this report does not account for them:\n", u.Count)
+		for _, p := range u.Paths {
+			fmt.Fprintf(&b, "  %s\n", p)
+		}
+		if u.Count > len(u.Paths) {
+			fmt.Fprintf(&b, "  ... and %d more\n", u.Count-len(u.Paths))
+		}
+	}
 	b.WriteString("\n")
 
 	if len(res.Findings) == 0 {
@@ -446,7 +493,7 @@ func strippedNote(stripped *bool) string {
 func usage() {
 	// WriteString rather than Fprint: the purl example contains %2F, which vet
 	// reads as a stray formatting directive in anything Printf-shaped.
-	os.Stderr.WriteString(`vexscan - check whether a CVE's vulnerable code is actually present in an image or source repo
+	os.Stderr.WriteString(`vexscan - check whether a CVE's vulnerable code is actually present in an image, a filesystem, or a source repo
 
 Every ecosystem brings its own deterministic presence test: pclntab
 dead-code-elimination evidence and govulncheck for Go, the dynamic linker's
@@ -455,8 +502,14 @@ a static import closure for Python and npm. The LLM, if enabled, only ever
 comments on what those tests could not rule out.
 
 Usage:
-  vexscan --image REF  (--package SPEC... | --cves LIST | --all) [flags]
-  vexscan --repo  REPO (--package SPEC... | --cves LIST | --all) [flags]
+  vexscan --image  REF  (--package SPEC... | --cves LIST | --all) [flags]
+  vexscan --rootfs DIR  (--package SPEC... | --cves LIST | --all) [flags]
+  vexscan --repo   REPO (--package SPEC... | --cves LIST | --all) [flags]
+
+--rootfs runs the same analysis against a tree already on disk. It arrives with
+no image config, so nothing declares an entrypoint: the language plugins mark
+their conclusions undetermined and the shared-library closure falls back to
+rooting every program it finds. Pass --roots to say what actually runs.
 
 A --package SPEC is a purl, an "ecosystem:name" shorthand, or a bare name
 resolved against whatever inventory contains it:
@@ -486,6 +539,9 @@ Examples:
   # Every Node package the image installs, with the require closure applied
   vexscan --image node:22-slim --all --ecosystem npm
 
+  # A filesystem tree rather than an image, with the entrypoint supplied
+  vexscan --rootfs /mnt/rootfs --all --roots /usr/bin/myapp
+
   # Source repo (govulncheck source-mode reachability)
   vexscan --repo github.com/rancher/rancher \
     --package golang:golang.org/x/net --cves CVE-2023-39325
@@ -496,6 +552,7 @@ Examples:
 
   # List the packages in an image, with the names OSV will be queried by
   vexscan --image debian:12 --format inventory
+  vexscan --rootfs /mnt/rootfs --format inventory
 
   # Share the report as a public gist (needs GITHUB_TOKEN/GH_TOKEN with gist scope)
   vexscan --image rancher/hardened-kubernetes:v1.30.1 \

@@ -128,7 +128,7 @@ func (n *node) entryRoots() ([]modgraph.Root, []modgraph.Taint) {
 	if len(argv) == 0 {
 		return nil, []modgraph.Taint{{
 			Kind:     modgraph.TaintNoEntrypoint,
-			Detail:   "the image config has neither Entrypoint nor Cmd, so what it runs is unknown",
+			Detail:   "nothing declares an entrypoint -- no image config, or one that sets neither Entrypoint nor Cmd -- so what runs is unknown; name it with --roots",
 			Blocking: true,
 			Global:   true,
 		}}

@@ -205,7 +205,7 @@ func (g *Graph) markRoots(opts Options) {
 	if len(argv) == 0 {
 		g.taints = append(g.taints, Taint{
 			Kind:   TaintNoEntrypoint,
-			Detail: "image config sets neither Entrypoint nor Cmd, so every executable is treated as a root",
+			Detail: "nothing declares an entrypoint -- no image config, or one that sets neither Entrypoint nor Cmd -- so every executable is treated as a root; name the real ones with --roots",
 		})
 		g.escalate(opts, "no entrypoint")
 		return

@@ -6,6 +6,7 @@ import (
 
 	"github.com/cwayne18/vexscan/internal/analyze"
 	"github.com/cwayne18/vexscan/internal/pkgdb"
+	"github.com/cwayne18/vexscan/internal/target"
 )
 
 func TestRenderInventory(t *testing.T) {
@@ -71,6 +72,40 @@ func TestRenderInventoryShoutsAboutAnUnresolvedEcosystem(t *testing.T) {
 	// The packages are still listed: the inventory is useful without a name.
 	if !strings.Contains(got, "glibc") {
 		t.Errorf("packages were suppressed:\n%s", got)
+	}
+}
+
+// TestRenderersSayWhenPartOfTheTreeWasNotRead: an unlistable directory hides an
+// unknown number of packages, and both views have to say so above the data, not
+// after it. This is mostly a rootfs concern -- extraction creates every
+// directory 0755 -- but the renderers do not care which mode produced it.
+func TestRenderersSayWhenPartOfTheTreeWasNotRead(t *testing.T) {
+	unreadable := &target.Unreadable{Count: 12, Paths: []string{"/opt/vendor", "/srv/data"}}
+
+	inv := renderInventory(&analyze.InventoryResult{
+		Target: "/mnt/rootfs", Mode: "rootfs", Unreadable: unreadable,
+	})
+	res := renderText(&analyze.Result{
+		SchemaVersion: analyze.SchemaVersion, Target: "/mnt/rootfs", Mode: "rootfs",
+		Unreadable: unreadable,
+	})
+
+	for name, got := range map[string]string{"inventory": inv, "report": res} {
+		if !strings.Contains(got, "INCOMPLETE") {
+			t.Errorf("%s does not flag the gap:\n%s", name, got)
+		}
+		if !strings.Contains(got, "/opt/vendor") || !strings.Contains(got, "/srv/data") {
+			t.Errorf("%s does not name the paths:\n%s", name, got)
+		}
+		// The sample is capped, so the count and the list disagree. Printing
+		// only the list would read as "two directories" when it was twelve.
+		if !strings.Contains(got, "and 10 more") {
+			t.Errorf("%s hides the paths beyond the sample:\n%s", name, got)
+		}
+	}
+	// A report with no findings and a hole in it is not a clean report.
+	if !strings.Contains(res, "This is not a clean result.") {
+		t.Errorf("an incomplete empty report reads as clean:\n%s", res)
 	}
 }
 

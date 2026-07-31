@@ -45,8 +45,8 @@ const (
 	// is treated as a root.
 	TaintForeignEntrypoint TaintKind = "foreign-entrypoint"
 
-	// TaintNoEntrypoint is an image config with neither Entrypoint nor Cmd.
-	// Same escalation, different cause.
+	// TaintNoEntrypoint is an image config with neither Entrypoint nor Cmd --
+	// or, in rootfs mode, no config at all. Same escalation, different cause.
 	TaintNoEntrypoint TaintKind = "no-entrypoint"
 
 	// TaintBundled is an entrypoint whose dependencies were compiled into it

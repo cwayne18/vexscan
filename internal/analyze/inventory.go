@@ -4,16 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 
-	"github.com/cwayne18/vexscan/internal/image"
 	"github.com/cwayne18/vexscan/internal/langdb"
 	"github.com/cwayne18/vexscan/internal/osv"
 	"github.com/cwayne18/vexscan/internal/pkgdb"
 	"github.com/cwayne18/vexscan/internal/target"
 )
 
-// InventoryResult is what an image's package databases say is installed.
+// InventoryResult is what a tree's package databases say is installed.
 //
 // This is the raw material the OS ecosystem plugin works from, exposed on its
 // own because it is checkable: a user who suspects a finding is wrong can see
@@ -21,9 +19,14 @@ import (
 // be used to query OSV before any query is made.
 type InventoryResult struct {
 	Target    string         `json:"target"`
-	Mode      string         `json:"mode"` // always "image"
+	Mode      string         `json:"mode"` // "image" | "rootfs"
 	OS        *OSInfo        `json:"os,omitempty"`
 	Databases []pkgdb.Result `json:"databases"`
+
+	// Unreadable is the part of the tree the walks could not enter. An
+	// inventory that skipped a directory is a list of what is installed with
+	// an unknown number of omissions, which is not the same document.
+	Unreadable *target.Unreadable `json:"unreadable,omitempty"`
 
 	// Languages are the installed distributions of the language ecosystems
 	// that ship inside images: Python's site-packages, Node's node_modules.
@@ -67,11 +70,11 @@ func (r *InventoryResult) LanguagePackages() int {
 	return n
 }
 
-// Inventory extracts an image and reads its OS package databases.
+// Inventory reads the OS package databases of an image or a rootfs.
 //
-// It deliberately does not require a subject: "what is in this image" is a
+// It deliberately does not require a subject: "what is in this tree" is a
 // question worth answering on its own, and it is the one output that can be
-// checked against `dpkg -l` or `rpm -qa` inside the same image.
+// checked against `dpkg -l` or `rpm -qa` run inside the same tree.
 func Inventory(ctx context.Context, opts Options) (*InventoryResult, error) {
 	if opts.Logf == nil {
 		opts.Logf = func(string, ...any) {}
@@ -79,34 +82,20 @@ func Inventory(ctx context.Context, opts Options) (*InventoryResult, error) {
 	// Check --repo first: a user who passed it gets told why it does not
 	// apply, rather than being told to pass a flag they deliberately did not.
 	if opts.Repo != "" {
-		return nil, errors.New("--format inventory reads an image's package databases; it does not apply to --repo")
+		return nil, errors.New("--format inventory reads a filesystem's package databases; it does not apply to --repo")
 	}
-	if opts.Image == "" {
-		return nil, errors.New("--format inventory needs --image")
-	}
-	if opts.OS == "" {
-		opts.OS = "linux"
-	}
-	if opts.Arch == "" {
-		opts.Arch = "amd64"
+	if err := opts.checkTarget(); err != nil {
+		return nil, err
 	}
 	logf := opts.Logf
 
-	dest, err := os.MkdirTemp("", "vexscan-fs-")
+	img, cleanup, err := openTree(ctx, &opts)
 	if err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(dest)
+	defer cleanup()
 
-	logf("Extracting %s (%s/%s)...", opts.Image, opts.OS, opts.Arch)
-	ex := image.NewExtractor()
-	ex.OS, ex.Arch = opts.OS, opts.Arch
-	img, err := ex.Extract(ctx, opts.Image, dest)
-	if err != nil {
-		return nil, fmt.Errorf("extract image: %w", err)
-	}
-
-	res := &InventoryResult{Target: opts.Image, Mode: "image"}
+	res := &InventoryResult{Target: img.Ref, Mode: opts.mode()}
 	res.OS = readOSInfo(img.FS, logf)
 
 	dbs, err := pkgdb.Read(img.FS)
@@ -119,7 +108,7 @@ func Inventory(ctx context.Context, opts Options) (*InventoryResult, error) {
 	res.Databases = dbs
 
 	if len(dbs) == 0 {
-		logf("  ! no dpkg, apk or rpm database found in %s", opts.Image)
+		logf("  ! no dpkg, apk or rpm database found in %s", img.Ref)
 	}
 	for _, db := range dbs {
 		logf("  %s: %d packages from %s", db.Format, len(db.Packages), db.DB)
@@ -142,6 +131,15 @@ func Inventory(ctx context.Context, opts Options) (*InventoryResult, error) {
 		}
 		for _, m := range l.Unidentified {
 			logf("    ! archive declares no coordinates %s", m)
+		}
+	}
+
+	// Last, because it accumulates across both scans above.
+	if u := img.FS.Unreadable(); u.Any() {
+		res.Unreadable = &u
+		logf("  ! %d path(s) could not be read; this inventory does not account for them", u.Count)
+		for _, m := range u.Paths {
+			logf("    ! %s", m)
 		}
 	}
 	return res, nil
