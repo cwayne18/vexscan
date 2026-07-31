@@ -140,16 +140,23 @@ func Inventory(ctx context.Context, opts Options) (*InventoryResult, error) {
 			// not parse is one whose absence must not be asserted later.
 			logf("    ! unreadable manifest %s", m)
 		}
+		for _, m := range l.Unidentified {
+			logf("    ! archive declares no coordinates %s", m)
+		}
 	}
 	return res, nil
 }
 
 // rootWord names what a language's roots are, for log lines.
 func rootWord(f langdb.Format) string {
-	if f == langdb.FormatNPM {
+	switch f {
+	case langdb.FormatNPM:
 		return "node_modules trees"
+	case langdb.FormatMaven:
+		return "archives"
+	default:
+		return "site-packages directories"
 	}
-	return "site-packages directories"
 }
 
 // readOSInfo parses /etc/os-release and maps it to an OSV ecosystem.

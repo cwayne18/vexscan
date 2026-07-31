@@ -1,6 +1,6 @@
-// Package langdb reads the installed-package layouts of the two language
-// ecosystems that ship inside container images: Python's site-packages and
-// Node's node_modules.
+// Package langdb reads the installed-package layouts of the language
+// ecosystems that ship inside container images: Python's site-packages, Node's
+// node_modules, and Java's jar, war and ear archives.
 //
 // It is the language-ecosystem counterpart of internal/pkgdb, and answers the
 // same two questions: which distributions are installed at which versions, and
@@ -11,7 +11,7 @@
 //
 // It differs from pkgdb in one structural way. A dpkg or rpm database is a
 // single file at a known path, so pkgdb's Reader can Detect by stat'ing it.
-// site-packages and node_modules can be anywhere and there can be many of
+// site-packages, node_modules and jars can be anywhere and there can be many of
 // them, so finding them means walking the tree. Scan therefore does one walk
 // for every format at once, rather than giving each Reader its own Detect.
 //
@@ -33,8 +33,9 @@ import (
 type Format string
 
 const (
-	FormatPyPI Format = "pypi"
-	FormatNPM  Format = "npm"
+	FormatPyPI  Format = "pypi"
+	FormatNPM   Format = "npm"
+	FormatMaven Format = "maven"
 )
 
 // Package is one installed distribution.
@@ -111,6 +112,21 @@ type Package struct {
 	// depends on nothing", which narrows a taint's scope to the package
 	// itself; only metadata that was actually read can support that.
 	RequiresKnown bool `json:"requires_known"`
+
+	// CoordsKnown reports whether Name came from metadata the build wrote
+	// rather than from the file name or the code's own layout.
+	//
+	// Only the Maven reader ever sets it false. A PyPI or npm name is read from
+	// a manifest that the package manager requires; a jar frequently carries no
+	// statement of its own groupId at all, and the name is then reconstructed
+	// from the file name and the classes' package prefixes.
+	//
+	// Same asymmetry as the rest of this family, one level up. A guessed
+	// coordinate is still worth querying OSV with -- a name that matches nothing
+	// costs one entry in a batch. It may not support a negative conclusion:
+	// asserting that an artifact does not contain some class, when the artifact
+	// is only what this reader thinks the jar is, stacks a guess on a guess.
+	CoordsKnown bool `json:"coords_known,omitempty"`
 }
 
 // Requirement is one declared dependency.
@@ -146,7 +162,9 @@ func (p Package) OSVNames() []string {
 type Result struct {
 	Format Format `json:"format"`
 
-	// Roots are the site-packages or node_modules directories that were found.
+	// Roots are what the tree walk found for this format: the site-packages or
+	// node_modules directories, or, for a format whose packages are files, the
+	// archive paths themselves.
 	Roots []string `json:"roots"`
 
 	Packages []Package `json:"packages"`
@@ -160,6 +178,16 @@ type Result struct {
 	// either: a distribution whose manifest could not be read is one whose
 	// absence must not be asserted, so the plugin turns this into a taint.
 	Unreadable []string `json:"unreadable,omitempty"`
+
+	// Unidentified are archives that opened cleanly and declare no coordinates
+	// anywhere -- no META-INF/maven, no usable manifest, no conventional file
+	// name.
+	//
+	// It is Unreadable's sibling for the Maven reader, and it exists because the
+	// two are the same failure wearing different clothes: something is installed
+	// here and this scan cannot say what. A plugin asked whether an artifact is
+	// present must not answer no while one of these is on the disk.
+	Unidentified []string `json:"unidentified,omitempty"`
 }
 
 // Reader parses one language's installed-package layout out of the roots that
@@ -176,9 +204,24 @@ type Reader interface {
 	Read(fsys target.RootFS, roots []string) (Result, error)
 }
 
+// FileReader is a Reader whose installed packages are individual files rather
+// than directories.
+//
+// Java is the reason it exists. A jar is a single self-describing file that can
+// sit anywhere -- a servlet container's lib directory, /usr/share/java, an
+// application's working directory -- so there is no directory base name to key
+// on the way site-packages and node_modules are keyed on. The roots handed to
+// Read are then the archive paths themselves.
+type FileReader interface {
+	Reader
+	// FileSuffixes are the file extensions that identify this format's
+	// packages, lowercase and including the dot.
+	FileSuffixes() []string
+}
+
 // Readers returns every backend, in a stable order.
 func Readers() []Reader {
-	return []Reader{&PyPI{}, &NPM{}}
+	return []Reader{&PyPI{}, &NPM{}, &Maven{}}
 }
 
 // skipDirs are kernel filesystems. An extracted image should not contain them,
@@ -187,8 +230,9 @@ var skipDirs = map[string]bool{
 	"/proc": true, "/sys": true, "/dev": true,
 }
 
-// FindRoots walks the tree once and returns, per format, the directories that
-// hold that format's installed packages.
+// FindRoots walks the tree once and returns, per format, what holds that
+// format's installed packages: a directory for most, an archive file for a
+// FileReader.
 //
 // A matched directory is not descended into. Nesting is real -- npm stores a
 // conflicting version in a node_modules inside a package -- but it is the npm
@@ -197,15 +241,29 @@ var skipDirs = map[string]bool{
 // structure the resolver needs.
 func FindRoots(fsys target.RootFS) (map[Format][]string, error) {
 	want := map[string]Format{}
+	wantSuffix := map[string]Format{}
 	for _, r := range Readers() {
 		for _, name := range r.DirNames() {
 			want[name] = r.Format()
+		}
+		if fr, ok := r.(FileReader); ok {
+			for _, suffix := range fr.FileSuffixes() {
+				wantSuffix[suffix] = r.Format()
+			}
 		}
 	}
 
 	out := map[Format][]string{}
 	err := fsys.Walk("/", func(name string, d fs.DirEntry) error {
 		if !d.IsDir() {
+			if !d.Type().IsRegular() {
+				// A symlink to a jar is the same jar under a second name, and
+				// counting it twice inventories one artifact as two.
+				return nil
+			}
+			if format, ok := matchSuffix(wantSuffix, name); ok {
+				out[format] = append(out[format], name)
+			}
 			return nil
 		}
 		if skipDirs[name] {
@@ -225,6 +283,19 @@ func FindRoots(fsys target.RootFS) (map[Format][]string, error) {
 		sort.Strings(roots)
 	}
 	return out, nil
+}
+
+// matchSuffix reports which format, if any, claims a file by its extension.
+// The comparison is case-insensitive because Windows-built archives and
+// hand-renamed ones both show up as .JAR.
+func matchSuffix(want map[string]Format, name string) (Format, bool) {
+	base := strings.ToLower(path.Base(name))
+	for suffix, format := range want {
+		if len(base) > len(suffix) && strings.HasSuffix(base, suffix) {
+			return format, true
+		}
+	}
+	return "", false
 }
 
 // Scan finds every root and runs the reader that owns it.
