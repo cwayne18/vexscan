@@ -2,6 +2,7 @@ package target
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -332,5 +333,163 @@ func TestDirFSWalkSkipDir(t *testing.T) {
 	want := []string{"/", "/keep", "/keep/a", "/skip"}
 	if !reflect.DeepEqual(seen, want) {
 		t.Errorf("Walk = %v, want %v", seen, want)
+	}
+}
+
+// TestWalkRecordsAnUnlistableDirectory is the property the whole type exists
+// for: a subtree the walk could not enter is skipped, and says so.
+func TestWalkRecordsAnUnlistableDirectory(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read anything, so there is no gap to record")
+	}
+	root := tree(t, map[string]string{
+		"open/":       "",
+		"open/a":      "a",
+		"closed/":     "",
+		"closed/deep": "secret",
+	})
+	closed := filepath.Join(root, "closed")
+	if err := os.Chmod(closed, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	// Restore the mode so t.TempDir's cleanup can remove the tree.
+	t.Cleanup(func() { _ = os.Chmod(closed, 0o755) })
+
+	fsys := NewDirFS(root)
+	var seen []string
+	if err := fsys.Walk("/", func(name string, d fs.DirEntry) error {
+		seen = append(seen, name)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The walk still completes and still reports everything it could reach.
+	want := []string{"/", "/closed", "/open", "/open/a"}
+	if !reflect.DeepEqual(seen, want) {
+		t.Errorf("Walk = %v, want %v", seen, want)
+	}
+
+	u := fsys.Unreadable()
+	if u.Count != 1 {
+		t.Errorf("Unreadable.Count = %d, want 1", u.Count)
+	}
+	if !reflect.DeepEqual(u.Paths, []string{"/closed"}) {
+		t.Errorf("Paths = %v, want [/closed]", u.Paths)
+	}
+	// The directory hid an unknown number of unnamed entries, so the scan is
+	// no longer an account of the tree and has to say so.
+	if !u.Any() {
+		t.Error("an unlistable directory must be recorded")
+	}
+}
+
+// TestAnUnreadableFileIsNotAWalkGap pins the boundary of what this type
+// claims. A walk reads directory listings and never opens the files in them,
+// so a mode-0000 file costs the walk nothing; the gap surfaces at whichever
+// reader actually wanted the file, which can say which file it lost.
+func TestAnUnreadableFileIsNotAWalkGap(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read anything, so there is no gap to record")
+	}
+	root := tree(t, map[string]string{"a": "a", "b": "b"})
+	if err := os.Chmod(filepath.Join(root, "b"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+
+	fsys := NewDirFS(root)
+	var seen []string
+	if err := fsys.Walk("/", func(name string, d fs.DirEntry) error {
+		seen = append(seen, name)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if want := []string{"/", "/a", "/b"}; !reflect.DeepEqual(seen, want) {
+		t.Errorf("Walk = %v, want %v", seen, want)
+	}
+	if u := fsys.Unreadable(); u.Any() {
+		t.Errorf("Unreadable = %+v, want nothing: the walk never opened the file", u)
+	}
+	// And the reader that does want it still fails, by name.
+	if _, err := fsys.ReadFile("/b"); err == nil {
+		t.Error("ReadFile on a mode-0000 file should fail")
+	}
+}
+
+// TestUnreadableIsCumulativeAndDeduplicated pins the contract the orchestrator
+// relies on: several plugins walk the same tree, and one bad directory is one
+// gap however many of them trip over it.
+func TestUnreadableIsCumulativeAndDeduplicated(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read anything, so there is no gap to record")
+	}
+	root := tree(t, map[string]string{"x/": "", "y/": ""})
+	for _, d := range []string{"x", "y"} {
+		p := filepath.Join(root, d)
+		if err := os.Chmod(p, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(p, 0o755) })
+	}
+
+	fsys := NewDirFS(root)
+	for i := 0; i < 3; i++ {
+		if err := fsys.Walk("/", func(string, fs.DirEntry) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	u := fsys.Unreadable()
+	if u.Count != 2 {
+		t.Errorf("Unreadable.Count = %d after three walks, want 2", u.Count)
+	}
+}
+
+// TestWalkingSomethingAbsentIsNotAGap keeps "not there" out of the report.
+// Callers walk directories that legitimately do not exist -- langdb probes for
+// site-packages in images that have no Python -- and recording those as
+// unreadable would make every scan look incomplete.
+func TestWalkingSomethingAbsentIsNotAGap(t *testing.T) {
+	fsys := NewDirFS(tree(t, map[string]string{"a": "a"}))
+	if err := fsys.Walk("/no/such/dir", func(string, fs.DirEntry) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if u := fsys.Unreadable(); u.Any() {
+		t.Errorf("Unreadable = %+v, want nothing recorded for an absent path", u)
+	}
+}
+
+func TestUnreadableSampleIsBounded(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read anything, so there is no gap to record")
+	}
+	spec := map[string]string{}
+	for i := 0; i < maxUnreadableSample+5; i++ {
+		spec[fmt.Sprintf("d%02d/", i)] = ""
+	}
+	root := tree(t, spec)
+	for i := 0; i < maxUnreadableSample+5; i++ {
+		p := filepath.Join(root, fmt.Sprintf("d%02d", i))
+		if err := os.Chmod(p, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(p, 0o755) })
+	}
+
+	fsys := NewDirFS(root)
+	if err := fsys.Walk("/", func(string, fs.DirEntry) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+
+	u := fsys.Unreadable()
+	// The count is complete even though the sample is not: a reader needs to
+	// know how big the hole is, not just see the first few edges of it.
+	if u.Count != maxUnreadableSample+5 {
+		t.Errorf("Unreadable.Count = %d, want %d", u.Count, maxUnreadableSample+5)
+	}
+	if len(u.Paths) != maxUnreadableSample {
+		t.Errorf("len(Paths) = %d, want %d", len(u.Paths), maxUnreadableSample)
 	}
 }
