@@ -628,9 +628,9 @@ The LLM is an overlay and never a source of truth. It runs only on findings the
 deterministic tests could not clear, and it cannot change a status.
 
 - **`--llm`** — for CVEs whose vulnerable code is genuinely linked or reachable,
-  a [GitHub Models](https://github.com/marketplace/models) chat model gives an
-  advisory `likely` / `unlikely` / `unknown` exploitability verdict, recorded
-  under `llm` on the finding.
+  a chat model gives an advisory `likely` / `unlikely` / `unknown` exploitability
+  verdict, recorded under `llm` on the finding. You choose which model — see
+  [Choosing a provider](#choosing-a-provider).
 - **`--mine-advisories`** — lets the model read an advisory's prose and extract
   symbols, sonames, filenames and **module paths** worth checking. Distro OSV
   records give a fixed version and nothing about what inside the package is
@@ -677,12 +677,88 @@ pass `--trust-import-absence`. Absence of a *direct* import does not prove
 unreachability, because the vulnerable code is usually called from inside the
 same library or package.
 
-GitHub Models enforces a low per-minute burst limit, so a scan assessing many
-CVEs can hit `429 Too Many Requests` (sometimes phrased as a Terms of Service or
-"scraping" notice — that is GitHub's secondary rate limit). `vexscan` caches
-verdicts per CVE, spaces requests out (default 1s), and retries `429`/`5xx` with
-backoff honoring `Retry-After` up to two minutes. A failed assessment is
-non-fatal: the finding is still reported, just without a verdict.
+### Choosing a provider
+
+There is **no default**. `vexscan` used to call [GitHub
+Models](https://github.com/marketplace/models), which was free with a token most
+users already had; it has been retired. `--llm` with nothing configured fails
+and prints the three ways to configure it, rather than quietly not asking —
+missing verdicts look exactly like findings nothing had an opinion about.
+
+**An OpenAI-compatible endpoint.** Almost everything speaks this format:
+
+```sh
+export VEXSCAN_LLM_ENDPOINT=https://api.openai.com/v1/chat/completions
+export VEXSCAN_LLM_TOKEN=sk-...          # or just set OPENAI_API_KEY
+vexscan --image myorg/app:latest --all --llm --llm-model gpt-4o
+```
+
+Anthropic serves the same shape at
+`https://api.anthropic.com/v1/chat/completions` (with `ANTHROPIC_API_KEY`), as
+do Azure AI Foundry, OpenRouter, Together, Groq and Fireworks. Set
+`--llm-model` to whatever that provider calls the model; routers want the
+`vendor/model` spelling.
+
+**A model on your own machine.** Ollama, vLLM and `llama.cpp` all expose the
+same endpoint, and none of them wants a token:
+
+```sh
+ollama pull llama3.1                     # with `ollama serve` running
+vexscan --image myorg/app:latest --all --llm \
+  --llm-endpoint http://localhost:11434/v1/chat/completions --llm-model llama3.1
+```
+
+This is the closest replacement for what GitHub Models provided — free, and
+nothing about the image you are triaging leaves the machine. The work suits a
+small model better than it looks: the prompts are short, the answer is one small
+JSON object, and `--mine-advisories` is extraction from text that is supplied in
+the prompt rather than recall. Expect thinner rationales; expect nothing else to
+change.
+
+**A CLI you already have logged in.** The prompt goes to its standard input and
+the reply is read from its standard output:
+
+```sh
+vexscan --image myorg/app:latest --all --llm --llm-command 'claude -p'
+```
+
+Anything that takes a prompt on stdin and prints a reply works, including a
+wrapper script around something in-house. This is the weakest transport and the
+trade is worth knowing: there is no structured-output mode to ask for, so the
+reply is whatever the CLI printed; there are no rate-limit headers, so a
+provider that wants you to slow down can only say so by failing; and an
+unauthenticated CLI fails once per finding rather than once at startup. Note
+also that `--llm-model` does nothing here — put the model in the command itself.
+
+| | Flag | Environment |
+|---|---|---|
+| Endpoint | `--llm-endpoint` | `VEXSCAN_LLM_ENDPOINT` |
+| Model | `--llm-model` | `VEXSCAN_LLM_MODEL` (default `gpt-4o`) |
+| Credential | *(none, deliberately)* | `VEXSCAN_LLM_TOKEN`, else `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` |
+| Local CLI | `--llm-command` | `VEXSCAN_LLM_COMMAND` |
+
+The credential has no flag on purpose: everything on a command line is readable
+in the process table by every other user on the machine. The prompt is sent to a
+command's stdin for the same reason, and because advisory prose is long enough
+to approach the argument-length limit.
+
+**Which provider you pick cannot change a conclusion.** A verdict is only ever
+attached to a finding that already has a status, and a mined symbol has to be
+found in the artifact before it supports one. A weaker model produces vaguer
+rationales and finds fewer checkable symbols. It cannot manufacture a
+`not_present`. That is why this is a configuration option and not an
+architectural decision.
+
+### Rate limits and failures
+
+`vexscan` caches verdicts per CVE, so the same CVE linked into twenty binaries
+costs one call. Requests are not spaced out by default — set
+`VEXSCAN_LLM_MIN_INTERVAL` (a Go duration) for a provider that needs it.
+`429`/`5xx` and connection failures are retried with backoff, honoring
+`Retry-After` up to two minutes; a failing `--llm-command` is **not** retried,
+because a CLI's transient failures were already retried inside its own client
+and its other failures do not improve on the sixth attempt. A failed assessment
+is non-fatal either way: the finding is still reported, just without a verdict.
 
 ## Output
 
@@ -755,8 +831,10 @@ be read, or part of the tree could not be read, `2` the command line was wrong.
 | `--dynamic-import-policy` | `taint` | The same knob for a language import graph's computed imports. These are far more common than `dlopen`, so `assume-none` discards much more |
 | `--trust-import-absence` | `false` | Let a missing dynamic import conclude `not_in_execute_path` (weaker than it looks) |
 | `--os` / `--arch` | `linux` / `amd64` | Image platform variant to pull (image mode only) |
-| `--llm` | `false` | Consult a GitHub Models LLM on genuinely-affected CVEs |
-| `--llm-model` | `openai/gpt-4o` | GitHub Models model id for `--llm` |
+| `--llm` | `false` | Consult a chat model on genuinely-affected CVEs; needs a provider below |
+| `--llm-endpoint` | | OpenAI-compatible chat/completions URL — an API provider or a local Ollama |
+| `--llm-model` | `gpt-4o` | Model id for `--llm-endpoint` |
+| `--llm-command` | | Run this installed CLI instead of an endpoint, e.g. `'claude -p'` |
 | `--mine-advisories` | `false` | With `--llm`, mine advisory prose for symbols and module paths to check |
 | `--format` | `text` | `text`, `json`, or `inventory` |
 | `--out` | *(stdout)* | Write output to a file |
@@ -765,7 +843,7 @@ be read, or part of the tree could not be read, `2` the command line was wrong.
 | `--quiet` | `false` | Suppress progress logging on stderr |
 
 `--gist` uploads whatever would otherwise be printed, respecting `--format`,
-using the same `GITHUB_TOKEN` / `GH_TOKEN` as `--llm`. It composes with `--out`
+using `GITHUB_TOKEN` / `GH_TOKEN` with gist scope. It composes with `--out`
 (written to the file *and* uploaded).
 
 ### Standard library
@@ -791,10 +869,14 @@ honored as a fallback so existing CI keeps working.
 
 | Variable | Legacy name | Purpose |
 |---|---|---|
-| `VEXSCAN_LLM_MIN_INTERVAL` | `GOMODVEX_LLM_MIN_INTERVAL` | Minimum spacing between `--llm` calls (Go duration; `0` disables) |
+| `VEXSCAN_LLM_ENDPOINT` | | OpenAI-compatible chat/completions URL for `--llm` |
+| `VEXSCAN_LLM_MODEL` | | Model id for that endpoint (default `gpt-4o`) |
+| `VEXSCAN_LLM_TOKEN` | | Bearer credential for that endpoint; `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` are accepted as fallbacks |
+| `VEXSCAN_LLM_COMMAND` | | A local CLI to run for `--llm` instead of calling an endpoint |
+| `VEXSCAN_LLM_MIN_INTERVAL` | `GOMODVEX_LLM_MIN_INTERVAL` | Minimum spacing between `--llm` calls (Go duration; default none) |
 | `VEXSCAN_GOVULNCHECK_VERSION` | `GOMODVEX_GOVULNCHECK_VERSION` | Pin the govulncheck version used by `--repo` |
 
-`GITHUB_TOKEN` / `GH_TOKEN` are unchanged.
+`GITHUB_TOKEN` / `GH_TOKEN` are for `--gist` only, and are unchanged.
 
 ## Requirements
 
@@ -805,7 +887,10 @@ honored as a fallback so existing CI keeps working.
 - [`govulncheck`](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck) on
   `PATH` — optional, used only for Go binary mode
 - Network access for OSV lookups, and for `--repo` cloning
-- `GITHUB_TOKEN` / `GH_TOKEN` for `--llm` and `--gist`
+- `GITHUB_TOKEN` / `GH_TOKEN` for `--gist`
+- An LLM provider for `--llm` — an endpoint and key, a local model, or an
+  installed CLI. See [Choosing a provider](#choosing-a-provider); there is no
+  default and nothing is required unless you pass `--llm`.
 
 All three package databases are parsed in-process — no `dpkg`, `rpm` or `apk`
 binary is needed. So are the Python and npm inventories and lock files, and the
@@ -842,7 +927,8 @@ docker run --rm ghcr.io/cwayne18/vexscan:latest \
   --image rancher/hardened-coredns:v1.8.6-build20231009 \
   --package golang:golang.org/x/net --cves CVE-2023-39325
 
-docker run --rm -e GITHUB_TOKEN ghcr.io/cwayne18/vexscan:latest \
+docker run --rm -e VEXSCAN_LLM_ENDPOINT -e VEXSCAN_LLM_TOKEN \
+  ghcr.io/cwayne18/vexscan:latest \
   --image myorg/myapp:latest --package golang:golang.org/x/crypto --llm
 ```
 
