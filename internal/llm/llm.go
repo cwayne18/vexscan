@@ -209,6 +209,30 @@ Note that npm removes no dead code, so a package being installed and required sa
 Respond with ONLY a JSON object, no prose, of the form:
 {"exploitable":"likely|unlikely|unknown","confidence":"low|medium|high","rationale":"one or two sentences"}`
 
+// mavenPrompt asks the same question about a Java artifact in an image.
+//
+// The evidence behind a Maven finding is the weakest of the five, and the
+// prompt has to say so plainly: there is no reference graph for Java here, so
+// "present" means the archive is on the disk and nothing more. Nothing has
+// established that a classloader ever opens it.
+//
+// The three considerations that are not in the npm prompt are the three things
+// actually different about Java in a container. A jar in a lib directory may
+// belong to a servlet container's own tooling rather than to the application.
+// Java advisories are dominated by deserialization sinks and by lookups that
+// fire only when a feature is configured on -- Log4Shell needed a message
+// pattern that interpolates user input -- so configuration is more often the
+// deciding fact than a call path. And the affected artifact is usually a
+// transitive dependency of a framework, reached, if at all, through one narrow
+// path the application never wrote.
+const mavenPrompt = `You are a security analyst assessing Java dependency vulnerabilities in a container image (VEX triage).
+You are given a CVE against a Maven artifact (a jar, war or ear) that is present in the image.
+Judge how plausibly the vulnerability is actually EXPLOITABLE in a typical deployment of this image.
+Consider: whether the vulnerable class is likely instantiated or invoked with attacker-controlled input rather than only from a build tool, an optional integration or a test path; whether exploitation requires a non-default configuration, a specific feature to be enabled, or the application to deserialize untrusted data; and whether the artifact is a deep transitive dependency of a framework rather than something the application uses directly.
+Note that this scan has established only that the artifact is present. Java loads classes lazily and this scan has no call graph, so nothing here says any of its code runs.
+Respond with ONLY a JSON object, no prose, of the form:
+{"exploitable":"likely|unlikely|unknown","confidence":"low|medium|high","rationale":"one or two sentences"}`
+
 // promptFor selects the system prompt for an ecosystem.
 //
 // The empty ecosystem is Go: that is what every caller meant before this
@@ -222,6 +246,8 @@ func promptFor(ecosystem string) string {
 		return pypiPrompt
 	case "npm":
 		return npmPrompt
+	case "maven":
+		return mavenPrompt
 	default:
 		return goPrompt
 	}

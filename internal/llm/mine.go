@@ -116,6 +116,31 @@ If the advisory names none of a category, return an empty array for it. Returnin
 Respond with ONLY a JSON object, no prose, of the form:
 {"modules":[],"symbols":[],"files":[],"note":"one sentence on what the advisory did or did not name"}`
 
+// mavenMinePrompt is the same instruction for a Java artifact.
+//
+// It asks for class names into the symbols category rather than adding a
+// category of its own, because a Java class is the unit of code and the unit of
+// packaging at once: org.apache.logging.log4j.core.lookup.JndiLookup names a
+// vulnerable type and names the entry JndiLookup.class in one breath. There is
+// nothing left for a separate modules list to hold.
+//
+// It accepts both spellings on purpose. Advisories are inconsistent about
+// qualification -- the Log4Shell record writes only "JndiLookup", never the
+// package it lives in -- and the plugin can check either, so demanding the
+// fully qualified form would throw away the case this ecosystem exists for. A
+// bare name is checked against every spelling in the archive instead, which is
+// the same test that keeps a shaded copy from being missed.
+const mavenMinePrompt = `You extract checkable identifiers from security advisory text. You do not analyze, judge, or infer.
+You are given the text of one advisory and the Maven coordinates of one affected Java artifact.
+List ONLY identifiers that appear LITERALLY in the advisory text and belong to that artifact:
+- symbols: names of vulnerable Java classes, exactly as written, whether the advisory writes them fully qualified ("org.apache.logging.log4j.core.lookup.JndiLookup") or bare ("JndiLookup"). A class name begins with a capital letter. A method name ("doLookup") is NOT a class and does not belong here, and neither does a package name that names no type.
+- files: resource or configuration file names the advisory names, exactly as written (e.g. "log4j2.xml")
+Do NOT guess, expand, complete, correct, or infer any identifier. In particular, do NOT add a package prefix the advisory did not write, and do NOT shorten one it did.
+Do NOT include CVE ids, groupId or artifactId coordinates, version numbers, URLs, or commit hashes.
+If the advisory names none of a category, return an empty array for it. Returning both empty is a correct and expected answer.
+Respond with ONLY a JSON object, no prose, of the form:
+{"symbols":[],"files":[],"note":"one sentence on what the advisory did or did not name"}`
+
 // minePromptFor selects the mining instruction for an ecosystem.
 func minePromptFor(ecosystem string) string {
 	switch strings.ToLower(ecosystem) {
@@ -123,6 +148,8 @@ func minePromptFor(ecosystem string) string {
 		return pyMinePrompt
 	case "npm":
 		return npmMinePrompt
+	case "maven":
+		return mavenMinePrompt
 	default:
 		return minePrompt
 	}

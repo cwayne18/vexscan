@@ -88,6 +88,13 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 	}}
 	f.Evidence = append(f.Evidence, e.coordinateTaint(c)...)
 
+	// The one test that can look below the artifact: the advisory sometimes
+	// names the vulnerable class, and a class is an entry in the archive.
+	var done bool
+	if f, done = e.mined(f, c, req); done {
+		return f
+	}
+
 	// Nothing left to narrow with. There is no reference graph for Java here,
 	// so an artifact that holds the code is reported as holding it, with no
 	// claim about whether anything calls it.
