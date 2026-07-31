@@ -11,12 +11,12 @@ import (
 )
 
 func testClient(endpoint string) *Client {
-	return &Client{
+	return NewClientWithTransport(&HTTPTransport{
 		HTTP:     &http.Client{Timeout: 5 * time.Second},
 		Endpoint: endpoint,
 		Model:    "test",
 		Token:    "test",
-	}
+	})
 }
 
 func TestParseVerdict(t *testing.T) {
@@ -67,7 +67,7 @@ func TestAssessNonJSONError(t *testing.T) {
 		t.Fatal("expected error, got nil")
 	}
 	if got := err.Error(); got == "" ||
-		!containsAll(got, "github models", "400", "malformed") {
+		!containsAll(got, "llm endpoint", "400", "malformed") {
 		t.Fatalf("unhelpful error: %q", got)
 	}
 }

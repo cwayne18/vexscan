@@ -98,9 +98,15 @@ type Options struct {
 	// on the toolchain version.
 	GoVersion string
 
-	UseLLM   bool
-	LLMModel string
-	Token    string
+	UseLLM bool
+	// LLMEndpoint, LLMModel and LLMCommand say who to ask. Each falls back to
+	// VEXSCAN_LLM_ENDPOINT / _MODEL / _COMMAND when empty, and exactly one of
+	// endpoint and command must end up set: see llm.Config. The credential is
+	// read from the environment only, never from here, so it cannot reach a
+	// command line.
+	LLMEndpoint string
+	LLMModel    string
+	LLMCommand  string
 
 	// MineAdvisories lets the model read each advisory's prose for symbol,
 	// soname and filename leads, which plugins then validate against the image.
@@ -864,10 +870,14 @@ func newLLM(opts Options) (*llm.Client, error) {
 	if !opts.UseLLM {
 		return nil, nil
 	}
-	c, err := llm.NewClient(opts.LLMModel, opts.Token)
+	c, err := llm.NewClient(llm.ConfigFrom(opts.LLMEndpoint, opts.LLMModel, opts.LLMCommand))
 	if err != nil {
-		return nil, fmt.Errorf("llm client: %w", err)
+		// Not wrapped with a prefix: the no-provider error is a formatted
+		// paragraph of shell to copy, and "llm client: " in front of its first
+		// line would break the block it is trying to show.
+		return nil, err
 	}
+	opts.Logf("LLM overlay: asking %s", c.Describe())
 	return c, nil
 }
 

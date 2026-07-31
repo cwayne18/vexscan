@@ -43,8 +43,10 @@ func main() {
 		dynamic    = flag.String("dynamic-import-policy", "taint", "what an import of a computed name does to a language import graph: taint (block conclusions) or assume-none; these are far more common than dlopen, so assume-none discards much more")
 		mine       = flag.Bool("mine-advisories", false, "with --llm, let the model read each advisory's prose for symbols to check against the image")
 		trustAbs   = flag.Bool("trust-import-absence", false, "let a missing dynamic import of the vulnerable symbol conclude not_in_execute_path (see README: this is weaker than it looks)")
-		useLLM     = flag.Bool("llm", false, "consult a GitHub Models LLM on genuinely-affected CVEs for exploitability")
-		llmModel   = flag.String("llm-model", "openai/gpt-4o", "GitHub Models model id for --llm")
+		useLLM     = flag.Bool("llm", false, "consult a chat model on genuinely-affected CVEs for exploitability (needs a provider: --llm-endpoint or --llm-command)")
+		llmURL     = flag.String("llm-endpoint", "", "OpenAI-compatible chat/completions URL for --llm -- an API provider, or a local Ollama (env: VEXSCAN_LLM_ENDPOINT; credential: VEXSCAN_LLM_TOKEN)")
+		llmModel   = flag.String("llm-model", "", "model id for --llm-endpoint (env: VEXSCAN_LLM_MODEL; default gpt-4o)")
+		llmCommand = flag.String("llm-command", "", "for --llm, run this installed CLI instead of calling an endpoint, e.g. 'claude -p'; the prompt arrives on its stdin (env: VEXSCAN_LLM_COMMAND)")
 		format     = flag.String("format", "text", "output format: text, json, or inventory (list the image's OS packages and exit)")
 		out        = flag.String("out", "", "write output to this file instead of stdout")
 		gistFlag   = flag.Bool("gist", false, "also upload the output to a public GitHub gist and print its URL (needs GITHUB_TOKEN/GH_TOKEN with gist scope)")
@@ -134,7 +136,9 @@ func main() {
 		DynamicPolicy:      dynamicPolicy,
 		GoVersion:          *goVersion,
 		UseLLM:             *useLLM,
+		LLMEndpoint:        *llmURL,
 		LLMModel:           *llmModel,
+		LLMCommand:         *llmCommand,
 		MineAdvisories:     *mine,
 		TrustImportAbsence: *trustAbs,
 		Logf:               logf,
@@ -511,6 +515,17 @@ no image config, so nothing declares an entrypoint: the language plugins mark
 their conclusions undetermined and the shared-library closure falls back to
 rooting every program it finds. Pass --roots to say what actually runs.
 
+--llm has no default provider. Point it at any OpenAI-compatible endpoint, at a
+model running on this machine, or at a CLI you already have logged in:
+
+  --llm-endpoint https://api.openai.com/v1/chat/completions   # VEXSCAN_LLM_TOKEN
+  --llm-endpoint http://localhost:11434/v1/chat/completions --llm-model llama3.1
+  --llm-command 'claude -p'
+
+Whichever you pick cannot change a deterministic conclusion: the verdict is an
+overlay on a finding that already has a status, and a mined symbol is checked
+against the artifact before it can support one.
+
 A --package SPEC is a purl, an "ecosystem:name" shorthand, or a bare name
 resolved against whatever inventory contains it:
 
@@ -553,6 +568,13 @@ Examples:
   # List the packages in an image, with the names OSV will be queried by
   vexscan --image debian:12 --format inventory
   vexscan --rootfs /mnt/rootfs --format inventory
+
+  # With an exploitability overlay, from a model running locally
+  vexscan --image myorg/app:latest --all --llm \
+    --llm-endpoint http://localhost:11434/v1/chat/completions --llm-model llama3.1
+
+  # ... or from a CLI already installed and logged in
+  vexscan --image myorg/app:latest --all --llm --llm-command 'claude -p'
 
   # Share the report as a public gist (needs GITHUB_TOKEN/GH_TOKEN with gist scope)
   vexscan --image rancher/hardened-kubernetes:v1.30.1 \

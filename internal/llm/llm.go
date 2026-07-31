@@ -1,7 +1,7 @@
-// Package llm asks a GitHub Models chat model two questions about a CVE that
-// the deterministic analysis has already decided is genuinely present: whether
-// it is plausibly exploitable in context (Assess), and which checkable
-// identifiers the advisory text names (Mine).
+// Package llm asks a chat model two questions about a CVE that the
+// deterministic analysis has already decided is genuinely present: whether it
+// is plausibly exploitable in context (Assess), and which checkable identifiers
+// the advisory text names (Mine).
 //
 // Both are optional and advisory. Assess never sets a status -- it attaches an
 // opinion to a finding that already has one. Mine produces nothing but
@@ -10,19 +10,23 @@
 // is indistinguishable from a hallucination, so validation is what makes a
 // wrong answer inert rather than dangerous. That validation deliberately lives
 // with the caller that has the facts to do it, not here.
+//
+// Which model answers is the user's choice, via Config: an OpenAI-compatible
+// endpoint, a local server speaking the same format, or a CLI already
+// installed on the machine. Nothing here is tied to a provider, and nothing
+// needs to be -- because no answer from any of them can set a status, the
+// choice trades rationale quality and cost, not correctness.
 package llm
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,21 +34,24 @@ import (
 	"github.com/cwayne18/vexscan/internal/envx"
 )
 
-// DefaultEndpoint is the GitHub Models OpenAI-compatible inference endpoint.
-const DefaultEndpoint = "https://models.github.ai/inference/chat/completions"
+// DefaultModel is the OpenAI-compatible model id used when none is given. It
+// is a bare name rather than a provider-qualified one because that is what
+// every endpoint except a router expects; OpenRouter and friends want
+// "vendor/model" and the user supplies it.
+const DefaultModel = "gpt-4o"
 
-// DefaultModel is used when no model is specified.
-const DefaultModel = "openai/gpt-4o"
-
-// DefaultMinInterval is the default minimum spacing between API requests. GitHub
-// Models applies a low per-minute burst limit; spacing requests out keeps a
-// multi-binary scan from tripping the secondary (abuse) rate limit. Override
-// with VEXSCAN_LLM_MIN_INTERVAL (a Go duration such as "2s" or "0" to disable).
-const DefaultMinInterval = time.Second
+// DefaultMinInterval is the default minimum spacing between requests: none.
+//
+// This was once a second, to stay under GitHub Models' burst limit. A
+// general endpoint has no such limit, and the ones that do rate-limit say so
+// with a 429 and a Retry-After that the retry loop already honors. Slowing
+// every scan down for a provider the user may not be using is the wrong
+// default. Override with VEXSCAN_LLM_MIN_INTERVAL (a Go duration such as "2s").
+const DefaultMinInterval = 0
 
 // maxRetryWait caps how long a single backoff wait can be, including a
-// server-provided Retry-After. GitHub's rate-limit windows are frequently 60s+,
-// so this must be large enough to actually outlast one.
+// server-provided Retry-After. Rate-limit windows are frequently 60s+, so this
+// must be large enough to actually outlast one.
 const maxRetryWait = 120 * time.Second
 
 // Verdict is the model's structured assessment.
@@ -69,12 +76,32 @@ type Request struct {
 	Reachable string // "linked" | "reachable" | "unknown"
 }
 
-// Client talks to the GitHub Models API.
-type Client struct {
-	HTTP     *http.Client
+// Config says which model to ask and how to reach it.
+//
+// Exactly one of Endpoint and Command must be set. There is no default for
+// either, and that is the point: the tool used to have one, GitHub Models,
+// which was free with a token most users already had. It was retired, and a
+// scanner that silently picked a replacement -- or silently stopped asking --
+// would be reporting an absence of exploitability opinions that looks exactly
+// like a set of findings nothing had an opinion about.
+type Config struct {
+	// Endpoint is an OpenAI-compatible chat/completions URL.
 	Endpoint string
-	Model    string
-	Token    string
+	// Model is the model id to send. Ignored when Command is set: a CLI
+	// chooses its own model, or takes one in its own arguments.
+	Model string
+	// Token is the bearer credential for Endpoint. Empty is valid and means
+	// no Authorization header, which is what the local servers want.
+	Token string
+	// Command is a locally installed CLI to run instead of calling an
+	// endpoint. See CommandTransport for what this costs.
+	Command string
+}
+
+// Client asks a model the package's two questions, once each per distinct
+// input.
+type Client struct {
+	Transport Transport
 
 	// MinInterval is the minimum spacing enforced between outgoing requests.
 	MinInterval time.Duration
@@ -87,30 +114,108 @@ type Client struct {
 	hints   map[string]*Hints
 }
 
-// NewClient builds a Client. The token is read from GITHUB_TOKEN (or GH_TOKEN)
-// unless supplied explicitly. It returns an error if no token is available.
-func NewClient(model, token string) (*Client, error) {
-	if token == "" {
-		token = os.Getenv("GITHUB_TOKEN")
+// NewClient builds a Client for a provider.
+func NewClient(cfg Config) (*Client, error) {
+	var tr Transport
+	switch {
+	case cfg.Endpoint != "" && cfg.Command != "":
+		return nil, errors.New("set either an LLM endpoint or an LLM command, not both")
+	case cfg.Command != "":
+		cmd, err := NewCommandTransport(cfg.Command)
+		if err != nil {
+			return nil, err
+		}
+		tr = cmd
+	case cfg.Endpoint != "":
+		model := cfg.Model
+		if model == "" {
+			model = DefaultModel
+		}
+		tr = &HTTPTransport{
+			HTTP:     &http.Client{Timeout: 60 * time.Second},
+			Endpoint: cfg.Endpoint,
+			Model:    model,
+			Token:    cfg.Token,
+		}
+	default:
+		return nil, ErrNoProvider
 	}
-	if token == "" {
-		token = os.Getenv("GH_TOKEN")
+	return NewClientWithTransport(tr), nil
+}
+
+// ErrNoProvider is returned when --llm is on and nothing says who to ask.
+//
+// It is a paragraph rather than a sentence because it is the error every
+// existing user hits exactly once, on the day their working command line stops
+// working, and the useful thing to tell them is not what went wrong but which
+// three things they can type instead.
+var ErrNoProvider = errors.New(`no LLM provider configured, and there is no default (GitHub Models, which used to be one, has been retired). Choose one:
+
+  an OpenAI-compatible endpoint
+    export VEXSCAN_LLM_ENDPOINT=https://api.openai.com/v1/chat/completions
+    export VEXSCAN_LLM_TOKEN=sk-...            # or set OPENAI_API_KEY
+
+  a model on this machine, via Ollama
+    export VEXSCAN_LLM_ENDPOINT=http://localhost:11434/v1/chat/completions
+    export VEXSCAN_LLM_MODEL=llama3.1          # no token needed
+
+  a CLI already installed and logged in
+    export VEXSCAN_LLM_COMMAND='claude -p'
+
+or pass --llm-endpoint / --llm-command`)
+
+// ConfigFrom resolves a provider from explicit values and the environment,
+// explicit values first.
+//
+// The token is env-only and has no flag on purpose: everything on a command
+// line is readable in the process table by every user on the machine, and a
+// credential is the one thing here that must not be.
+func ConfigFrom(endpoint, model, command string) Config {
+	if endpoint == "" {
+		endpoint = envx.Get("LLM_ENDPOINT")
 	}
-	if token == "" {
-		return nil, fmt.Errorf("no GitHub token found (set GITHUB_TOKEN or GH_TOKEN)")
+	if command == "" {
+		command = envx.Get("LLM_COMMAND")
 	}
 	if model == "" {
-		model = DefaultModel
+		model = envx.Get("LLM_MODEL")
 	}
+	return Config{Endpoint: endpoint, Model: model, Command: command, Token: tokenFromEnv()}
+}
+
+// tokenFromEnv finds the bearer credential for an endpoint.
+//
+// The provider-specific names are accepted after vexscan's own because they
+// are already exported in the shell of anyone who uses these APIs, and asking
+// them to copy a key into a second variable buys nothing.
+func tokenFromEnv() string {
+	if v := envx.Get("LLM_TOKEN"); v != "" {
+		return v
+	}
+	for _, k := range []string{"OPENAI_API_KEY", "ANTHROPIC_API_KEY"} {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// NewClientWithTransport wraps a Transport the caller built itself.
+func NewClientWithTransport(tr Transport) *Client {
 	return &Client{
-		HTTP:        &http.Client{Timeout: 60 * time.Second},
-		Endpoint:    DefaultEndpoint,
-		Model:       model,
-		Token:       token,
+		Transport:   tr,
 		MinInterval: minIntervalFromEnv(),
 		cache:       make(map[string]*Verdict),
 		hints:       make(map[string]*Hints),
-	}, nil
+	}
+}
+
+// Describe names the provider, for a log line saying who is being asked.
+func (c *Client) Describe() string {
+	if c == nil || c.Transport == nil {
+		return "none"
+	}
+	return c.Transport.Describe()
 }
 
 // minIntervalFromEnv resolves the request spacing, honoring an optional
@@ -124,28 +229,6 @@ func minIntervalFromEnv() time.Duration {
 		return d
 	}
 	return DefaultMinInterval
-}
-
-type chatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type chatRequest struct {
-	Model       string        `json:"model"`
-	Messages    []chatMessage `json:"messages"`
-	Temperature float64       `json:"temperature"`
-}
-
-type chatResponse struct {
-	Choices []struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
-	} `json:"choices"`
-	Error *struct {
-		Message string `json:"message"`
-	} `json:"error"`
 }
 
 // goPrompt is the original prompt, kept verbatim. Changing a word of it would
@@ -323,60 +406,24 @@ func (c *Client) Assess(ctx context.Context, r Request) (*Verdict, error) {
 }
 
 // chat sends one system/user exchange and returns the model's reply text,
-// retrying the failures that are worth retrying.
+// retrying the failures the transport says are worth retrying.
 func (c *Client) chat(ctx context.Context, system, user string) (string, error) {
-	body, err := json.Marshal(chatRequest{
-		Model:       c.Model,
-		Temperature: 0,
-		Messages: []chatMessage{
-			{Role: "system", Content: system},
-			{Role: "user", Content: user},
-		},
-	})
-	if err != nil {
-		return "", err
+	if c.Transport == nil {
+		return "", errors.New("llm: no transport configured")
 	}
-
 	const maxAttempts = 6
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		c.throttle(ctx)
-		res, raw, err := c.do(ctx, body)
-		if err != nil {
-			lastErr = err
-			if !sleepBeforeRetry(ctx, attempt, maxAttempts, 0) {
-				return "", err
-			}
-			continue
+		out, err := c.Transport.Chat(ctx, system, user)
+		if err == nil {
+			return out, nil
 		}
-
-		// The API does not always return JSON: rate limiting, gateway timeouts
-		// and auth failures can come back as plain text or HTML. Decode
-		// defensively and prefer the HTTP status when the body isn't JSON.
-		var cr chatResponse
-		decodeErr := json.Unmarshal(raw, &cr)
-
-		if res.StatusCode != http.StatusOK {
-			if decodeErr == nil && cr.Error != nil && cr.Error.Message != "" {
-				lastErr = fmt.Errorf("github models: %s (status %d)", cr.Error.Message, res.StatusCode)
-			} else {
-				lastErr = fmt.Errorf("github models: status %d: %s", res.StatusCode, snippet(raw))
-			}
-			if isRetryable(res.StatusCode) && sleepBeforeRetry(ctx, attempt, maxAttempts, retryAfter(res)) {
-				continue
-			}
-			return "", lastErr
+		lastErr = err
+		again, hint := retryHint(err)
+		if !again || !sleepBeforeRetry(ctx, attempt, maxAttempts, hint) {
+			return "", err
 		}
-		if decodeErr != nil {
-			return "", fmt.Errorf("github models: could not parse response: %s", snippet(raw))
-		}
-		if cr.Error != nil && cr.Error.Message != "" {
-			return "", fmt.Errorf("github models: %s", cr.Error.Message)
-		}
-		if len(cr.Choices) == 0 {
-			return "", fmt.Errorf("github models: empty response")
-		}
-		return cr.Choices[0].Message.Content, nil
 	}
 	return "", lastErr
 }
@@ -422,56 +469,6 @@ func (c *Client) throttle(ctx context.Context) {
 		}
 	}
 	c.lastReq = time.Now()
-}
-
-// do sends one request and returns the response (with a drained body) and the
-// raw body bytes.
-func (c *Client) do(ctx context.Context, body []byte) (*http.Response, []byte, error) {
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.Endpoint, bytes.NewReader(body))
-	if err != nil {
-		return nil, nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.Token)
-	httpReq.Header.Set("Accept", "application/json")
-
-	res, err := c.HTTP.Do(httpReq)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer res.Body.Close()
-
-	raw, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
-	if err != nil {
-		return nil, nil, err
-	}
-	return res, raw, nil
-}
-
-// isRetryable reports whether an HTTP status warrants another attempt.
-func isRetryable(status int) bool {
-	return status == http.StatusTooManyRequests || status >= 500
-}
-
-// retryAfter parses the Retry-After header into a duration. GitHub Models sends
-// a delay in seconds, but the header may also be an HTTP date; both are handled.
-func retryAfter(res *http.Response) time.Duration {
-	if res == nil {
-		return 0
-	}
-	v := strings.TrimSpace(res.Header.Get("Retry-After"))
-	if v == "" {
-		return 0
-	}
-	if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
-		return time.Duration(secs) * time.Second
-	}
-	if t, err := http.ParseTime(v); err == nil {
-		if d := time.Until(t); d > 0 {
-			return d
-		}
-	}
-	return 0
 }
 
 // sleepBeforeRetry waits before the next attempt, using the server-provided

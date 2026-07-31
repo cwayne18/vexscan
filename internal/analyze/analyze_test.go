@@ -17,7 +17,7 @@ import (
 	"github.com/cwayne18/vexscan/internal/osv"
 )
 
-// llmServer stands in for the GitHub Models endpoint, recording the user
+// llmServer stands in for an OpenAI-compatible endpoint, recording the user
 // message of every request so a test can assert what the overlay asked about.
 type llmServer struct {
 	srv *httptest.Server
@@ -52,11 +52,10 @@ func newLLMServer(t *testing.T, status int, verdict string) (*llm.Client, *llmSe
 	}))
 	t.Cleanup(rec.srv.Close)
 
-	c, err := llm.NewClient("test-model", "test-token")
+	c, err := llm.NewClient(llm.Config{Endpoint: rec.srv.URL, Model: "test-model", Token: "test-token"})
 	if err != nil {
 		t.Fatalf("llm.NewClient: %v", err)
 	}
-	c.Endpoint = rec.srv.URL
 	c.MinInterval = 0
 	return c, rec
 }
