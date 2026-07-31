@@ -224,12 +224,6 @@ func Readers() []Reader {
 	return []Reader{&PyPI{}, &NPM{}, &Maven{}}
 }
 
-// skipDirs are kernel filesystems. An extracted image should not contain them,
-// but a tar built from a running container does, and walking them is pure cost.
-var skipDirs = map[string]bool{
-	"/proc": true, "/sys": true, "/dev": true,
-}
-
 // FindRoots walks the tree once and returns, per format, what holds that
 // format's installed packages: a directory for most, an archive file for a
 // FileReader.
@@ -266,7 +260,7 @@ func FindRoots(fsys target.RootFS) (map[Format][]string, error) {
 			}
 			return nil
 		}
-		if skipDirs[name] {
+		if target.IsKernelFS(name) {
 			return fs.SkipDir
 		}
 		format, ok := want[path.Base(name)]

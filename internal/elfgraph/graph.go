@@ -11,12 +11,6 @@ import (
 	"github.com/cwayne18/vexscan/internal/target"
 )
 
-// skipDirs are kernel filesystems. An extracted image should not contain them,
-// but a tar built from a running container does, and walking them is pure cost.
-var skipDirs = map[string]bool{
-	"/proc": true, "/sys": true, "/dev": true,
-}
-
 // binDirs are where an escalated closure looks for executables to root at, on
 // top of whatever the image config's PATH names.
 var binDirs = []string{
@@ -153,7 +147,7 @@ func Build(fsys target.RootFS, opts Options) (*Graph, error) {
 func (g *Graph) index(opts Options) error {
 	err := g.fsys.Walk("/", func(name string, d fs.DirEntry) error {
 		if d.IsDir() {
-			if skipDirs[name] {
+			if target.IsKernelFS(name) {
 				return fs.SkipDir
 			}
 			return nil

@@ -57,6 +57,22 @@ type Unreadable struct {
 // incomplete account of the tree.
 func (u Unreadable) Any() bool { return u.Count > 0 }
 
+// IsKernelFS reports whether a tree-absolute directory is a pseudo-filesystem
+// mount point that a walk should not descend into.
+//
+// An extracted image contains none of these, but a rootfs captured from a
+// running system does, and they ship no code: /proc alone is tens of thousands
+// of synthetic entries that stat as regular files. Walk itself does not apply
+// this -- it is a question about what is worth looking at, not about what the
+// tree contains -- so each walker asks.
+func IsKernelFS(name string) bool {
+	switch name {
+	case "/proc", "/sys", "/dev":
+		return true
+	}
+	return false
+}
+
 // RootFS is a read-only view of a filesystem tree that lives in a directory on
 // the host but is addressed by the absolute paths it would have from inside.
 //

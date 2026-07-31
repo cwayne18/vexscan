@@ -107,7 +107,7 @@ func (p *Plugin) DetectImage(context.Context, *target.Image) (bool, error) { ret
 func (p *Plugin) InventoryImage(ctx context.Context, img *target.Image, subjects []ecosystem.Subject) ([]ecosystem.Component, error) {
 	root := img.FS.Root()
 	p.Logf("Scanning for Go binaries...")
-	bins := binscan.FindGoBinaries(root)
+	bins := binscan.FindGoBinaries(img.FS)
 	p.Logf("Found %d Go binaries.", len(bins))
 
 	modules, all := p.wantedModules(subjects)

@@ -20,37 +20,59 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/cwayne18/vexscan/internal/target"
 )
 
-// Binary is a discovered Go binary and its embedded build info.
+// Binary is a discovered Go binary and its embedded build info. Path is a host
+// path, because the two things done with it afterwards -- reading the whole
+// file for pclntab tests, and handing it to govulncheck -- are not
+// tree-relative operations.
 type Binary struct {
 	Path string
 	Info *buildinfo.BuildInfo
 }
 
-// FindGoBinaries walks root and returns every Go binary, keyed by discovery.
-// Non-Go and unreadable files are skipped.
-func FindGoBinaries(root string) []Binary {
+// FindGoBinaries walks the tree and returns every Go binary in it. Non-Go and
+// unreadable files are skipped.
+//
+// It goes through RootFS rather than walking the host directory directly for
+// two reasons that only show up outside image mode. A subtree this walk cannot
+// enter is recorded rather than dropped -- a Go binary nobody looked at is a
+// module the report never mentions, which reads exactly like a module with no
+// advisories against it. And a tree captured from a running system has /proc
+// in it, whose synthetic entries stat as regular files and would each be
+// opened and sniffed.
+func FindGoBinaries(fsys target.RootFS) []Binary {
 	var out []Binary
-	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	_ = fsys.Walk("/", func(name string, d fs.DirEntry) error {
+		if d.IsDir() {
+			if target.IsKernelFS(name) {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		// Symlinks are not followed: Walk visits every regular file exactly
+		// once under its own path, so a binary reachable under three names is
+		// still one binary.
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		host, err := fsys.HostPath(name)
 		if err != nil {
 			return nil
 		}
-		if d.IsDir() || !d.Type().IsRegular() {
+		if !looksExecutable(host) {
 			return nil
 		}
-		if !looksExecutable(path) {
-			return nil
-		}
-		info, err := buildinfo.ReadFile(path)
+		info, err := buildinfo.ReadFile(host)
 		if err != nil || info == nil {
 			return nil
 		}
-		out = append(out, Binary{Path: path, Info: info})
+		out = append(out, Binary{Path: host, Info: info})
 		return nil
 	})
 	return out
