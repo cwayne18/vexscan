@@ -1,6 +1,7 @@
 package pkgdb
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,9 +15,48 @@ import (
 // between them cover every filename shape dpkg produces. The status file is
 // untouched: parsing a database someone else wrote is the entire job, so the
 // fixture is not one this code's author got to design.
+//
+// The fixture is materialised into a temp directory rather than read in place
+// because of the one filename shape that matters most here. dpkg writes the
+// multiarch lists as "libc6:amd64.list", and a module zip cannot contain a
+// colon: the punctuation a module file path may use is "!#$%&()+,-.=@[]^_{}~"
+// and nothing else, so one such file makes "go install" of this module fail
+// for everyone, on every platform, before a line of it is compiled. The files
+// are stored %3A-escaped and the colon is put back here, which keeps the name
+// the parser sees byte-for-byte what dpkg wrote while keeping the repository
+// installable. TestTrackedFilesCanGoInAModuleZip pins the rule.
 func debianFS(t *testing.T) target.RootFS {
 	t.Helper()
-	return target.NewDirFS(filepath.Join("testdata", "debian12"))
+	return target.NewDirFS(unescapeTree(t, filepath.Join("testdata", "debian12")))
+}
+
+// unescapeTree copies a fixture tree into a temp directory, turning %3A in any
+// path element back into a colon.
+func unescapeTree(t *testing.T, src string) string {
+	t.Helper()
+	dst := t.TempDir()
+	err := filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		out := filepath.Join(dst, strings.ReplaceAll(rel, "%3A", ":"))
+		if d.IsDir() {
+			return os.MkdirAll(out, 0o755)
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(out, b, 0o644)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dst
 }
 
 func TestDebReadsARealDebianStatus(t *testing.T) {
