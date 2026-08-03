@@ -23,6 +23,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/cwayne18/vexscan/internal/cvss"
 )
 
 // DefaultBaseURL is the OSV v1 API root. Endpoints are derived from it.
@@ -81,6 +83,69 @@ type Advisory struct {
 	// records), in which case callers should fall back to module granularity,
 	// and always empty for non-Go ecosystems.
 	Pkgs []string
+
+	// CVSSVector is the CVSS:3.0 or CVSS:3.1 base vector the record publishes,
+	// empty when it publishes none or publishes only a version this tool does
+	// not score. It is kept as the string rather than only as a number so a
+	// report can show the metrics behind a rating someone disputes.
+	CVSSVector string
+	// PublisherSeverity is the qualitative rating the database itself assigned,
+	// verbatim. Empty when the record carries no label.
+	//
+	// It is kept separate from CVSSVector because the two are independent
+	// claims that disagree more often than one would expect. See Severity.
+	PublisherSeverity string
+}
+
+// Severity is the rating to display for this advisory: the more severe of what
+// the publisher said and what its CVSS v3 vector computes to.
+//
+// Taking the maximum is not indecision about a conflict. It is the only rule
+// available here that never demotes a finding on a metadata technicality. The
+// two sources disagree in both directions -- measured across 442 GHSA records,
+// the v3 vector is milder than GitHub's own label 27 times and harsher 20
+// times -- so neither "always trust the vector" nor "always trust the label"
+// avoids quietly lowering the severity of some real findings.
+//
+// Neither source is wrong. GitHub rates the advisory, increasingly against the
+// CVSS 4.0 vector it also publishes and this tool deliberately does not score,
+// while the v3 vector is a separate and older statement about the same flaw.
+// The computed score cannot simply be dropped in the label's favour either: a
+// Debian record carries a vector and no label at all, and scoring it is what
+// makes it comparable with a GHSA one in the same table.
+//
+// Erring upward costs a reader time on a finding milder than billed. Erring
+// downward costs them the finding.
+func (a *Advisory) Severity() string {
+	computed := cvss.Unknown
+	if score, ok := a.CVSSScore(); ok {
+		computed = cvss.Label(score)
+	}
+	published := cvss.Normalize(a.PublisherSeverity)
+
+	// An absent rating loses to any real one. This is checked before the
+	// comparison rather than folded into it because cvss.Rank is a display
+	// order, in which UNKNOWN deliberately sorts above MEDIUM so that
+	// unrated findings are not scrolled past -- correct for laying out a
+	// table, and exactly wrong for choosing between two candidate ratings,
+	// where it would let "nobody said" outrank a source that did.
+	switch {
+	case published == cvss.Unknown:
+		return computed
+	case computed == cvss.Unknown:
+		return published
+	case cvss.Rank(published) < cvss.Rank(computed):
+		return published
+	default:
+		return computed
+	}
+}
+
+// CVSSScore returns the base score for the advisory's vector. The bool is false
+// when there is no vector, or it is a version this tool does not score, and
+// callers must not read that as a score of zero -- 0.0 is a real CVSS answer.
+func (a *Advisory) CVSSScore() (float64, bool) {
+	return cvss.Score(a.CVSSVector)
 }
 
 // Client queries the OSV API.
@@ -152,10 +217,21 @@ type queryRequest struct {
 }
 
 type vuln struct {
-	ID       string   `json:"id"`
-	Aliases  []string `json:"aliases"`
-	Summary  string   `json:"summary"`
-	Details  string   `json:"details"`
+	ID      string   `json:"id"`
+	Aliases []string `json:"aliases"`
+	Summary string   `json:"summary"`
+	Details string   `json:"details"`
+	// Severity is OSV's list of scores, one per scoring system. A record may
+	// carry a CVSS_V3 entry, a CVSS_V4 entry, both, or neither.
+	Severity []struct {
+		Type  string `json:"type"`
+		Score string `json:"score"`
+	} `json:"severity"`
+	// DatabaseSpecific is a free-form object whose contents depend on the
+	// publishing database. Only "severity" is read, and only GitHub sets it.
+	DatabaseSpecific struct {
+		Severity string `json:"severity"`
+	} `json:"database_specific"`
 	Affected []struct {
 		Package struct {
 			Name string `json:"name"`
@@ -375,11 +451,13 @@ func normalizeVersion(ref Ref) string {
 
 func buildMap(ref Ref, vulns []vuln) map[string]*Advisory {
 	out := map[string]*Advisory{}
+	kept := make([]*Advisory, 0, len(vulns))
 	for _, v := range vulns {
 		if !appliesToRelease(ref, v) {
 			continue
 		}
 		adv := advisoryFor(ref, v)
+		kept = append(kept, adv)
 		for _, key := range append([]string{v.ID}, v.Aliases...) {
 			if key == "" {
 				continue
@@ -391,7 +469,42 @@ func buildMap(ref Ref, vulns []vuln) map[string]*Advisory {
 			}
 		}
 	}
+	borrowSeverity(out, kept)
 	return out
+}
+
+// borrowSeverity fills in a winning advisory's missing severity from another
+// record for the same vulnerability.
+//
+// The preference above is about import paths, and for Go it systematically
+// picks the record that has no severity: a GO- record publishes the vulnerable
+// packages and no rating at all, while the GHSA record aliased to it publishes
+// a vector and a label and no packages. Without this, every Go finding would
+// report UNKNOWN while the answer sat in a record already fetched, decoded and
+// discarded in the same call.
+//
+// Two records sharing an identifier are two descriptions of one vulnerability,
+// so taking severity from the other is not mixing sources -- it is reading the
+// half of the same advisory that the packages did not come from. Only empty
+// fields are filled; a record that stated its own rating keeps it.
+func borrowSeverity(out map[string]*Advisory, kept []*Advisory) {
+	for _, adv := range kept {
+		if adv.CVSSVector == "" && adv.PublisherSeverity == "" {
+			continue
+		}
+		for _, key := range append([]string{adv.ID}, adv.Aliases...) {
+			winner, ok := out[key]
+			if !ok || winner == adv {
+				continue
+			}
+			if winner.CVSSVector == "" {
+				winner.CVSSVector = adv.CVSSVector
+			}
+			if winner.PublisherSeverity == "" {
+				winner.PublisherSeverity = adv.PublisherSeverity
+			}
+		}
+	}
 }
 
 // appliesToRelease reports whether an advisory names a product of ref.Release.
@@ -413,7 +526,14 @@ func appliesToRelease(ref Ref, v vuln) bool {
 }
 
 func advisoryFor(ref Ref, v vuln) *Advisory {
-	adv := &Advisory{ID: v.ID, Aliases: v.Aliases, Summary: v.Summary, Details: v.Details}
+	adv := &Advisory{
+		ID:                v.ID,
+		Aliases:           v.Aliases,
+		Summary:           v.Summary,
+		Details:           v.Details,
+		CVSSVector:        cvssVector(v),
+		PublisherSeverity: v.DatabaseSpecific.Severity,
+	}
 
 	// ecosystem_specific.imports is a Go-database field. Reading it for any
 	// other ecosystem yields an empty list that is indistinguishable from "OSV
@@ -440,6 +560,25 @@ func advisoryFor(ref Ref, v vuln) *Advisory {
 		adv.Pkgs = append(adv.Pkgs, p)
 	}
 	return adv
+}
+
+// cvssVector picks the scorable base vector out of a record's severity list.
+//
+// The list is keyed by scoring system and a record may hold several: a GHSA
+// commonly publishes CVSS_V3 and CVSS_V4 side by side. Only a v3 vector is
+// returned, because that is the only one internal/cvss will score, and the
+// entry's own type is not trusted to say which -- the vector string carries its
+// own version prefix, and honouring that rather than the label means a record
+// that files a 4.0 vector under a CVSS_V3 type cannot be scored with the wrong
+// formula.
+func cvssVector(v vuln) string {
+	for _, s := range v.Severity {
+		vector := strings.TrimSpace(s.Score)
+		if strings.HasPrefix(vector, "CVSS:3.0/") || strings.HasPrefix(vector, "CVSS:3.1/") {
+			return vector
+		}
+	}
+	return ""
 }
 
 // retry runs fn up to three times, backing off a second per attempt. A

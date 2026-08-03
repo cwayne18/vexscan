@@ -762,8 +762,89 @@ is non-fatal either way: the finding is still reported, just without a verdict.
 
 ## Output
 
-`--format text` is for reading; `--format json` is for keeping. The JSON is
-`schema_version: 2`:
+`--format text` is for reading; `--format json` is for keeping.
+
+### The text report
+
+Findings are grouped by what you have to do about them and sorted by severity.
+Abridged from `--image debian:12 --all --ecosystem os` (170 lines in full):
+
+```
+vexscan report (image) for debian:12
+
+  os       Debian:12                  88 components   159 findings
+  affected by severity: 10 critical, 26 high, 34 unknown, 73 medium, 9 low
+
+AFFECTED (152) - vulnerable code is present and can be loaded
+SEVERITY  ADVISORY          PACKAGE             VERSION                 BASIS
+CRITICAL  CVE-2019-1010022  libc6               2.36-9+deb12u14         elf-needed-closure
+MEDIUM    CVE-2022-27943    libgcc-s1           12.2.0-14+deb12u1       elf-needed-closure
+MEDIUM    CVE-2022-27943    libstdc++6          12.2.0-14+deb12u1       elf-needed-closure
+
+RULED OUT (7) - the vulnerable code is not present or cannot run
+SEVERITY  ADVISORY        PACKAGE         VERSION            BASIS
+HIGH      CVE-2025-8941   libpam-runtime  1.5.2-6+deb12u2    pkgdb-no-code
+MEDIUM    CVE-2022-27943  gcc-12-base     12.2.0-14+deb12u1  pkgdb-no-code
+```
+
+Three sections — `AFFECTED` (`linked`, `reachable`), `UNDETERMINED`, `RULED OUT`
+(`not_present`, `not_in_execute_path`) — and an empty one is not printed. Ruled
+out is last but still printed in full: it is the tool's proof of work, and the
+reason the short list above it is believable. A `VERDICT` column appears only
+when a section holds more than one status, so a Debian image (everything
+`linked`) does not get a column repeating that 152 times, and a repo scan mixing
+`linked` and `reachable` gets one automatically.
+
+`PACKAGE` is the **installed** package, not the source package the advisory is
+filed against. Those differ constantly and the difference is load-bearing:
+`CVE-2022-27943` is filed against Debian's `gcc-12` source, which ships as
+`gcc-12-base` (no ELF object, so ruled out), `libgcc-s1` and `libstdc++6` (both
+linked). Printing the source name would show the same row three times with two
+contradictory verdicts. The source package is shown under `--details`, where it
+differs.
+
+`BASIS` is `method` verbatim rather than a sentence, because one method means
+different things under different statuses (`elf-needed-closure` covers
+not-in-path, linked-with-taint and linked-and-loaded) and prose per row would
+drift from what the method asserts. `ADVISORY` drops a distro prefix only when a
+well-formed CVE id remains, so `DEBIAN-CVE-2022-27943` prints as
+`CVE-2022-27943` and a `DSA-5678-1` is left alone; the full OSV id stays in the
+JSON and in `--details`.
+
+`--details` prints the full evidence block under each row — every field above
+plus `purl`, `evidence` and the plugin's own characterization of the
+reachability. That is the pre-table output, and it is verbose on purpose: the
+same scan is 3,990 lines.
+
+### Severity
+
+`SEVERITY` is scored from the CVSS vector OSV already returns with each
+advisory, so it costs no extra requests. Where a publisher also states a label
+(GitHub does, as `MODERATE`/`HIGH`/…), the **more severe** of the two is used —
+measured over 442 GHSA records the vector is milder than GitHub's own label 27
+times and harsher 20 times, so neither source can be trusted to be the ceiling.
+Erring upward costs a reader time on a finding milder than billed; erring
+downward costs them the finding.
+
+`UNKNOWN` sorts above `MEDIUM`, deliberately. A severity nobody published is not
+evidence that the problem is small, and in a report several hundred rows long
+anything sorted to the bottom stops being read.
+
+Two things report `UNKNOWN` that are worth knowing about:
+
+- **CVSS 4.0-only records are not scored.** A v4 base score is a 270-entry
+  MacroVector lookup with interpolation, not a formula. Records carrying only a
+  v4 vector report `UNKNOWN` rather than a number this tool made up. Most
+  advisories still publish v3 alongside; on `debian:12` 34 of 159 findings are
+  unrated, from a mix of v4-only and pre-CVSS records.
+- **`--repo` Go findings carry no severity at all.** That path resolves
+  advisories inside govulncheck, which is run with `-format openvex`, and OpenVEX
+  carries no severity field. Image mode goes entirely through the resolver and is
+  fully covered — on `debian:12 --all` every finding gets a rating.
+
+### JSON
+
+The JSON is `schema_version: 2`:
 
 ```jsonc
 {
@@ -777,7 +858,9 @@ is non-fatal either way: the finding is still reported, just without a verdict.
 
 Each finding carries ecosystem-neutral identity (`ecosystem`, `id`, `package`,
 `version`, `location`, `purl`) plus `status`, `method`, `justification` and
-`evidence`. The v1 Go spellings (`cve`, `module`, `binary`, `go_id`, `packages`,
+`evidence`, and `severity`/`cvss` when an advisory was resolved for it. Both are
+omitted when none was, which is not the same fact as `UNKNOWN`. The v1 Go
+spellings (`cve`, `module`, `binary`, `go_id`, `packages`,
 `granularity`, `stripped`) are still emitted for Go findings, mirrored from the
 neutral fields so they cannot drift.
 
@@ -837,6 +920,7 @@ be read, or part of the tree could not be read, `2` the command line was wrong.
 | `--llm-command` | | Run this installed CLI instead of an endpoint, e.g. `'claude -p'` |
 | `--mine-advisories` | `false` | With `--llm`, mine advisory prose for symbols and module paths to check |
 | `--format` | `text` | `text`, `json`, or `inventory` |
+| `--details` | `false` | With `--format text`, print the full evidence block under each row instead of the table alone |
 | `--out` | *(stdout)* | Write output to a file |
 | `--gist` | `false` | Also upload the output to a public gist and print its URL (token needs `gist` scope) |
 | `--gist-secret` | `false` | With `--gist`, create a secret (unlisted) gist |

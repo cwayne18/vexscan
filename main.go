@@ -48,6 +48,7 @@ func main() {
 		llmModel   = flag.String("llm-model", "", "model id for --llm-endpoint (env: VEXSCAN_LLM_MODEL; default gpt-4o)")
 		llmCommand = flag.String("llm-command", "", "for --llm, run this installed CLI instead of calling an endpoint, e.g. 'claude -p'; the prompt arrives on its stdin (env: VEXSCAN_LLM_COMMAND)")
 		format     = flag.String("format", "text", "output format: text, json, or inventory (list the image's OS packages and exit)")
+		details    = flag.Bool("details", false, "with --format text, print the full evidence block under each row instead of the table alone")
 		out        = flag.String("out", "", "write output to this file instead of stdout")
 		gistFlag   = flag.Bool("gist", false, "also upload the output to a public GitHub gist and print its URL (needs GITHUB_TOKEN/GH_TOKEN with gist scope)")
 		gistSecret = flag.Bool("gist-secret", false, "with --gist, create a secret (unlisted) gist instead of a public one")
@@ -165,7 +166,7 @@ func main() {
 		}
 		rendered = string(b) + "\n"
 	default: // --format was validated up front; inventory returned earlier
-		rendered = renderText(res)
+		rendered = renderText(res, *details)
 	}
 
 	if *out != "" {
@@ -371,129 +372,6 @@ func parseCVEs(flagVal, file string) []string {
 	return out
 }
 
-func renderText(res *analyze.Result) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "vexscan report (%s) for %s\n", res.Mode, res.Target)
-	if res.Module != "" {
-		fmt.Fprintf(&b, "module: %s\n", res.Module)
-	}
-	for _, e := range res.Ecosystems {
-		if e.Error != "" {
-			// Above the findings, not below: a reader who stops after the
-			// summary must still see that part of the target went unexamined.
-			fmt.Fprintf(&b, "INCOMPLETE: ecosystem %s did not run - %s\n", e.ID, e.Error)
-		}
-	}
-	if u := res.Unreadable; u != nil && u.Any() {
-		// Same placement, same reason. The paths are named because the usual
-		// cause is scanning a root-owned tree as someone else, and the fix --
-		// re-run it as root -- is only obvious once you can see what was missed.
-		fmt.Fprintf(&b, "INCOMPLETE: %d path(s) could not be read, so this report does not account for them:\n", u.Count)
-		for _, p := range u.Paths {
-			fmt.Fprintf(&b, "  %s\n", p)
-		}
-		if u.Count > len(u.Paths) {
-			fmt.Fprintf(&b, "  ... and %d more\n", u.Count-len(u.Paths))
-		}
-	}
-	b.WriteString("\n")
-
-	if len(res.Findings) == 0 {
-		// Empty because nothing was wrong and empty because nothing was read
-		// look identical, and only one of them is good news.
-		if res.Failed() {
-			b.WriteString("No findings, but the scan was incomplete: see above.\n")
-			b.WriteString("This is not a clean result.\n")
-		} else {
-			b.WriteString("No findings: nothing selected was found in this target,\n")
-			b.WriteString("or no matching advisories were published for it.\n")
-		}
-		return b.String()
-	}
-
-	// Group by status for a readable summary.
-	counts := map[analyze.Status]int{}
-	for _, f := range res.Findings {
-		counts[f.Status]++
-	}
-	fmt.Fprintf(&b, "summary: %d not_present, %d not_in_execute_path, %d linked, %d reachable, %d undetermined\n\n",
-		counts[analyze.StatusNotPresent], counts[analyze.StatusNotInPath],
-		counts[analyze.StatusLinked], counts[analyze.StatusReachable],
-		counts[analyze.StatusUndetermined])
-
-	for _, f := range res.Findings {
-		id := f.CVE
-		if f.GoID != "" && f.GoID != f.CVE {
-			id = fmt.Sprintf("%s (%s)", f.CVE, f.GoID)
-		}
-		fmt.Fprintf(&b, "%-22s %s\n", statusLabel(f.Status), component(f))
-		fmt.Fprintf(&b, "  cve:      %s\n", id)
-		if f.Ecosystem != "" {
-			fmt.Fprintf(&b, "  from:     %s\n", f.Ecosystem)
-		}
-		if f.Binary != "" {
-			fmt.Fprintf(&b, "  binary:   %s%s\n", f.Binary, strippedNote(f.Stripped))
-		}
-		if len(f.Packages) > 0 {
-			fmt.Fprintf(&b, "  packages: %s (%s)\n", strings.Join(f.Packages, ", "), f.Granularity)
-		}
-		if f.Justification != "" {
-			fmt.Fprintf(&b, "  vex:      %s [%s]\n", f.Justification, f.Method)
-		} else if f.Method != "" && f.Status == analyze.StatusReachable {
-			fmt.Fprintf(&b, "  method:   %s\n", f.Method)
-		}
-		if f.Reason != "" {
-			fmt.Fprintf(&b, "  reason:   %s\n", f.Reason)
-		}
-		if f.LLM != nil {
-			fmt.Fprintf(&b, "  llm:      exploitable=%s confidence=%s\n", f.LLM.Exploitable, f.LLM.Confidence)
-			if f.LLM.Rationale != "" {
-				fmt.Fprintf(&b, "            %s\n", f.LLM.Rationale)
-			}
-		}
-		b.WriteString("\n")
-	}
-	return b.String()
-}
-
-func statusLabel(s analyze.Status) string {
-	switch s {
-	case analyze.StatusNotPresent:
-		return "[NOT PRESENT]"
-	case analyze.StatusNotInPath:
-		return "[NOT REACHABLE]"
-	case analyze.StatusLinked:
-		return "[LINKED]"
-	case analyze.StatusReachable:
-		return "[REACHABLE]"
-	default:
-		return "[UNDETERMINED]"
-	}
-}
-
-// component names what a finding is about. An id that matched nothing in the
-// target has no component at all, and printing "@" for it would look like a
-// package whose name failed to render.
-func component(f analyze.Finding) string {
-	switch {
-	case f.Package == "":
-		return "(no matching component)"
-	case f.Version == "":
-		return f.Package
-	default:
-		return f.Package + "@" + f.Version
-	}
-}
-
-// strippedNote annotates a binary that carries no symbol table. Nil means the
-// question does not apply: an OS package is not a Go binary.
-func strippedNote(stripped *bool) string {
-	if stripped != nil && *stripped {
-		return " (stripped)"
-	}
-	return ""
-}
-
 func usage() {
 	// WriteString rather than Fprint: the purl example contains %2F, which vet
 	// reads as a stray formatting directive in anything Printf-shaped.
@@ -545,8 +423,11 @@ Examples:
   # One OS package, with the shared-library closure as the presence test
   vexscan --image debian:12 --package deb:openssl
 
-  # Everything the image installs, OS packages only
+  # Everything the image installs, OS packages only -- a table sorted by severity
   vexscan --image registry.access.redhat.com/ubi9/ubi:latest --all --ecosystem os
+
+  # ... and the evidence behind every row of it
+  vexscan --image registry.access.redhat.com/ubi9/ubi:latest --all --ecosystem os --details
 
   # One Python distribution, by any spelling of its name
   vexscan --image python:3.12-slim --package pypi:PyYAML

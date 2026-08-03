@@ -10,6 +10,7 @@ package ecosystem
 
 import (
 	"context"
+	"net/url"
 	"sort"
 	"strings"
 
@@ -377,6 +378,18 @@ type Finding struct {
 	// unstripped.
 	Stripped *bool `json:"stripped,omitempty"`
 
+	// Severity is the advisory's rating, in the vocabulary of internal/cvss,
+	// and CVSS is the v3 base vector it was computed from when the record
+	// published one. Plugins do not set these: the orchestrator fills them
+	// from advisories it has already fetched, for the same reason it stamps
+	// Ecosystem, so no plugin can forget to.
+	//
+	// Empty means no advisory data was resolved for the finding at all, which
+	// is not the same as UNKNOWN -- that is a record which was read and
+	// published no rating.
+	Severity string `json:"severity,omitempty"`
+	CVSS     string `json:"cvss,omitempty"`
+
 	Status        Status       `json:"status"`
 	Method        string       `json:"method,omitempty"`
 	Justification string       `json:"justification,omitempty"`
@@ -396,6 +409,70 @@ type Finding struct {
 // should be asked about and a reader should act on.
 func (f Finding) Affected() bool {
 	return f.Status == StatusLinked || f.Status == StatusReachable
+}
+
+// osPURLTypes are the purl types whose namespace is a distribution rather than
+// part of the package's name.
+var osPURLTypes = map[string]bool{"deb": true, "rpm": true, "apk": true}
+
+// Component is the installed artifact's own name: the binary package, not the
+// source package the advisory is filed against.
+//
+// For an OS package these differ, and printing Package instead makes the report
+// appear to contradict itself. One Debian source package fans out into several
+// binary packages with genuinely different answers -- gcc-12 ships gcc-12-base,
+// which contains no ELF object and is not_present, alongside libgcc-s1 and
+// libstdc++6, which are linked -- and all three are filed under the same
+// advisory. Rendered as "gcc-12" they are three identical-looking rows with two
+// different verdicts. The binary name is the thing that tells them apart, and
+// it survives only in the purl.
+//
+// For every other ecosystem this returns exactly what Package does, so the
+// distinction stays confined to the case where it is real. Anything unparseable
+// falls back to Package: a name that is merely coarse beats no name at all.
+func (f Finding) Component() string {
+	if name, ok := purlName(f.PURL); ok {
+		return name
+	}
+	return f.Package
+}
+
+// purlName pulls the binary package name out of an OS package URL.
+//
+// Only the OS types are handled. For npm the namespace is half the name and for
+// Go the whole path is the name, so re-deriving those from the purl would be
+// work that can only introduce a disagreement with what Package already says
+// correctly.
+func purlName(purl string) (string, bool) {
+	body, ok := strings.CutPrefix(purl, "pkg:")
+	if !ok {
+		return "", false
+	}
+	// Qualifiers ("?arch=amd64") and the subpath are not part of the name.
+	if i := strings.IndexAny(body, "?#"); i >= 0 {
+		body = body[:i]
+	}
+	typ, rest, found := strings.Cut(body, "/")
+	if !found || !osPURLTypes[strings.ToLower(typ)] {
+		return "", false
+	}
+	if at := strings.LastIndex(rest, "@"); at >= 0 {
+		rest = rest[:at]
+	}
+	// What remains is "<distro>/<name>" or a bare "<name>"; the namespace is
+	// the distribution and carries nothing a reader needs here.
+	if i := strings.LastIndex(rest, "/"); i >= 0 {
+		rest = rest[i+1:]
+	}
+	// purl percent-encodes reserved characters. Package names rarely contain
+	// any, but decoding failure must not lose the name.
+	if decoded, err := url.PathUnescape(rest); err == nil {
+		rest = decoded
+	}
+	if rest == "" {
+		return "", false
+	}
+	return rest, true
 }
 
 // EcosystemResult records how one plugin fared, independently of its findings.

@@ -88,7 +88,7 @@ func TestRenderersSayWhenPartOfTheTreeWasNotRead(t *testing.T) {
 	res := renderText(&analyze.Result{
 		SchemaVersion: analyze.SchemaVersion, Target: "/mnt/rootfs", Mode: "rootfs",
 		Unreadable: unreadable,
-	})
+	}, false)
 
 	for name, got := range map[string]string{"inventory": inv, "report": res} {
 		if !strings.Contains(got, "INCOMPLETE") {

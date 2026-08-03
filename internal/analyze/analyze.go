@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/cwayne18/vexscan/internal/cvss"
 	"github.com/cwayne18/vexscan/internal/ecosystem"
 	"github.com/cwayne18/vexscan/internal/ecosystem/golang"
 	"github.com/cwayne18/vexscan/internal/ecosystem/maven"
@@ -470,6 +471,7 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 		}
 	}
 
+	severityOverlay(result.Findings, run.resolver.severities())
 	llmOverlay(ctx, llmClient, result.Findings, "", logf)
 	sortFindings(result.Findings)
 	return result, nil
@@ -606,6 +608,7 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 	}
 	result.Findings = append(result.Findings, unmapped(opts.CVEs, result.Findings)...)
 
+	severityOverlay(result.Findings, run.resolver.severities())
 	llmOverlay(ctx, llmClient, result.Findings, "source tree", logf)
 	sortFindings(result.Findings)
 	return result, nil
@@ -779,6 +782,76 @@ func (r *advisoryResolver) advisories(ctx context.Context, c ecosystem.Component
 	adv = merge(results)
 	r.cache[c.Key()] = adv
 	return adv
+}
+
+// severity is the display rating for one advisory, and the vector it came from.
+type severity struct {
+	label  string
+	vector string
+}
+
+// severities flattens everything the resolver fetched into a lookup from
+// advisory id to its rating.
+//
+// This costs no network traffic at all. Every advisory a finding could be about
+// was already fetched, decoded and cached to decide whether the finding existed;
+// this reads the fields that were sitting in those same records unused.
+//
+// Each advisory is indexed under its own id and under every alias, because a
+// finding names the advisory by whichever id its plugin was working from --
+// ospkg reports DEBIAN-CVE-2022-27943 while a caller may have asked about
+// CVE-2022-27943, and workItems already treats the two as interchangeable.
+func (r *advisoryResolver) severities() map[string]severity {
+	out := map[string]severity{}
+	for _, set := range r.cache {
+		for _, adv := range set {
+			if adv == nil {
+				continue
+			}
+			s := severity{label: adv.Severity(), vector: adv.CVSSVector}
+			for _, key := range append([]string{adv.ID}, adv.Aliases...) {
+				if key == "" {
+					continue
+				}
+				// A key can arrive from more than one component's query. Keep
+				// the more severe reading rather than letting map iteration
+				// order decide, so a repeated scan cannot report two different
+				// severities for the same advisory.
+				if prev, ok := out[key]; ok && cvss.Rank(prev.label) <= cvss.Rank(s.label) {
+					continue
+				}
+				out[key] = s
+			}
+		}
+	}
+	return out
+}
+
+// severityOverlay labels each finding with its advisory's severity, in place.
+//
+// It runs in the orchestrator beside llmOverlay, and for the same reason: a
+// plugin cannot forget to do something it does not do. Plugins never see an
+// advisory's metadata -- they are handed a presence question and answer it --
+// so severity has to be attached where the advisories live.
+//
+// A finding whose advisory is not in the map keeps an empty Severity. That is
+// deliberately distinct from UNKNOWN, which means a record was read and
+// published no rating: the renderer needs to be able to tell "nobody rated
+// this" from "we never looked".
+func severityOverlay(findings []Finding, sev map[string]severity) {
+	for i := range findings {
+		f := &findings[i]
+		for _, key := range []string{f.CVE, f.ID, f.GoID} {
+			if key == "" {
+				continue
+			}
+			if s, ok := sev[key]; ok {
+				f.Severity = s.label
+				f.CVSS = s.vector
+				break
+			}
+		}
+	}
 }
 
 // queryNames is the component's OSV names, primary first, deduplicated.
