@@ -21,8 +21,13 @@ import (
 // Plain aligned columns, not box drawing. These reports are pasted into gists,
 // CI logs and terminals of every width, and are grepped and cut. A row that
 // survives all of that is worth more than one that looks better in a
-// screenshot. There is no colour for the same reason, and because nothing in
-// this tree detects a tty.
+// screenshot. There is no colour for the same reason.
+//
+// pager.go does look at whether stdout is a tty, which is not a reversal of
+// that: it decides whether to run less, and changes no bytes. Everything here
+// renders identically for a terminal, a file and a pipe -- including the footer
+// below, whose threshold is counted in the report's own lines and never in the
+// terminal's height.
 
 // renderText renders a scan result for humans.
 func renderText(res *analyze.Result, details bool) string {
@@ -54,9 +59,16 @@ func renderText(res *analyze.Result, details bool) string {
 		return b.String()
 	}
 
-	writeSummary(&b, res)
+	writeSummary(&b, res, false)
 	for _, s := range sections(res) {
 		writeSection(&b, s, details)
+	}
+
+	// Long enough that the header is gone: say it all again. Measured on the
+	// report rather than on the terminal, so a file, a gist and a paged
+	// terminal all get the same bytes.
+	if strings.Count(b.String(), "\n") > footerThreshold {
+		writeFooter(&b, res)
 	}
 	return b.String()
 }
@@ -67,12 +79,25 @@ func renderText(res *analyze.Result, details bool) string {
 // The INCOMPLETE banners come before everything else and are unconditional.
 // They are the guarantee that a scan which could not read part of the target
 // never renders as a clean one, and no amount of table formatting below is
-// allowed to push them out of sight.
+// allowed to push them out of sight. That last promise is why writeFooter
+// exists: at 172 lines, the table below pushes them out of sight anyway.
 func writeHeader(b *strings.Builder, res *analyze.Result) {
 	fmt.Fprintf(b, "vexscan report (%s) for %s\n", res.Mode, res.Target)
 	if res.Module != "" {
 		fmt.Fprintf(b, "module: %s\n", res.Module)
 	}
+	writeCaveats(b, res)
+	b.WriteString("\n")
+}
+
+// writeCaveats writes everything that changes how the rows should be read: the
+// INCOMPLETE banners, what --severity withheld, and a VEX hub that could not be
+// reached.
+//
+// Split out of writeHeader so the footer can repeat it verbatim. A caveat that
+// appeared at one end of a long report and not the other would be worse than
+// one printed twice.
+func writeCaveats(b *strings.Builder, res *analyze.Result) {
 	for _, e := range res.Ecosystems {
 		if e.Error != "" {
 			fmt.Fprintf(b, "INCOMPLETE: ecosystem %s did not run - %s\n", e.ID, e.Error)
@@ -114,11 +139,55 @@ func writeHeader(b *strings.Builder, res *analyze.Result) {
 		// reached looks exactly like one with nothing to say.
 		fmt.Fprintf(b, "NOTE: VEX hub %s could not be read, so nothing was moved to ALREADY VEXED - %s\n", h.URL, h.Error)
 	}
-	b.WriteString("\n")
 }
 
-// writeSummary prints one line per ecosystem that ran, then the severity spread.
-func writeSummary(b *strings.Builder, res *analyze.Result) {
+// footerThreshold is how many lines a report may be before it needs its summary
+// repeated at the bottom.
+//
+// A proxy for one screen, and deliberately a count of the report's own lines
+// rather than the terminal's height: the output has to be identical whether it
+// is paged, redirected into a file, or uploaded to a gist, because those are
+// the same bytes and get diffed against each other. Under the threshold nothing
+// has scrolled and the header is still visible, where a second copy of it four
+// lines further down is just noise.
+const footerThreshold = 30
+
+// writeFooter repeats, at the bottom of a long report, the things a reader
+// needed and has already scrolled past.
+//
+// The counts, because "how bad is this" is the question someone asks again
+// after reading 154 rows. The caveats, because an INCOMPLETE banner that only
+// appears above 154 rows is one nobody sees -- and this is also the end a CI
+// log, a piped file and a gist all land on.
+func writeFooter(b *strings.Builder, res *analyze.Result) {
+	writeCaveats(b, res)
+	writeSummary(b, res, true)
+}
+
+// writeSections lists what the report was divided into, with the counts.
+//
+// Built from sections() rather than recounted, so the index cannot claim a
+// heading the report does not have or disagree with one it does.
+func writeSections(b *strings.Builder, res *analyze.Result) {
+	secs := sections(res)
+	parts := make([]string, 0, len(secs))
+	for _, s := range secs {
+		parts = append(parts, fmt.Sprintf("%s (%d)", s.title, len(s.findings)))
+	}
+	if len(parts) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "  %d findings in %d section(s): %s\n",
+		len(res.Findings), len(secs), strings.Join(parts, ", "))
+}
+
+// writeSummary prints one line per ecosystem that ran, then the severity
+// spread, and for the footer an index of the sections below.
+//
+// The index is footer-only because at the top of the report the section
+// headings are the next thing on screen, and listing them there would be
+// telling a reader what they can already see.
+func writeSummary(b *strings.Builder, res *analyze.Result, index bool) {
 	perEco := map[string]int{}
 	for _, f := range res.Findings {
 		perEco[f.Ecosystem]++
@@ -159,6 +228,9 @@ func writeSummary(b *strings.Builder, res *analyze.Result) {
 	}
 	if vexed > 0 {
 		fmt.Fprintf(b, "  already vexed: %d by %s\n", vexed, vexAuthors(res))
+	}
+	if index {
+		writeSections(b, res)
 	}
 	b.WriteString("\n")
 }

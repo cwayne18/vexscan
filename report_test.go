@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -779,5 +780,155 @@ func TestTheSummaryCountsOnlyWhatSurvivedTheFilter(t *testing.T) {
 	}
 	if !strings.Contains(lineWith(t, out, "withheld"), "4 of 7") {
 		t.Errorf("banner does not account for the difference:\n%s", out)
+	}
+}
+
+// The footer: what a reader has scrolled past by the time they reach the
+// bottom of 172 lines.
+
+// longReport renders n affected findings, which is the only way to get a report
+// past footerThreshold.
+func longReport(t *testing.T, n int, mutate func(*analyze.Result)) string {
+	t.Helper()
+	findings := make([]analyze.Finding, 0, n)
+	for i := range n {
+		findings = append(findings, analyze.Finding{
+			Ecosystem: "os",
+			CVE:       fmt.Sprintf("CVE-2024-%04d", i),
+			ID:        fmt.Sprintf("CVE-2024-%04d", i),
+			Package:   "libc6", Module: "libc6", Version: "2.36-9",
+			PURL:     "pkg:deb/debian/libc6@2.36-9?arch=amd64",
+			Status:   analyze.StatusLinked,
+			Method:   "elf-needed-closure",
+			Severity: "HIGH",
+		})
+	}
+	res := &analyze.Result{
+		SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
+		Ecosystems: []ecosystem.EcosystemResult{
+			{ID: "os", Ecosystems: []string{"Debian:12"}, Components: 88},
+		},
+		Findings: findings,
+	}
+	if mutate != nil {
+		mutate(res)
+	}
+	return renderText(res, false)
+}
+
+func TestAShortReportHasNoFooter(t *testing.T) {
+	out := longReport(t, 5, nil)
+	if n := strings.Count(out, "\n"); n > footerThreshold {
+		t.Fatalf("this test needs a report under the threshold; it is %d lines", n)
+	}
+	if got := strings.Count(out, "affected by severity"); got != 1 {
+		t.Errorf("summary appears %d times in a short report, want 1:\n%s", got, out)
+	}
+}
+
+func TestALongReportRepeatsTheSummaryAtTheBottom(t *testing.T) {
+	out := longReport(t, 60, nil)
+	if n := strings.Count(out, "\n"); n <= footerThreshold {
+		t.Fatalf("this test needs a report over the threshold; it is %d lines", n)
+	}
+
+	// Twice, and identically: the reader who scrolled to the bottom is owed the
+	// same numbers as the one who caught the top.
+	var spreads []string
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "affected by severity") {
+			spreads = append(spreads, l)
+		}
+	}
+	if len(spreads) != 2 {
+		t.Fatalf("want the severity spread at both ends, got %d:\n%s", len(spreads), out)
+	}
+	if spreads[0] != spreads[1] {
+		t.Errorf("header says %q but footer says %q", spreads[0], spreads[1])
+	}
+	if !strings.Contains(spreads[0], "60 high") {
+		t.Errorf("spread = %q, want 60 high", spreads[0])
+	}
+}
+
+// The footer is the last thing in the report. A summary with rows under it
+// would be a heading, not a footer.
+func TestTheFooterIsLast(t *testing.T) {
+	out := longReport(t, 60, nil)
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	last := strings.Join(lines[len(lines)-3:], "\n")
+	for _, want := range []string{"88 components", "affected by severity", "findings in"} {
+		if !strings.Contains(last, want) {
+			t.Errorf("last lines are missing %q:\n%s", want, last)
+		}
+	}
+}
+
+func TestTheSectionIndexAgreesWithTheHeadings(t *testing.T) {
+	out := longReport(t, 60, func(res *analyze.Result) {
+		res.Findings = append(res.Findings, gccTrio[0]) // one not_present row
+	})
+	index := lineWith(t, out, "findings in")
+	for _, want := range []string{"61 findings in 2 section(s)", "AFFECTED (60)", "RULED OUT (1)"} {
+		if !strings.Contains(index, want) {
+			t.Errorf("index %q is missing %q", index, want)
+		}
+	}
+	// Every heading it names has to exist, with the count it claims.
+	for _, heading := range []string{"AFFECTED (60)", "RULED OUT (1)"} {
+		if !strings.Contains(out, heading+" -") {
+			t.Errorf("index names %q but the report has no such heading", heading)
+		}
+	}
+}
+
+// The reason the footer repeats the caveats and not just the counts: an
+// INCOMPLETE banner 154 rows above the reader's eyes is one they never saw.
+func TestALongReportRepeatsTheIncompleteBanner(t *testing.T) {
+	out := longReport(t, 60, func(res *analyze.Result) {
+		res.Ecosystems = append(res.Ecosystems,
+			ecosystem.EcosystemResult{ID: "golang", Error: "no go binaries could be read"})
+	})
+	if got := strings.Count(out, "INCOMPLETE: ecosystem golang"); got != 2 {
+		t.Errorf("INCOMPLETE banner appears %d times, want 2 (both ends):\n%s", got, out)
+	}
+}
+
+func TestALongReportRepeatsTheWithheldNote(t *testing.T) {
+	out := longReport(t, 60, func(res *analyze.Result) {
+		res.Withheld = &analyze.Withheld{
+			Severities: []string{"HIGH"}, Count: 40,
+			BySeverity: map[string]int{"MEDIUM": 40},
+		}
+	})
+	if got := strings.Count(out, "--severity HIGH withheld 40 of 100"); got != 2 {
+		t.Errorf("withheld note appears %d times, want 2 (both ends):\n%s", got, out)
+	}
+}
+
+// An unreachable hub is the third caveat, and it must not be the one that gets
+// forgotten -- a hub that contributed nothing looks exactly like one with
+// nothing to say.
+func TestALongReportRepeatsTheVexHubNote(t *testing.T) {
+	out := longReport(t, 60, func(res *analyze.Result) {
+		res.VEXHubs = []ecosystem.VEXHubResult{
+			{URL: "https://github.com/rancher/vexhub", Error: "dial tcp: lookup failed"},
+		}
+	})
+	if got := strings.Count(out, "NOTE: VEX hub"); got != 2 {
+		t.Errorf("hub note appears %d times, want 2 (both ends):\n%s", got, out)
+	}
+}
+
+// Paging must never be able to change a byte, so the renderer cannot know
+// whether it is talking to a terminal. This is the regression test for that:
+// the same result renders identically however it is consumed.
+func TestRenderingDoesNotDependOnTheEnvironment(t *testing.T) {
+	first := longReport(t, 60, nil)
+	t.Setenv("VEXSCAN_PAGER", "less -S")
+	t.Setenv("TERM", "xterm-256color")
+	t.Setenv("COLUMNS", "40")
+	if second := longReport(t, 60, nil); first != second {
+		t.Error("the report changed with the environment; it must not")
 	}
 }

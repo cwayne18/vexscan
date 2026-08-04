@@ -59,6 +59,7 @@ func main() {
 		gistFlag   = flag.Bool("gist", false, "also upload the output to a public GitHub gist and print its URL (needs GITHUB_TOKEN/GH_TOKEN with gist scope)")
 		gistSecret = flag.Bool("gist-secret", false, "with --gist, create a secret (unlisted) gist instead of a public one")
 		quiet      = flag.Bool("quiet", false, "suppress progress logging on stderr")
+		noPager    = flag.Bool("no-pager", false, "never page the output, even when stdout is a terminal (VEXSCAN_PAGER picks the pager; setting it empty turns paging off for good)")
 	)
 	flag.Usage = usage
 	flag.Parse()
@@ -132,7 +133,7 @@ func main() {
 			Arch:         *arch,
 			OSVEcosystem: *osvEco,
 			Logf:         logf,
-		}, *out, logf)
+		}, *out, *noPager, logf)
 		return
 	}
 
@@ -190,15 +191,7 @@ func main() {
 		rendered = renderText(res, *details)
 	}
 
-	if *out != "" {
-		if err := os.WriteFile(*out, []byte(rendered), 0o644); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
-		}
-		logf("Wrote %s", *out)
-	} else {
-		fmt.Print(rendered)
-	}
+	emit(rendered, *out, *noPager, logf)
 
 	if *gistFlag {
 		url, err := uploadGist(ctx, res, rendered, *format, !*gistSecret)
@@ -228,6 +221,33 @@ func main() {
 	}
 }
 
+// emit delivers a rendered report: to a file with --out, through a pager when
+// someone is watching, and to stdout otherwise.
+//
+// Both output paths go through here so that --format inventory pages exactly
+// like a scan does, and so there is one answer to "where did the report go".
+//
+// Paging is skipped for --out (nothing reaches stdout), for --no-pager, for an
+// empty pager setting, and whenever stdout is not a character device -- a pipe,
+// a redirect, a CI log. The bytes are identical in every case; the only
+// question here is whether less gets to hold them first.
+func emit(rendered, out string, noPager bool, logf func(string, ...any)) {
+	if out != "" {
+		if err := os.WriteFile(out, []byte(rendered), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		logf("Wrote %s", out)
+		return
+	}
+	// page reports false for every failure it can have, including a $PAGER
+	// naming something that is not installed, so the report is still printed.
+	if !noPager && stdoutIsTerminal() && page(rendered) {
+		return
+	}
+	fmt.Print(rendered)
+}
+
 // countNamed reports how many of the target flags were given a value.
 func countNamed(vals ...string) int {
 	n := 0
@@ -248,22 +268,13 @@ func fail(format string, args ...any) {
 
 // runInventory handles --format inventory, which lists the target's OS packages
 // and exits without resolving a single advisory.
-func runInventory(ctx context.Context, opts analyze.Options, out string, logf func(string, ...any)) {
+func runInventory(ctx context.Context, opts analyze.Options, out string, noPager bool, logf func(string, ...any)) {
 	inv, err := analyze.Inventory(ctx, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	rendered := renderInventory(inv)
-	if out != "" {
-		if err := os.WriteFile(out, []byte(rendered), 0o644); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
-		}
-		logf("Wrote %s", out)
-	} else {
-		fmt.Print(rendered)
-	}
+	emit(renderInventory(inv), out, noPager, logf)
 
 	// Written first, then failed: an inventory with holes in it is still worth
 	// reading, and still not something a CI job should treat as the list.
@@ -484,6 +495,11 @@ Examples:
   # Share the report as a public gist (needs GITHUB_TOKEN/GH_TOKEN with gist scope)
   vexscan --image rancher/hardened-kubernetes:v1.30.1 \
     --package golang:golang.org/x/net --cves CVE-2023-39325 --gist
+
+A report longer than one screen is paged through $VEXSCAN_PAGER, $PAGER or
+less, and repeats its summary and any INCOMPLETE notes at the bottom. Piped,
+redirected or written with --out it is never paged, and the bytes are the same
+either way. --no-pager turns it off for one run; VEXSCAN_PAGER= for good.
 
 Exit status:
   0  the scan completed

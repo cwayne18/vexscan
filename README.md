@@ -816,6 +816,46 @@ plus `purl`, `evidence` and the plugin's own characterization of the
 reachability. That is the pre-table output, and it is verbose on purpose: the
 same scan is 3,990 lines.
 
+### Reading a long report
+
+`debian:12 --all --ecosystem os` is 172 lines, 154 of which are the `AFFECTED`
+table. That is not padding to trim — it is what the image installs — so two
+things make it navigable instead.
+
+**A report longer than one screen is paged**, through `$VEXSCAN_PAGER`,
+`$PAGER`, or `less` if neither is set. This happens only when stdout is a
+terminal: piped, redirected, or written with `--out` it never pages, and the
+bytes are identical either way. A bare `less` is given `LESS=FRX` (unless you
+have your own `LESS`), so a short report does not trap you in a pager and the
+text stays on screen after you quit.
+
+```sh
+vexscan --image debian:12 --all --no-pager   # not this run
+VEXSCAN_PAGER= vexscan --image debian:12 --all   # not ever
+VEXSCAN_PAGER='less -S' vexscan --image debian:12 --all   # chop long lines
+```
+
+If the pager cannot be started, the report is printed normally and a warning
+goes to stderr. A scan that took forty seconds should not end in a blank
+terminal because a dotfile names a pager that is no longer installed.
+
+**A long report repeats its summary at the bottom**, along with anything that
+changes how it should be read:
+
+```
+NOTE: --severity CRITICAL,HIGH withheld 123 of 161 findings:
+      36 unknown (no rating was published), 78 medium, 9 low
+  os       Debian:12                  88 components    38 findings
+  affected by severity: 10 critical, 26 high
+  38 findings in 2 section(s): AFFECTED (36), RULED OUT (2)
+```
+
+That matters most for the `INCOMPLETE:` banners. They are printed first
+precisely so they cannot be missed, but 154 rows will push anything off a
+terminal, and a CI log, a `--out` file and a gist are all read from the end. The
+threshold is 30 lines of report — counted from the report, never from the
+terminal, so the same scan produces the same bytes wherever it goes.
+
 ### Severity
 
 `SEVERITY` is scored from the CVSS vector OSV already returns with each
@@ -1064,6 +1104,7 @@ be read, or part of the tree could not be read, `2` the command line was wrong.
 | `--out` | *(stdout)* | Write output to a file |
 | `--gist` | `false` | Also upload the output to a public gist and print its URL (token needs `gist` scope) |
 | `--gist-secret` | `false` | With `--gist`, create a secret (unlisted) gist |
+| `--no-pager` | `false` | Never page the output, even when stdout is a terminal — see [Reading a long report](#reading-a-long-report) |
 | `--quiet` | `false` | Suppress progress logging on stderr |
 
 `--gist` uploads whatever would otherwise be printed, respecting `--format`,
@@ -1099,6 +1140,7 @@ honored as a fallback so existing CI keeps working.
 | `VEXSCAN_LLM_COMMAND` | | A local CLI to run for `--llm` instead of calling an endpoint |
 | `VEXSCAN_LLM_MIN_INTERVAL` | `GOMODVEX_LLM_MIN_INTERVAL` | Minimum spacing between `--llm` calls (Go duration; default none) |
 | `VEXSCAN_GOVULNCHECK_VERSION` | `GOMODVEX_GOVULNCHECK_VERSION` | Pin the govulncheck version used by `--repo` |
+| `VEXSCAN_PAGER` | `GOMODVEX_PAGER` | Pager for terminal output; `$PAGER` is the fallback, `less` the default. Set it **empty** to never page — unlike the variables above, an empty value here is a decision rather than an absence |
 
 `GITHUB_TOKEN` / `GH_TOKEN` are for `--gist` only, and are unchanged.
 
