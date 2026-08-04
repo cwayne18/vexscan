@@ -17,6 +17,7 @@ import (
 	"github.com/cwayne18/vexscan/internal/llm"
 	"github.com/cwayne18/vexscan/internal/osv"
 	"github.com/cwayne18/vexscan/internal/target"
+	"github.com/cwayne18/vexscan/internal/triage"
 )
 
 // Status classifies one (location, advisory) pair.
@@ -411,6 +412,16 @@ type Finding struct {
 	// above is what local evidence concluded, and stays comparable between a
 	// run with a hub and a run without one.
 	VEX *VEXStatement `json:"vex,omitempty"`
+
+	// Priority is exploitation evidence -- an EPSS score, a KEV listing --
+	// attached by --triage. Like VEX it never changes Status: whether anyone is
+	// exploiting a vulnerability elsewhere says nothing about whether the code
+	// is present here, which is the only question this tool answers.
+	//
+	// Nil means --triage was off. Non-nil with Scored false means the flag was
+	// on and this finding could not be looked up, which is a different fact and
+	// must not be allowed to look like a low score.
+	Priority *triage.Priority `json:"priority,omitempty"`
 
 	// Reachability is how the plugin's deterministic layer characterized a
 	// genuinely-affected component, in its own words ("linked (symbols

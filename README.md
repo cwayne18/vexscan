@@ -931,6 +931,110 @@ Exit codes are unchanged: `0` the scan completed, `1` it could not read
 something, `2` the command line was wrong. Findings existing — at any severity —
 is not a failure, which is what keeps exit `1` worth acting on.
 
+### Prioritising by exploitation evidence (`--triage`)
+
+Severity says how bad a vulnerability would be if exploited. It says nothing
+about whether anyone is exploiting it. `--triage` adds the second question, from
+two public feeds: [EPSS](https://www.first.org/epss/), a daily per-CVE forecast
+of exploitation activity, and
+[CISA's known-exploited catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog),
+a list of what is being exploited in the wild right now.
+
+```console
+$ vexscan --image debian:12 --all --ecosystem os --triage
+vexscan report (image) for debian:12
+NOTE: --triage could not score 16 of 161 findings, so they sort last for lack of data rather than lack of risk:
+      16 have a CVE the feed has not scored yet, which usually means it was published in the last day or two
+
+  os       Debian:12                  88 components   161 findings
+  affected by severity: 10 critical, 26 high, 34 unknown, 75 medium, 9 low
+  priority: none in CISA's known-exploited catalog, 3 at or above the 90th EPSS percentile, 138 scored, 16 unscored
+  priority data: EPSS 2026-08-04, KEV catalog 2026.08.04
+
+AFFECTED (154) - vulnerable code is present and can be loaded
+SEVERITY  ADVISORY          PACKAGE       VERSION                 EPSS   BASIS
+UNKNOWN   CVE-2011-3389     libgnutls30   3.7.9-2+deb12u7         99.4%  elf-needed-closure
+HIGH      CVE-2018-20796    libc-bin      2.36-9+deb12u14         92.4%  elf-needed-closure
+UNKNOWN   CVE-2005-2541     tar           1.34+dfsg-1.2+deb12u1   89.5%  elf-needed-closure
+CRITICAL  CVE-2019-1010022  libc-bin      2.36-9+deb12u14         87.1%  elf-needed-closure
+```
+
+That reordering is the point, and it is large. The likeliest-to-be-exploited
+finding in `debian:12` is **unrated**, so a `--severity CRITICAL,HIGH` run throws
+it away. Six of the image's eight CRITICALs sit between the 28th and 40th
+percentile — below the median:
+
+| CVE | Severity | EPSS percentile |
+|---|---|---|
+| CVE-2019-1010022 | CRITICAL | 87th |
+| CVE-2023-45853 | CRITICAL | 86th |
+| CVE-2026-5450 | CRITICAL | 40th |
+| CVE-2026-8376 | CRITICAL | 36th |
+| CVE-2026-13221 | CRITICAL | 35th |
+| CVE-2026-42496 | CRITICAL | 35th |
+| CVE-2026-12087 | CRITICAL | 30th |
+| CVE-2026-57433 | CRITICAL | 28th |
+
+**Nothing is hidden and nothing is rewritten.** The flag adds two columns and
+changes the order: known-exploited rows first, then by EPSS percentile
+descending, then everything unscored in the severity order it had before. No
+status changes and no severity changes — whether a vulnerability is being
+exploited on someone else's network says nothing about whether the code is
+present in this image, which is the only question this tool answers. Use
+[`--severity`](#filtering-by-severity---severity) if you want fewer rows;
+`--triage` only decides which of them you read first.
+
+**There is no blended score.** vexscan will not emit a
+`priority = f(cvss, epss, kev)` number, because the two inputs measure different
+things and any weighting would be this tool's opinion dressed as arithmetic. It
+shows the facts and orders by them.
+
+The `EPSS` column is the **percentile**, not the raw probability: `0.03` reads as
+negligible until you know it is the 87th percentile of all 355,094 scored CVEs.
+`--details` prints both, along with the id the score was looked up under:
+
+```
+  epss:     0.03249 (87.1th percentile), as CVE-2019-1010022
+```
+
+Four things are worth knowing before you rely on it:
+
+- **Both feeds are keyed by CVE, and many advisories are not.** On the Rancher
+  image below, *not one* of 865 findings carries a CVE in any of its own fields —
+  they are all `GHSA-` and `GO-` ids. Expanding each through the OSV alias list
+  the resolver already fetched is what scores 834 of them anyway; the remaining
+  31 have no CVE alias anywhere and can never be scored by either feed. Those are
+  counted, named in a `NOTE:`, and sorted last — which in a list ordered by
+  likelihood reads as "least likely", so the note says in as many words that they
+  sort last for lack of data rather than lack of risk.
+- **A CVE published in the last day or two has no score yet.** EPSS lags new
+  CVEs by about a day; the 16 unscored findings on `debian:12` above are two such
+  ids across eight packages each. This is counted separately from "no CVE at
+  all", because the two have different fixes (wait a day; nothing).
+- **Absence from the KEV catalog means nothing at all.** It is 1,660 entries
+  against EPSS's 355,094, and it fired on **zero** of the 1,026 findings across
+  both images here. It is worth carrying because when it does fire it ends the
+  argument, but a report with no KEV rows is the normal case and not a clean bill
+  of health.
+- **EPSS predicts observed exploitation activity anywhere in the next 30 days**,
+  not risk to you. A high percentile on a library your entrypoint never loads is
+  still a finding vexscan has already told you is `not_present`.
+
+`--triage` downloads about 4 MB the first time (2.5 MB gzipped EPSS, 1.5 MB KEV)
+and takes well under a second. Both are cached under `VEXSCAN_TRIAGE_CACHE`, or
+`os.UserCacheDir()/vexscan/triage` by default. EPSS is served under a dated
+filename, so a second scan the same day re-downloads nothing at all; KEV is
+revalidated with an `ETag` and normally answers `304`. A feed that cannot be
+reached falls back to the cached copy, and both the summary and the caveat mark
+it `(cached)` with the date it is from — a percentile is a claim about a day, and
+a CI log read next month must not be able to pretend otherwise.
+
+An unreachable feed with no cache prints a `NOTE:` and **does not fail the run**,
+for the same reason [`--vexhub`](#vex-hubs---vexhub) does not: it leaves the rows
+in the order they were already in, which over-reports rather than under-reports.
+The report says so explicitly, because a table with an empty KEV column must
+never be readable as "nothing here is being exploited".
+
 ### VEX hubs (`--vexhub`)
 
 Some vendors have already triaged the CVEs in their own images and published the
@@ -1021,6 +1125,14 @@ The JSON is `schema_version: 2`:
   "ecosystems": [ { "id": "os", "components": 65, "error": "" } ],
   "unreadable": { "count": 3, "paths": ["/opt/vendor"] },  // omitted when nothing was skipped
   "vex_hubs": [ { "url": "...", "author": "...", "products": 1082, "matched": 3 } ],  // only with --vexhub
+  "triage": {  // only with --triage
+    "epss_date": "2026-08-04", "kev_date": "2026.08.04",  // the feeds' own dates, not today's
+    "epss_stale": true, "kev_stale": true,   // a cached copy was used; omitted when false
+    "epss_error": "...", "kev_error": "...", // a feed failed; set instead of failing the run
+    "not_in_feed": 16, "no_cve": 3,          // unscored, and why; each omitted when zero
+    "catalog_size": 1660,                    // how many CVEs the KEV catalog held
+    "scored": 145, "known_exploited": 0      // always present: "0 known exploited" is a finding
+  },
   "withheld": {  // only when --severity hid something; findings[] is already the kept set
     "severities": ["CRITICAL", "HIGH"],
     "count": 123,
@@ -1037,7 +1149,11 @@ omitted when none was, which is not the same fact as `UNKNOWN`. With
 it was found in) and, when one matched, `vex` — the statement's `status`,
 `justification`, `impact_statement`, `action_statement`, `author`, the product
 purl that matched and the hub it came from, so a consumer can audit the claim
-without re-fetching. The v1 Go
+without re-fetching. With [`--triage`](#prioritising-by-exploitation-evidence---triage)
+it carries `priority`: `{"cve": "...", "scored": true, "epss": 0.03249,
+"percentile": 0.871}` plus `kev` when it is listed. `scored: false` means the
+lookup ran and found nothing, which is not a score of zero; the block is absent
+entirely when the flag was off. The v1 Go
 spellings (`cve`, `module`, `binary`, `go_id`, `packages`,
 `granularity`, `stripped`) are still emitted for Go findings, mirrored from the
 neutral fields so they cannot drift.
@@ -1090,6 +1206,7 @@ be read, or part of the tree could not be read, `2` the command line was wrong.
 | `--roots` | | Extra entrypoints for the closures — shared libraries and language imports; repeatable |
 | `--vexhub` | | VEX Repository to check findings against, e.g. `https://github.com/rancher/vexhub` (also a raw base URL or a local directory); repeatable, earliest wins — see [VEX hubs](#vex-hubs---vexhub) |
 | `--severity` | *(all)* | Only report findings at these severities: `CRITICAL`, `HIGH`, `UNKNOWN`, `MEDIUM`, `LOW`, `NONE`; comma-separated or repeatable. `UNKNOWN` must be named to be shown — see [Filtering by severity](#filtering-by-severity---severity) |
+| `--triage` | `false` | Order findings by exploitation evidence — EPSS scores and CISA's known-exploited catalog. Adds two columns and re-sorts; hides nothing and changes no severity — see [Prioritising by exploitation evidence](#prioritising-by-exploitation-evidence---triage) |
 | `--dlopen-policy` | `taint` | `taint` (block conclusions) or `assume-none` |
 | `--dynamic-import-policy` | `taint` | The same knob for a language import graph's computed imports. These are far more common than `dlopen`, so `assume-none` discards much more |
 | `--trust-import-absence` | `false` | Let a missing dynamic import conclude `not_in_execute_path` (weaker than it looks) |
@@ -1140,6 +1257,7 @@ honored as a fallback so existing CI keeps working.
 | `VEXSCAN_LLM_COMMAND` | | A local CLI to run for `--llm` instead of calling an endpoint |
 | `VEXSCAN_LLM_MIN_INTERVAL` | `GOMODVEX_LLM_MIN_INTERVAL` | Minimum spacing between `--llm` calls (Go duration; default none) |
 | `VEXSCAN_GOVULNCHECK_VERSION` | `GOMODVEX_GOVULNCHECK_VERSION` | Pin the govulncheck version used by `--repo` |
+| `VEXSCAN_TRIAGE_CACHE` | | Directory for the `--triage` feed cache (default `os.UserCacheDir()/vexscan/triage`, e.g. `~/Library/Caches` or `$XDG_CACHE_HOME`) |
 | `VEXSCAN_PAGER` | `GOMODVEX_PAGER` | Pager for terminal output; `$PAGER` is the fallback, `less` the default. Set it **empty** to never page — unlike the variables above, an empty value here is a decision rather than an absence |
 
 `GITHUB_TOKEN` / `GH_TOKEN` are for `--gist` only, and are unchanged.

@@ -31,6 +31,7 @@ import (
 	"github.com/cwayne18/vexscan/internal/osv"
 	"github.com/cwayne18/vexscan/internal/source"
 	"github.com/cwayne18/vexscan/internal/target"
+	"github.com/cwayne18/vexscan/internal/triage"
 )
 
 // The finding vocabulary lives in internal/ecosystem, which is what the plugins
@@ -113,6 +114,16 @@ type Options struct {
 	// reader still has to look at.
 	VEXHubs []string
 
+	// Triage is the EPSS/KEV loader for --triage, or nil to skip it entirely.
+	// It is the loader rather than a bool so a test can point it at its own
+	// feeds, and so the caller owns the cache location.
+	//
+	// Like VEXHubs it never changes a finding's status. Whether a vulnerability
+	// is being exploited elsewhere says nothing about whether the code is
+	// present here, which is the only question this tool answers; what it
+	// changes is which of the answers a reader looks at first.
+	Triage *triage.Loader
+
 	// GoVersion optionally pins the Go toolchain for repo-mode analysis
 	// (e.g. "1.24.0"). Mainly useful with --module stdlib, whose findings depend
 	// on the toolchain version.
@@ -181,6 +192,10 @@ type Result struct {
 	// flag was not used or hid nothing. See severityFilter: a filtered result
 	// and a clean one are indistinguishable without it.
 	Withheld *Withheld `json:"withheld,omitempty"`
+
+	// Triage records what --triage contributed, and is nil when the flag was
+	// not used. Like VEXHubs it is not part of Failed(): see triageOverlay.
+	Triage *TriageResult `json:"triage,omitempty"`
 }
 
 // Failed reports whether the findings are an incomplete account of the target
@@ -511,6 +526,7 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	// from a directory name would look up an artifact that does not exist.
 	productOverlay(result.Findings, opts.Image)
 	result.VEXHubs = vexOverlay(ctx, opts.VEXHubs, result.Findings, run.resolver.aliases(), logf)
+	result.Triage = triageOverlay(ctx, opts.Triage, result.Findings, run.resolver.aliases(), logf)
 	llmOverlay(ctx, llmClient, result.Findings, "", logf)
 	sortFindings(result.Findings)
 	return result, nil
@@ -657,6 +673,7 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 	// No productOverlay here: repo mode has no image, and the only artifact a
 	// checkout is is its own module, which the Go plugin already recorded.
 	result.VEXHubs = vexOverlay(ctx, opts.VEXHubs, result.Findings, run.resolver.aliases(), logf)
+	result.Triage = triageOverlay(ctx, opts.Triage, result.Findings, run.resolver.aliases(), logf)
 	llmOverlay(ctx, llmClient, result.Findings, "source tree", logf)
 	sortFindings(result.Findings)
 	return result, nil

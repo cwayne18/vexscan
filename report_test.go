@@ -9,6 +9,7 @@ import (
 	"github.com/cwayne18/vexscan/internal/ecosystem"
 	"github.com/cwayne18/vexscan/internal/llm"
 	"github.com/cwayne18/vexscan/internal/target"
+	"github.com/cwayne18/vexscan/internal/triage"
 )
 
 // report renders a result from a bare list of findings.
@@ -930,5 +931,243 @@ func TestRenderingDoesNotDependOnTheEnvironment(t *testing.T) {
 	t.Setenv("COLUMNS", "40")
 	if second := longReport(t, 60, nil); first != second {
 		t.Error("the report changed with the environment; it must not")
+	}
+}
+
+// triaged renders a result with --triage evidence attached.
+func triaged(t *testing.T, tr *analyze.TriageResult, details bool, findings ...analyze.Finding) string {
+	t.Helper()
+	return renderText(&analyze.Result{
+		SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
+		Ecosystems: []ecosystem.EcosystemResult{
+			{ID: "os", Ecosystems: []string{"Debian:12"}, Components: 88},
+		},
+		Findings: findings, Triage: tr,
+	}, details)
+}
+
+// scored is a linked finding carrying an EPSS percentile.
+func scored(cve, severity string, pct float64) analyze.Finding {
+	f := analyze.Finding{
+		Ecosystem: "os", CVE: cve, ID: cve,
+		Package: "libc6", Module: "libc6", Version: "2.36-9",
+		PURL:     "pkg:deb/debian/libc6@2.36-9?arch=amd64",
+		Status:   analyze.StatusLinked,
+		Method:   "elf-needed-closure",
+		Severity: severity,
+	}
+	f.Priority = &triage.Priority{CVE: cve, Scored: true, EPSS: pct / 10, Percentile: pct}
+	return f
+}
+
+// unscored is a finding --triage looked up and could not score.
+func unscored(id, severity string) analyze.Finding {
+	f := scored(id, severity, 0)
+	f.Priority = &triage.Priority{}
+	return f
+}
+
+func kevFinding(cve string, ransomware bool) analyze.Finding {
+	f := scored(cve, "MEDIUM", 0.10)
+	f.Priority.KEV = &triage.KEVEntry{DateAdded: "2021-11-03", DueDate: "2022-05-03", Ransomware: ransomware}
+	return f
+}
+
+// The finding this whole feature exists for: on debian:12 the likeliest to be
+// exploited is one nobody ever rated, and it must not be at the bottom.
+func TestAnUnratedFindingWithAHighPercentileSortsToTheTop(t *testing.T) {
+	out := triaged(t, &analyze.TriageResult{Scored: 3, EPSSDate: "2026-08-04"}, false,
+		scored("CVE-2026-5450", "CRITICAL", 0.402),
+		scored("CVE-2018-20796", "HIGH", 0.924),
+		scored("CVE-2011-3389", "", 0.994),
+	)
+	rows := sectionOf(t, out, "AFFECTED")
+	if len(rows) < 4 {
+		t.Fatalf("expected a header and three rows:\n%s", out)
+	}
+	if !strings.Contains(rows[1], "CVE-2011-3389") {
+		t.Errorf("the 99.4th-percentile unrated finding is not first:\n%s", strings.Join(rows, "\n"))
+	}
+	if !strings.Contains(rows[3], "CVE-2026-5450") {
+		t.Errorf("the low-percentile CRITICAL is not last:\n%s", strings.Join(rows, "\n"))
+	}
+}
+
+// Known exploitation is not a probability, so it outranks every probability.
+func TestKEVOutranksAHigherPercentile(t *testing.T) {
+	out := triaged(t, &analyze.TriageResult{Scored: 2, KnownExploited: 1}, false,
+		scored("CVE-2011-3389", "LOW", 0.994),
+		kevFinding("CVE-2017-5638", false),
+	)
+	rows := sectionOf(t, out, "AFFECTED")
+	if !strings.Contains(rows[1], "CVE-2017-5638") {
+		t.Errorf("the known-exploited row is not first:\n%s", strings.Join(rows, "\n"))
+	}
+}
+
+func TestTheEPSSColumnShowsThePercentileNotTheRawScore(t *testing.T) {
+	out := triaged(t, &analyze.TriageResult{Scored: 1}, false, scored("CVE-2011-3389", "HIGH", 0.994))
+	row := lineWith(t, out, "CVE-2011-3389")
+	if !strings.Contains(row, "99.4%") {
+		t.Errorf("no percentile in the row: %q", row)
+	}
+	if !strings.Contains(lineWith(t, out, "SEVERITY"), "EPSS") {
+		t.Error("no EPSS column heading")
+	}
+}
+
+// A column of blanks on every image that has never shipped a known-exploited
+// package is a daily reminder of a rare event.
+func TestTheKEVColumnOnlyAppearsWhenSomethingIsListed(t *testing.T) {
+	without := triaged(t, &analyze.TriageResult{Scored: 1}, false, scored("CVE-2011-3389", "HIGH", 0.994))
+	if strings.Contains(lineWith(t, without, "SEVERITY"), "KEV") {
+		t.Error("a KEV column was printed with nothing in it")
+	}
+	with := triaged(t, &analyze.TriageResult{Scored: 1, KnownExploited: 1}, false, kevFinding("CVE-2017-5638", true))
+	if !strings.Contains(lineWith(t, with, "SEVERITY"), "KEV") {
+		t.Error("no KEV column when a row is listed")
+	}
+	if !strings.Contains(lineWith(t, with, "CVE-2017-5638"), "ransomware") {
+		t.Error("a ransomware campaign was not called one")
+	}
+}
+
+// An unscored row sorts last, which in a list ordered by likelihood reads as
+// "least likely". It means "nobody knows", and the report has to say so.
+func TestUnscoredRowsSortLastAndAreExplained(t *testing.T) {
+	out := triaged(t, &analyze.TriageResult{Scored: 1, NoCVE: 1, NotInFeed: 1}, false,
+		unscored("GHSA-gcjh-h69q-9w9g", "CRITICAL"),
+		scored("CVE-2011-3389", "LOW", 0.994),
+		unscored("CVE-2026-53613", "HIGH"),
+	)
+	rows := sectionOf(t, out, "AFFECTED")
+	if !strings.Contains(rows[1], "CVE-2011-3389") {
+		t.Errorf("the scored row is not first:\n%s", strings.Join(rows, "\n"))
+	}
+	note := lineWith(t, out, "could not score")
+	if !strings.Contains(note, "2 of 3") {
+		t.Errorf("the note does not say how many: %q", note)
+	}
+	if !strings.Contains(out, "lack of risk") {
+		t.Errorf("nothing warns that last does not mean safe:\n%s", out)
+	}
+	if !strings.Contains(out, "no CVE id") || !strings.Contains(out, "not scored yet") {
+		t.Errorf("the two reasons are not distinguished:\n%s", out)
+	}
+	if !strings.Contains(lineWith(t, out, "GHSA-gcjh"), " - ") {
+		t.Errorf("an unscored row shows a number rather than a dash:\n%s", out)
+	}
+}
+
+// A percentile is a claim about a day, and a report read next month has to be
+// able to see which day.
+func TestTheSummaryNamesTheFeedDates(t *testing.T) {
+	out := triaged(t, &analyze.TriageResult{
+		Scored: 1, EPSSDate: "2026-08-04", KEVDate: "2026.08.03",
+	}, false, scored("CVE-2011-3389", "HIGH", 0.994))
+
+	line := lineWith(t, out, "priority data:")
+	if !strings.Contains(line, "EPSS 2026-08-04") || !strings.Contains(line, "KEV catalog 2026.08.03") {
+		t.Errorf("priority data line = %q", line)
+	}
+	p := lineWith(t, out, "  priority: ")
+	if !strings.Contains(p, "1 at or above the 90th EPSS percentile") {
+		t.Errorf("priority line = %q", p)
+	}
+	if !strings.Contains(p, "none in CISA's known-exploited catalog") {
+		t.Errorf("the catalog was checked and the line does not say so: %q", p)
+	}
+}
+
+func TestACachedFeedIsMarkedAsCached(t *testing.T) {
+	out := triaged(t, &analyze.TriageResult{
+		Scored: 1, EPSSDate: "2026-08-03", EPSSStale: true,
+	}, false, scored("CVE-2011-3389", "HIGH", 0.994))
+
+	if !strings.Contains(lineWith(t, out, "priority data:"), "EPSS 2026-08-03 (cached)") {
+		t.Errorf("a stale feed is not marked:\n%s", out)
+	}
+	if !strings.Contains(out, "the percentiles below are that day's") {
+		t.Errorf("nothing explains that the scores are old:\n%s", out)
+	}
+}
+
+// A feed that could not be read leaves the rows in their old order. That must
+// never look like a report where nothing is being exploited.
+func TestAFailedFeedIsSaidOutLoud(t *testing.T) {
+	out := triaged(t, &analyze.TriageResult{
+		NotInFeed: 1,
+		EPSSError: "dial tcp: connection refused",
+		KEVError:  "403 Forbidden",
+	}, false, unscored("CVE-2011-3389", "HIGH"))
+
+	if !strings.Contains(out, "could not read the EPSS feed") {
+		t.Errorf("the EPSS failure is not reported:\n%s", out)
+	}
+	if !strings.Contains(out, "no row below is marked as exploited") {
+		t.Errorf("the KEV failure is not reported:\n%s", out)
+	}
+	if strings.Contains(out, "none in CISA's known-exploited catalog") {
+		t.Error("a catalog that could not be read was reported as having nothing in it")
+	}
+	// The unscored note would be noise here: nothing was scored at all, and the
+	// line above already says why.
+	if strings.Contains(out, "could not score") {
+		t.Errorf("the per-finding note repeats the feed failure:\n%s", out)
+	}
+}
+
+// The v0.4.1 property: anything a reader needs is at both ends of a long
+// report, because a caveat only above 154 rows is one nobody sees.
+func TestALongTriagedReportRepeatsThePriorityLines(t *testing.T) {
+	out := longReport(t, 60, func(res *analyze.Result) {
+		res.Triage = &analyze.TriageResult{Scored: 60, EPSSDate: "2026-08-04", EPSSStale: true}
+		for i := range res.Findings {
+			res.Findings[i].Priority = &triage.Priority{
+				CVE: res.Findings[i].CVE, Scored: true, Percentile: 0.5,
+			}
+		}
+	})
+	for _, want := range []string{"priority data:", "(cached)", "  priority: ", "used the cached scores"} {
+		if n := strings.Count(out, want); n != 2 {
+			t.Errorf("%q appears %d times, want 2 (once at each end):\n%s", want, n, out)
+		}
+	}
+}
+
+// Without the flag nothing changes -- not a column, not a line, not the order.
+// This is the guarantee that makes the feature safe to add.
+func TestAnUntriagedReportIsUnchanged(t *testing.T) {
+	before := report(t, true, gccTrio...)
+	for i := range gccTrio {
+		if gccTrio[i].Priority != nil {
+			t.Fatal("the fixture was mutated by another test")
+		}
+	}
+	if strings.Contains(before, "EPSS") || strings.Contains(before, "priority") {
+		t.Errorf("an untriaged report mentions triage:\n%s", before)
+	}
+	// Same findings, same order, with the overlay having run and found nothing.
+	rows := make([]analyze.Finding, len(gccTrio))
+	copy(rows, gccTrio)
+	sortForDisplay(rows)
+	for i, f := range rows {
+		if f.CVE != gccTrio[i].CVE {
+			t.Error("the triage-aware sort reordered an untriaged report")
+		}
+	}
+}
+
+func TestTheDetailBlockShowsWhichCVEWasScored(t *testing.T) {
+	f := scored("GO-2025-3547", "HIGH", 0.31)
+	f.Priority.CVE = "CVE-2024-7598"
+	out := triaged(t, &analyze.TriageResult{Scored: 1}, true, f)
+
+	line := lineWith(t, out, "epss:")
+	if !strings.Contains(line, "CVE-2024-7598") {
+		t.Errorf("the detail does not name the id the score was looked up under: %q", line)
+	}
+	if !strings.Contains(line, "31.0%") || !strings.Contains(line, "0.031") {
+		t.Errorf("the detail should carry both the percentile and the raw score: %q", line)
 	}
 }

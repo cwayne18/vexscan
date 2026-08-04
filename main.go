@@ -18,6 +18,7 @@ import (
 	"github.com/cwayne18/vexscan/internal/elfgraph"
 	"github.com/cwayne18/vexscan/internal/gist"
 	"github.com/cwayne18/vexscan/internal/modgraph"
+	"github.com/cwayne18/vexscan/internal/triage"
 )
 
 func main() {
@@ -47,6 +48,7 @@ func main() {
 		osvEco     = flag.String("osv-ecosystem", "", "override the OSV ecosystem derived from the image's os-release, e.g. 'Debian:12'")
 		dlopen     = flag.String("dlopen-policy", "taint", "what a reachable dlopen does to the closure: taint (block conclusions) or assume-none")
 		dynamic    = flag.String("dynamic-import-policy", "taint", "what an import of a computed name does to a language import graph: taint (block conclusions) or assume-none; these are far more common than dlopen, so assume-none discards much more")
+		triageOn   = flag.Bool("triage", false, "order findings by exploitation evidence: EPSS scores and CISA's known-exploited catalog. Adds two columns and sorts known-exploited first, then by EPSS percentile; nothing is hidden, and no severity changes. Downloads two public feeds (~4 MB, cached under VEXSCAN_TRIAGE_CACHE)")
 		mine       = flag.Bool("mine-advisories", false, "with --llm, let the model read each advisory's prose for symbols to check against the image")
 		trustAbs   = flag.Bool("trust-import-absence", false, "let a missing dynamic import of the vulnerable symbol conclude not_in_execute_path (see README: this is weaker than it looks)")
 		useLLM     = flag.Bool("llm", false, "consult a chat model on genuinely-affected CVEs for exploitability (needs a provider: --llm-endpoint or --llm-command)")
@@ -155,6 +157,7 @@ func main() {
 		OSVEcosystem:       *osvEco,
 		Roots:              roots,
 		VEXHubs:            vexhubs,
+		Triage:             triageLoader(*triageOn),
 		DlopenPolicy:       dlopenPolicy,
 		DynamicPolicy:      dynamicPolicy,
 		GoVersion:          *goVersion,
@@ -257,6 +260,19 @@ func countNamed(vals ...string) int {
 		}
 	}
 	return n
+}
+
+// triageLoader is the feed loader for --triage, or nil when the flag is off.
+//
+// Options.Triage is a loader rather than a bool so that tests can point it at
+// their own feeds, and nil is the off switch: with no loader the overlay never
+// runs, every Priority stays nil, and the report renders exactly as it did
+// before any of this existed.
+func triageLoader(on bool) *triage.Loader {
+	if !on {
+		return nil
+	}
+	return triage.New()
 }
 
 // fail prints a usage error and exits 2.
@@ -464,6 +480,10 @@ Examples:
   # ... or just the ones worth waking someone for (the report says what it hid)
   vexscan --image debian:12 --all --ecosystem os --severity CRITICAL,HIGH
 
+  # ... or ordered by whether anyone is actually exploiting them, which is a
+  # different question from severity and often a differently-ordered table
+  vexscan --image debian:12 --all --ecosystem os --triage
+
   # One Python distribution, by any spelling of its name
   vexscan --image python:3.12-slim --package pypi:PyYAML
 
@@ -495,6 +515,14 @@ Examples:
   # Share the report as a public gist (needs GITHUB_TOKEN/GH_TOKEN with gist scope)
   vexscan --image rancher/hardened-kubernetes:v1.30.1 \
     --package golang:golang.org/x/net --cves CVE-2023-39325 --gist
+
+--triage answers a question severity does not: is anyone exploiting this? It
+downloads EPSS (a 30-day exploitation-activity forecast, per CVE) and CISA's
+known-exploited catalog, and reorders the table by them. Neither feed changes a
+status or a severity: whether a vulnerability is being exploited elsewhere says
+nothing about whether the code is present here. Both are keyed by CVE, so an
+advisory that never got one cannot be scored, and the report names those rather
+than filing them as zero. Absence from the KEV catalog means nothing at all.
 
 A report longer than one screen is paged through $VEXSCAN_PAGER, $PAGER or
 less, and repeats its summary and any INCOMPLETE notes at the bottom. Piped,

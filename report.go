@@ -139,6 +139,53 @@ func writeCaveats(b *strings.Builder, res *analyze.Result) {
 		// reached looks exactly like one with nothing to say.
 		fmt.Fprintf(b, "NOTE: VEX hub %s could not be read, so nothing was moved to ALREADY VEXED - %s\n", h.URL, h.Error)
 	}
+	writeTriageCaveats(b, res)
+}
+
+// writeTriageCaveats explains anything --triage could not do.
+//
+// Three things can go wrong and they are not interchangeable. A feed that could
+// not be read at all means the rows below are in their old order. A feed served
+// from yesterday's cache means the percentiles are yesterday's. And a finding
+// that could not be looked up sorts to the bottom, which in a list ordered by
+// exploitation probability reads exactly like "least urgent" -- so the reason
+// it is down there has to be on the page. Both feeds are keyed by CVE, and an
+// advisory that never got one is unscoreable rather than safe.
+func writeTriageCaveats(b *strings.Builder, res *analyze.Result) {
+	t := res.Triage
+	if t == nil {
+		return
+	}
+	if t.EPSSError != "" {
+		fmt.Fprintf(b, "NOTE: --triage could not read the EPSS feed, so nothing below is ordered by "+
+			"exploitation probability - %s\n", t.EPSSError)
+	} else if t.EPSSStale {
+		fmt.Fprintf(b, "NOTE: --triage could not reach the EPSS feed and used the cached scores from %s; "+
+			"the percentiles below are that day's\n", t.EPSSDate)
+	}
+	if t.KEVError != "" {
+		fmt.Fprintf(b, "NOTE: --triage could not read CISA's known-exploited catalog, so no row below "+
+			"is marked as exploited - %s\n", t.KEVError)
+	} else if t.KEVStale {
+		fmt.Fprintf(b, "NOTE: --triage could not reach CISA's catalog and used the cached copy %s\n", t.KEVDate)
+	}
+
+	if t.EPSSError != "" || t.Unscored() == 0 {
+		return
+	}
+	var why []string
+	if t.NoCVE > 0 {
+		why = append(why, fmt.Sprintf("%d carry no CVE id, which is the only key either feed has", t.NoCVE))
+	}
+	if t.NotInFeed > 0 {
+		why = append(why, fmt.Sprintf("%d have a CVE the feed has not scored yet, which usually means "+
+			"it was published in the last day or two", t.NotInFeed))
+	}
+	fmt.Fprintf(b, "NOTE: --triage could not score %d of %d findings, so they sort last for lack of "+
+		"data rather than lack of risk:\n", t.Unscored(), t.Scored+t.Unscored())
+	for _, w := range why {
+		fmt.Fprintf(b, "      %s\n", w)
+	}
 }
 
 // footerThreshold is how many lines a report may be before it needs its summary
@@ -229,10 +276,90 @@ func writeSummary(b *strings.Builder, res *analyze.Result, index bool) {
 	if vexed > 0 {
 		fmt.Fprintf(b, "  already vexed: %d by %s\n", vexed, vexAuthors(res))
 	}
+	writePriority(b, res)
 	if index {
 		writeSections(b, res)
 	}
 	b.WriteString("\n")
+}
+
+// highPercentile is where "worth looking at first" begins. Arbitrary, like
+// every threshold, and chosen because the EPSS distribution is steep enough
+// that the top tenth is a genuinely short list: on debian:12 it is four rows
+// out of a hundred and fifty-four.
+const highPercentile = 0.90
+
+// writePriority summarises the exploitation evidence, over exactly the rows the
+// severity spread above it counts.
+//
+// Same population on purpose. Two summary lines describing different subsets of
+// the same report is the kind of small dishonesty a reader only discovers by
+// adding the numbers up and finding they disagree.
+func writePriority(b *strings.Builder, res *analyze.Result) {
+	t := res.Triage
+	if t == nil {
+		return
+	}
+	var kev, high, scored, unscored int
+	for _, f := range res.Findings {
+		if !f.Affected() || alreadyVexed(f) {
+			continue
+		}
+		p := f.Priority
+		switch {
+		case p == nil || !p.Scored:
+			unscored++
+		default:
+			scored++
+			if p.Percentile >= highPercentile {
+				high++
+			}
+		}
+		if p != nil && p.KEV != nil {
+			kev++
+		}
+	}
+
+	var parts []string
+	if kev > 0 {
+		parts = append(parts, fmt.Sprintf("%d known exploited (CISA KEV)", kev))
+	} else if t.KEVError == "" {
+		// Worth saying out loud that the catalog was consulted and had nothing.
+		// Not worth reading as reassurance: it holds a few thousand entries and
+		// covers almost nothing a base image ships.
+		parts = append(parts, "none in CISA's known-exploited catalog")
+	}
+	if t.EPSSError == "" {
+		parts = append(parts,
+			fmt.Sprintf("%d at or above the %dth EPSS percentile", high, int(highPercentile*100)),
+			fmt.Sprintf("%d scored", scored))
+		if unscored > 0 {
+			parts = append(parts, fmt.Sprintf("%d unscored", unscored))
+		}
+	}
+	if len(parts) > 0 {
+		fmt.Fprintf(b, "  priority: %s\n", strings.Join(parts, ", "))
+	}
+
+	// A percentile is a claim about a day. A report read next month, or a CI
+	// log read after an incident, must be able to see which day.
+	var dates []string
+	if t.EPSSDate != "" {
+		dates = append(dates, "EPSS "+t.EPSSDate+stale(t.EPSSStale))
+	}
+	if t.KEVDate != "" {
+		dates = append(dates, "KEV catalog "+t.KEVDate+stale(t.KEVStale))
+	}
+	if len(dates) > 0 {
+		fmt.Fprintf(b, "  priority data: %s\n", strings.Join(dates, ", "))
+	}
+}
+
+func stale(b bool) string {
+	if b {
+		return " (cached)"
+	}
+	return ""
 }
 
 // withheldSpread is what --severity hid, by severity.
@@ -371,7 +498,19 @@ func writeSection(b *strings.Builder, s section, details bool) {
 	// and reachable gets the column automatically.
 	showVerdict := distinctStatuses(rows) > 1
 
+	// The triage columns earn their place the same way VERDICT does. EPSS
+	// appears when --triage scored anything in this section; KEV only when
+	// something in it is actually listed, which on most images is never, and a
+	// column of blanks would be a daily reminder of a rare event.
+	showEPSS, showKEV := triageColumns(rows)
+
 	header := []string{"SEVERITY", "ADVISORY", "PACKAGE", "VERSION"}
+	if showEPSS {
+		header = append(header, "EPSS")
+	}
+	if showKEV {
+		header = append(header, "KEV")
+	}
 	if showVerdict {
 		header = append(header, "VERDICT")
 	}
@@ -391,6 +530,12 @@ func writeSection(b *strings.Builder, s section, details bool) {
 			shortAdvisory(f),
 			truncate(f.Component(), 40),
 			truncate(f.Version, 28),
+		}
+		if showEPSS {
+			cells = append(cells, displayEPSS(f))
+		}
+		if showKEV {
+			cells = append(cells, displayKEV(f))
 		}
 		if showVerdict {
 			cells = append(cells, string(f.Status))
@@ -439,13 +584,25 @@ func distinctStatuses(rows []analyze.Finding) int {
 	return len(seen)
 }
 
-// sortForDisplay orders rows by severity, then by the names a reader scans for.
+// sortForDisplay orders rows by exploitation evidence where --triage supplied
+// any, then by severity, then by the names a reader scans for.
+//
+// The triage comparisons come first and cost nothing when the flag was off:
+// every row is then in the same band with the same percentile, both tests fall
+// through, and what remains is exactly the severity ordering this function has
+// always done. That is what keeps an untriaged report byte-identical.
 //
 // Display order only. The JSON order is published and belongs to
 // analyze.sortFindings, which is deliberately left alone.
 func sortForDisplay(rows []analyze.Finding) {
 	sort.SliceStable(rows, func(i, j int) bool {
 		a, c := rows[i], rows[j]
+		if ba, bc := priorityBand(a), priorityBand(c); ba != bc {
+			return ba < bc
+		}
+		if pa, pc := percentile(a), percentile(c); pa != pc {
+			return pa > pc // likeliest first
+		}
 		if ra, rc := cvss.Rank(displaySeverity(a)), cvss.Rank(displaySeverity(c)); ra != rc {
 			return ra < rc
 		}
@@ -454,6 +611,115 @@ func sortForDisplay(rows []analyze.Finding) {
 		}
 		return shortAdvisory(a) < shortAdvisory(c)
 	})
+}
+
+// Bands for the triage sort. Known-exploited outranks every probability there
+// is, because it is not a probability: someone has already done it.
+//
+// Unscored rows land in the same band as untriaged ones, at the bottom. That
+// placement is a compromise and it is the reason writeTriageCaveats exists --
+// in a list ordered by likelihood, last reads as "least likely", and for these
+// rows it means "nobody knows". The alternative, scattering unscored rows
+// through the middle by severity, hides them instead, which is worse.
+const (
+	bandKEV = iota
+	bandScored
+	bandUnscored
+)
+
+func priorityBand(f analyze.Finding) int {
+	switch p := f.Priority; {
+	case p == nil:
+		return bandUnscored
+	case p.KEV != nil:
+		return bandKEV
+	case p.Scored:
+		return bandScored
+	default:
+		return bandUnscored
+	}
+}
+
+func percentile(f analyze.Finding) float64 {
+	if f.Priority == nil {
+		return 0
+	}
+	return f.Priority.Percentile
+}
+
+// triageColumns reports which of the two triage columns this section has
+// anything to put in.
+func triageColumns(rows []analyze.Finding) (epss, kev bool) {
+	for _, f := range rows {
+		if f.Priority == nil {
+			continue
+		}
+		if f.Priority.Scored {
+			epss = true
+		}
+		if f.Priority.KEV != nil {
+			kev = true
+		}
+	}
+	return epss, kev
+}
+
+// displayEPSS is the percentile as a percentage, which is the form a human can
+// reason about. The raw score is in --details and in the JSON: 0.03 reads as
+// "negligible" and is in fact the 87th percentile of every scored CVE there is,
+// because the distribution is extremely skewed.
+//
+// An unscored row gets a dash rather than 0.0%, since the two mean opposite
+// things.
+func displayEPSS(f analyze.Finding) string {
+	if f.Priority == nil || !f.Priority.Scored {
+		return "-"
+	}
+	return fmt.Sprintf("%.1f%%", f.Priority.Percentile*100)
+}
+
+// writePriorityDetail is the --details view of the exploitation evidence.
+//
+// It names the CVE the score was looked up under, which for a Go finding is not
+// the id at the top of the block -- GO-2025-3547 is scored as CVE-2024-7598 --
+// so the reader can check the join rather than take it on faith.
+func writePriorityDetail(b *strings.Builder, f analyze.Finding) {
+	p := f.Priority
+	if p == nil {
+		return
+	}
+	switch {
+	case p.Scored:
+		line := fmt.Sprintf("%.1f%% percentile (epss %.5f)", p.Percentile*100, p.EPSS)
+		if p.CVE != f.CVE {
+			line += " for " + p.CVE
+		}
+		fmt.Fprintf(b, "  epss:     %s\n", line)
+	case p.CVE == "":
+		fmt.Fprintf(b, "  epss:     not scored - this advisory has no CVE id, and both feeds are keyed by CVE\n")
+	default:
+		fmt.Fprintf(b, "  epss:     not scored - %s is not in the feed yet\n", p.CVE)
+	}
+	if p.KEV != nil {
+		line := fmt.Sprintf("in CISA's known-exploited catalog since %s", p.KEV.DateAdded)
+		if p.KEV.DueDate != "" {
+			line += fmt.Sprintf(", federal remediation due %s", p.KEV.DueDate)
+		}
+		if p.KEV.Ransomware {
+			line += "; known ransomware campaign use"
+		}
+		fmt.Fprintf(b, "  kev:      %s\n", line)
+	}
+}
+
+func displayKEV(f analyze.Finding) string {
+	if f.Priority == nil || f.Priority.KEV == nil {
+		return ""
+	}
+	if f.Priority.KEV.Ransomware {
+		return "ransomware"
+	}
+	return "yes"
 }
 
 // displaySeverity is the finding's severity, as a label that always sorts.
@@ -562,6 +828,7 @@ func writeDetail(b *strings.Builder, f analyze.Finding) {
 		}
 		fmt.Fprintf(b, "  severity: %s\n", line)
 	}
+	writePriorityDetail(b, f)
 	if f.Component() != f.Package && f.Package != "" {
 		// The source package is worth showing precisely where it differs: it is
 		// what the advisory is filed against, and what a reader will find if
