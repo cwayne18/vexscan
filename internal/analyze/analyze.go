@@ -74,6 +74,16 @@ type Options struct {
 	// Ecosystems restricts which plugins run (--ecosystem). Empty runs them
 	// all. Naming one nothing handles is an error, not an empty result.
 	Ecosystems []string
+	// Severities restricts the result to findings carrying these severity
+	// labels (--severity), already canonicalized through cvss.Parse by the
+	// caller. Empty keeps everything.
+	//
+	// Unlike Ecosystems this changes what is reported rather than what runs:
+	// every plugin still inventories and every advisory is still resolved,
+	// because a finding's severity is only knowable once its advisory is in
+	// hand. What it does buy is that the LLM overlay is never asked about a row
+	// nobody is going to read.
+	Severities []string
 
 	CVEs    []string // optional filter; empty means "every advisory that applies"
 	Version string   // optional override of the detected module version (image mode)
@@ -166,6 +176,11 @@ type Result struct {
 	// not be read. It is not part of Failed(): see vexOverlay for why a hub
 	// failure is not the same kind of incompleteness as an ecosystem failure.
 	VEXHubs []ecosystem.VEXHubResult `json:"vex_hubs,omitempty"`
+
+	// Withheld is what --severity removed from Findings, and is nil when the
+	// flag was not used or hid nothing. See severityFilter: a filtered result
+	// and a clean one are indistinguishable without it.
+	Withheld *Withheld `json:"withheld,omitempty"`
 }
 
 // Failed reports whether the findings are an incomplete account of the target
@@ -486,6 +501,11 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	}
 
 	severityOverlay(result.Findings, run.resolver.severities())
+	// Filtering here, rather than in the renderer, is what keeps every count
+	// downstream honest: the LLM is never billed for a row nobody will read,
+	// and a hub's Matched is statements about findings that are actually in the
+	// report rather than ones that had already been dropped.
+	result.Findings, result.Withheld = severityFilter(result.Findings, opts.Severities)
 	// The image is only a product for a scan that was given one: --rootfs
 	// analyzes a tree whose provenance nobody recorded, and inventing a purl
 	// from a directory name would look up an artifact that does not exist.
@@ -628,6 +648,12 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 	result.Findings = append(result.Findings, unmapped(opts.CVEs, result.Findings)...)
 
 	severityOverlay(result.Findings, run.resolver.severities())
+	// See runTree for why the filter runs before the overlays rather than in
+	// the renderer. Repo mode is the path where it bites hardest: govulncheck's
+	// OpenVEX carries no severity, so every Go finding here is UNKNOWN and a
+	// --severity that does not name UNKNOWN empties the report completely. The
+	// renderer has to say so, which is what Withheld is for.
+	result.Findings, result.Withheld = severityFilter(result.Findings, opts.Severities)
 	// No productOverlay here: repo mode has no image, and the only artifact a
 	// checkout is is its own module, which the Go plugin already recorded.
 	result.VEXHubs = vexOverlay(ctx, opts.VEXHubs, result.Findings, run.resolver.aliases(), logf)

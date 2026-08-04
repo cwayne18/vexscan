@@ -213,3 +213,81 @@ func TestRankIsCaseInsensitive(t *testing.T) {
 		t.Error("Rank must not depend on the case of the label")
 	}
 }
+
+// TestLabelsIsRankOrderAndComplete ties Labels to Rank, so a seventh severity
+// can only be added to both or neither. Anything walking the severities walks
+// Labels, and one that Rank knew about but Labels omitted would be a spread a
+// summary line silently failed to count.
+func TestLabelsIsRankOrderAndComplete(t *testing.T) {
+	for i := 1; i < len(Labels); i++ {
+		if Rank(Labels[i-1]) >= Rank(Labels[i]) {
+			t.Errorf("Labels is not in Rank order: %s (%d) before %s (%d)",
+				Labels[i-1], Rank(Labels[i-1]), Labels[i], Rank(Labels[i]))
+		}
+	}
+	// Rank's unrecognized bucket is the last value it can return, so every
+	// rank below it must be spoken for by a label.
+	unrecognized := Rank("nonsense")
+	for r := 0; r < unrecognized; r++ {
+		found := false
+		for _, l := range Labels {
+			if Rank(l) == r {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("Rank returns %d for some label, but no entry of Labels has that rank", r)
+		}
+	}
+}
+
+func TestDisplayTurnsAnUnratedFindingIntoUnknown(t *testing.T) {
+	for _, in := range []string{"", "   "} {
+		if got := Display(in); got != Unknown {
+			t.Errorf("Display(%q) = %q, want %q", in, got, Unknown)
+		}
+	}
+	if got := Display(High); got != High {
+		t.Errorf("Display(%q) = %q, want it unchanged", High, got)
+	}
+}
+
+// TestParseIsStrictWhereNormalizeIsNot is the point of having both. Normalize
+// exists to swallow whatever a database publishes; Parse exists to reject what
+// a user mistyped, because "CRITCAL" quietly becoming UNKNOWN would select the
+// unrated findings instead of the critical ones.
+func TestParseIsStrictWhereNormalizeIsNot(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{"CRITICAL", Critical, true},
+		{"critical", Critical, true},
+		{"  High  ", High, true},
+		{"MODERATE", Medium, true}, // what GitHub prints
+		{"moderate", Medium, true},
+		{"UNKNOWN", Unknown, true}, // nameable, so it can be asked for
+		{"none", None, true},
+		{"CRITCAL", "", false}, // the typo that matters
+		{"", "", false},
+		{"HIGHEST", "", false},
+		{"9.1", "", false},
+	} {
+		got, ok := Parse(tc.in)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("Parse(%q) = (%q, %v), want (%q, %v)", tc.in, got, ok, tc.want, tc.ok)
+		}
+		if ok && Normalize(got) != got {
+			t.Errorf("Parse(%q) returned %q, which Normalize does not consider canonical", tc.in, got)
+		}
+	}
+	// Every label Parse can return is one Labels knows, so the flag's help text
+	// and the values it accepts cannot disagree.
+	for _, l := range Labels {
+		if got, ok := Parse(l); !ok || got != l {
+			t.Errorf("Parse(%q) = (%q, %v), want it to round-trip", l, got, ok)
+		}
+	}
+}

@@ -650,3 +650,134 @@ func TestOnlyAffectedFindingsCanBeVexed(t *testing.T) {
 		t.Errorf("the ruled-out row left its section:\n%s", out)
 	}
 }
+
+// --severity: the renderer's whole job here is to make sure a filtered report
+// can never be mistaken for a clean one.
+
+func filteredReport(t *testing.T, w *analyze.Withheld, findings ...analyze.Finding) string {
+	t.Helper()
+	return renderText(&analyze.Result{
+		SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
+		Findings: findings, Withheld: w,
+	}, false)
+}
+
+func TestTheBannerSaysWhatTheFilterHid(t *testing.T) {
+	out := filteredReport(t, &analyze.Withheld{
+		Severities: []string{"CRITICAL", "HIGH"},
+		Count:      118,
+		BySeverity: map[string]int{"MEDIUM": 73, "LOW": 9, "UNKNOWN": 36},
+	}, gccTrio[1])
+
+	note := lineWith(t, out, "withheld")
+	for _, want := range []string{"NOTE:", "--severity CRITICAL,HIGH", "118 of 119"} {
+		if !strings.Contains(note, want) {
+			t.Errorf("banner %q is missing %q", note, want)
+		}
+	}
+	// Rank order, not map order, so the line reads the same way the summary does.
+	spread := lineWith(t, out, "no rating was published")
+	if got := strings.TrimSpace(spread); got != "36 unknown (no rating was published), 73 medium, 9 low" {
+		t.Errorf("spread = %q", got)
+	}
+}
+
+// The gloss is the sentence that keeps this honest: 36 unrated findings must
+// not disappear behind a number that reads like low-priority noise.
+func TestTheUnratedGlossOnlyAppearsWhenUnratedRowsWereHidden(t *testing.T) {
+	out := filteredReport(t, &analyze.Withheld{
+		Severities: []string{"CRITICAL", "HIGH", "UNKNOWN"},
+		Count:      82,
+		BySeverity: map[string]int{"MEDIUM": 73, "LOW": 9},
+	}, gccTrio[1])
+	if strings.Contains(out, "no rating was published") {
+		t.Errorf("glossed a spread with no unrated rows in it:\n%s", out)
+	}
+	if !strings.Contains(out, "73 medium, 9 low") {
+		t.Errorf("want the plain spread, got:\n%s", out)
+	}
+}
+
+func TestNoBannerWithoutTheFlag(t *testing.T) {
+	out := report(t, false, gccTrio...)
+	for _, unwanted := range []string{"--severity", "withheld"} {
+		if strings.Contains(out, unwanted) {
+			t.Errorf("an unfiltered report mentions %q:\n%s", unwanted, out)
+		}
+	}
+}
+
+// The --repo case, and the one this feature could most easily have got wrong:
+// govulncheck publishes no severity, so --severity HIGH hides every Go finding
+// there is. Printing the ordinary "no findings" line would be a clean bill of
+// health for a scan that found twelve things.
+func TestFilteringEverythingIsNotACleanResult(t *testing.T) {
+	out := renderText(&analyze.Result{
+		SchemaVersion: analyze.SchemaVersion, Target: "github.com/cwayne18/vexscan", Mode: "repo",
+		Withheld: &analyze.Withheld{
+			Severities: []string{"HIGH", "CRITICAL"},
+			Count:      12,
+			BySeverity: map[string]int{"UNKNOWN": 12},
+		},
+	}, false)
+
+	for _, want := range []string{
+		"No findings at these severities.",
+		"--severity HIGH,CRITICAL withheld all 12 finding(s)",
+		"12 unknown (no rating was published)",
+		"This is a filtered view, not a clean result.",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
+	}
+	// The wording for an incomplete scan is a different and stronger claim, and
+	// must not be borrowed for a filter the reader asked for.
+	if strings.Contains(out, "the scan was incomplete") {
+		t.Errorf("a filtered report claims the scan was incomplete:\n%s", out)
+	}
+}
+
+// A genuinely clean scan still reads as clean. The filter's wording only
+// applies when the filter is what emptied the report.
+func TestAnEmptyUnfilteredReportIsUnchanged(t *testing.T) {
+	out := renderText(&analyze.Result{
+		SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
+	}, false)
+	if !strings.Contains(out, "No findings: nothing selected was found") {
+		t.Errorf("want the plain empty wording, got:\n%s", out)
+	}
+	if strings.Contains(out, "filtered view") {
+		t.Errorf("an unfiltered empty report claims to be filtered:\n%s", out)
+	}
+}
+
+// An incomplete scan outranks a filter: the reader needs to know the tool could
+// not read something before they are told what they chose to hide.
+func TestIncompletenessOutranksTheFilterWhenBothEmptyTheReport(t *testing.T) {
+	out := renderText(&analyze.Result{
+		SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
+		Ecosystems: []ecosystem.EcosystemResult{{ID: "os", Error: "dpkg status unreadable"}},
+		Withheld:   &analyze.Withheld{Severities: []string{"HIGH"}, Count: 3, BySeverity: map[string]int{"LOW": 3}},
+	}, false)
+	if !strings.Contains(out, "This is not a clean result.") {
+		t.Errorf("want the incomplete-scan wording, got:\n%s", out)
+	}
+	if !strings.Contains(out, "INCOMPLETE: ecosystem os") {
+		t.Errorf("want the INCOMPLETE banner, got:\n%s", out)
+	}
+}
+
+// The summary counts rows that are in the report, and the banner accounts for
+// the rest -- the two lines have to add up.
+func TestTheSummaryCountsOnlyWhatSurvivedTheFilter(t *testing.T) {
+	out := filteredReport(t, &analyze.Withheld{
+		Severities: []string{"MEDIUM"}, Count: 4, BySeverity: map[string]int{"LOW": 4},
+	}, gccTrio...)
+	if got := lineWith(t, out, "affected by severity"); !strings.Contains(got, "2 medium") {
+		t.Errorf("summary = %q, want only the two linked rows", got)
+	}
+	if !strings.Contains(lineWith(t, out, "withheld"), "4 of 7") {
+		t.Errorf("banner does not account for the difference:\n%s", out)
+	}
+}

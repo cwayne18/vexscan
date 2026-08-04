@@ -835,12 +835,61 @@ Two things report `UNKNOWN` that are worth knowing about:
 - **CVSS 4.0-only records are not scored.** A v4 base score is a 270-entry
   MacroVector lookup with interpolation, not a formula. Records carrying only a
   v4 vector report `UNKNOWN` rather than a number this tool made up. Most
-  advisories still publish v3 alongside; on `debian:12` 34 of 159 findings are
+  advisories still publish v3 alongside; on `debian:12` 36 of 161 findings are
   unrated, from a mix of v4-only and pre-CVSS records.
 - **`--repo` Go findings carry no severity at all.** That path resolves
   advisories inside govulncheck, which is run with `-format openvex`, and OpenVEX
   carries no severity field. Image mode goes entirely through the resolver and is
   fully covered — on `debian:12 --all` every finding gets a rating.
+
+### Filtering by severity (`--severity`)
+
+`--severity CRITICAL,HIGH` reports only the findings at those ratings. It is
+comma-separated or repeatable, case-insensitive, accepts `MODERATE` for
+`MEDIUM`, and a name it does not recognize is a command-line error (exit 2)
+rather than a silently empty report.
+
+```console
+$ vexscan --image debian:12 --all --ecosystem os --severity CRITICAL,HIGH
+vexscan report (image) for debian:12
+NOTE: --severity CRITICAL,HIGH withheld 123 of 161 findings:
+      36 unknown (no rating was published), 78 medium, 9 low
+
+  os       Debian:12                  88 components    38 findings
+  affected by severity: 10 critical, 26 high
+```
+
+The filter is applied to the result, not to the rendering, so `--format json`
+shrinks the same way and gains a `withheld` block that matches the banner
+exactly. It also runs before the LLM overlay, so `--severity CRITICAL --llm`
+only pays for criticals.
+
+Three things about it are worth knowing before you put it in CI:
+
+- **`UNKNOWN` is a severity you have to ask for.** As in Trivy, a `--severity`
+  that does not name it drops it — 36 findings on `debian:12` above. Those are
+  unrated, not unimportant ([above](#severity)), so every filtered run prints
+  what it withheld and glosses the unrated count. Name `UNKNOWN` alongside the
+  ratings you want to keep them.
+- **`--repo` mode has no severities at all**, for the reason in the previous
+  section, so any `--severity` that omits `UNKNOWN` filters out *everything*.
+  That does not print as a clean scan:
+
+  ```console
+  $ vexscan --repo https://github.com/cwayne18/vexscan --all --severity HIGH,CRITICAL
+  No findings at these severities.
+  --severity HIGH,CRITICAL withheld all 1 finding(s): 1 unknown (no rating was published).
+  This is a filtered view, not a clean result.
+  ```
+
+- **A `--cves` id that matched nothing is never filtered.** Those rows exist so
+  that an id you named by hand cannot vanish from the report; they carry no
+  severity, and hiding them would recreate exactly the silence they are there to
+  prevent.
+
+Exit codes are unchanged: `0` the scan completed, `1` it could not read
+something, `2` the command line was wrong. Findings existing — at any severity —
+is not a failure, which is what keeps exit `1` worth acting on.
 
 ### VEX hubs (`--vexhub`)
 
@@ -931,7 +980,12 @@ The JSON is `schema_version: 2`:
   "findings": [ /* flat, sorted — jq '.findings[]' still works */ ],
   "ecosystems": [ { "id": "os", "components": 65, "error": "" } ],
   "unreadable": { "count": 3, "paths": ["/opt/vendor"] },  // omitted when nothing was skipped
-  "vex_hubs": [ { "url": "...", "author": "...", "products": 1082, "matched": 3 } ]  // only with --vexhub
+  "vex_hubs": [ { "url": "...", "author": "...", "products": 1082, "matched": 3 } ],  // only with --vexhub
+  "withheld": {  // only when --severity hid something; findings[] is already the kept set
+    "severities": ["CRITICAL", "HIGH"],
+    "count": 123,
+    "by_severity": { "UNKNOWN": 36, "MEDIUM": 78, "LOW": 9 }
+  }
 }
 ```
 
@@ -995,6 +1049,7 @@ be read, or part of the tree could not be read, `2` the command line was wrong.
 | `--osv-ecosystem` | *(auto)* | Override the OSV ecosystem derived from os-release, e.g. `Debian:12` |
 | `--roots` | | Extra entrypoints for the closures — shared libraries and language imports; repeatable |
 | `--vexhub` | | VEX Repository to check findings against, e.g. `https://github.com/rancher/vexhub` (also a raw base URL or a local directory); repeatable, earliest wins — see [VEX hubs](#vex-hubs---vexhub) |
+| `--severity` | *(all)* | Only report findings at these severities: `CRITICAL`, `HIGH`, `UNKNOWN`, `MEDIUM`, `LOW`, `NONE`; comma-separated or repeatable. `UNKNOWN` must be named to be shown — see [Filtering by severity](#filtering-by-severity---severity) |
 | `--dlopen-policy` | `taint` | `taint` (block conclusions) or `assume-none` |
 | `--dynamic-import-policy` | `taint` | The same knob for a language import graph's computed imports. These are far more common than `dlopen`, so `assume-none` discards much more |
 | `--trust-import-absence` | `false` | Let a missing dynamic import conclude `not_in_execute_path` (weaker than it looks) |

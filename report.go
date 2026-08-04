@@ -30,12 +30,24 @@ func renderText(res *analyze.Result, details bool) string {
 	writeHeader(&b, res)
 
 	if len(res.Findings) == 0 {
-		// Empty because nothing was wrong and empty because nothing was read
-		// look identical, and only one of them is good news.
-		if res.Failed() {
+		// Three ways to be empty, and only one of them is good news. Nothing
+		// was wrong; nothing was read; or something was found and the reader's
+		// own filter hid all of it.
+		switch {
+		case res.Failed():
 			b.WriteString("No findings, but the scan was incomplete: see above.\n")
 			b.WriteString("This is not a clean result.\n")
-		} else {
+		case res.Withheld != nil:
+			// The --repo case: govulncheck publishes no severity, so every Go
+			// finding is UNKNOWN and a --severity that does not name UNKNOWN
+			// empties the report. Printing the bare "no findings" line there
+			// would be this tool telling its worst available lie.
+			b.WriteString("No findings at these severities.\n")
+			fmt.Fprintf(&b, "--severity %s withheld all %d finding(s): %s.\n",
+				strings.Join(res.Withheld.Severities, ","), res.Withheld.Count,
+				withheldSpread(res.Withheld))
+			b.WriteString("This is a filtered view, not a clean result.\n")
+		default:
 			b.WriteString("No findings: nothing selected was found in this target,\n")
 			b.WriteString("or no matching advisories were published for it.\n")
 		}
@@ -77,6 +89,19 @@ func writeHeader(b *strings.Builder, res *analyze.Result) {
 		if u.Count > len(u.Paths) {
 			fmt.Fprintf(b, "  ... and %d more\n", u.Count-len(u.Paths))
 		}
+	}
+	if w := res.Withheld; w != nil && len(res.Findings) > 0 {
+		// Above the VEX notes, because this one changes which rows exist at all
+		// while those only change how the rows are grouped. Not an INCOMPLETE
+		// banner: the scan read everything it meant to and the reader asked for
+		// the subset. But loud, because a filtered report and a clean one are
+		// otherwise the same document.
+		//
+		// Skipped when nothing survived, where renderText says the same thing at
+		// more length and the two together read as a stutter.
+		fmt.Fprintf(b, "NOTE: --severity %s withheld %d of %d findings:\n",
+			strings.Join(w.Severities, ","), w.Count, w.Count+len(res.Findings))
+		fmt.Fprintf(b, "      %s\n", withheldSpread(w))
 	}
 	for _, h := range res.VEXHubs {
 		if h.Error == "" {
@@ -129,19 +154,43 @@ func writeSummary(b *strings.Builder, res *analyze.Result) {
 		}
 		counts[displaySeverity(f)]++
 	}
-	var parts []string
-	for _, label := range []string{cvss.Critical, cvss.High, cvss.Unknown, cvss.Medium, cvss.Low, cvss.None} {
-		if counts[label] > 0 {
-			parts = append(parts, fmt.Sprintf("%d %s", counts[label], strings.ToLower(label)))
-		}
-	}
-	if len(parts) > 0 {
-		fmt.Fprintf(b, "  affected by severity: %s\n", strings.Join(parts, ", "))
+	if spread := severitySpread(counts, false); spread != "" {
+		fmt.Fprintf(b, "  affected by severity: %s\n", spread)
 	}
 	if vexed > 0 {
 		fmt.Fprintf(b, "  already vexed: %d by %s\n", vexed, vexAuthors(res))
 	}
 	b.WriteString("\n")
+}
+
+// withheldSpread is what --severity hid, by severity.
+func withheldSpread(w *analyze.Withheld) string {
+	return severitySpread(w.BySeverity, true)
+}
+
+// severitySpread renders a count-per-label as "10 critical, 26 high", in the
+// order the ranking puts them rather than the order a map iterates.
+//
+// gloss adds "(no rating was published)" to the unknown count. It is on for the
+// withheld line and off for the affected one, and it is the sentence that keeps
+// a severity filter honest: without it, 36 findings whose records are CVSS
+// v4-only disappear behind a number that reads like low-priority noise. UNKNOWN
+// outranks MEDIUM here for exactly that reason, and a reader who just hid it
+// deserves to be told what they hid.
+func severitySpread(counts map[string]int, gloss bool) string {
+	var parts []string
+	for _, label := range cvss.Labels {
+		n := counts[label]
+		if n == 0 {
+			continue
+		}
+		part := fmt.Sprintf("%d %s", n, strings.ToLower(label))
+		if gloss && label == cvss.Unknown {
+			part += " (no rating was published)"
+		}
+		parts = append(parts, part)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // vexAuthors names who published the statements, for the summary line. A
@@ -342,11 +391,12 @@ func sortForDisplay(rows []analyze.Finding) {
 // MEDIUM on purpose: a severity nobody published is not evidence that the
 // problem is small, and a report several hundred rows long is one where
 // anything sorted to the bottom stops being read.
+//
+// The mapping itself lives in cvss because --severity filters on it too, in
+// another package. A renderer and a filter disagreeing about what an unrated
+// finding is would show a row the filter thought it had removed.
 func displaySeverity(f analyze.Finding) string {
-	if f.Severity == "" {
-		return cvss.Unknown
-	}
-	return f.Severity
+	return cvss.Display(f.Severity)
 }
 
 // cveSuffix matches a bare CVE id, which is what has to be left behind when a

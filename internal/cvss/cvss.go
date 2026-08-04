@@ -31,6 +31,13 @@ const (
 	Unknown = "UNKNOWN"
 )
 
+// Labels is every severity in this package's vocabulary, in Rank order.
+//
+// Anything that walks the severities -- a summary line, a --severity flag's
+// help text, the set of names that flag accepts -- walks this, so a seventh
+// label cannot be taught to one of them and not the others.
+var Labels = []string{Critical, High, Unknown, Medium, Low, None}
+
 // metric weights, from the CVSS v3.1 specification, section 7.4. The v3.0
 // weights are identical for every base metric; the two versions differ only in
 // the roundup function and in some wording, which is why both are accepted.
@@ -194,6 +201,49 @@ func Rank(label string) int {
 		return 5
 	default:
 		return 6
+	}
+}
+
+// Display is the label to show a reader, and the one to filter on.
+//
+// An empty label means no advisory was resolved for the finding at all, which
+// is not the same fact as an advisory that published no rating -- the resolver
+// keeps them distinct on purpose. To a reader deciding what to look at they are
+// the same fact, so both arrive here as UNKNOWN rather than one of them
+// rendering as a blank cell or slipping through a severity filter.
+func Display(label string) string {
+	if strings.TrimSpace(label) == "" {
+		return Unknown
+	}
+	return label
+}
+
+// Parse maps a severity a user typed onto this package's vocabulary, strictly.
+//
+// Unlike Normalize, an unrecognized name fails instead of becoming Unknown.
+// That difference is the whole reason this exists: Normalize("CRITCAL") is
+// UNKNOWN, so a typo in --severity would silently ask for exactly the unrated
+// findings rather than the critical ones -- the worst available misreading of
+// the intent. A caller with a typo gets an error and a list of the real names.
+func Parse(s string) (string, bool) {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case Critical:
+		return Critical, true
+	case High:
+		return High, true
+	case Medium, "MODERATE":
+		// MODERATE is accepted for the same reason Normalize accepts it: it is
+		// what GitHub prints, so it is what someone copying a severity out of
+		// an advisory page will type.
+		return Medium, true
+	case Low:
+		return Low, true
+	case None:
+		return None, true
+	case Unknown:
+		return Unknown, true
+	default:
+		return "", false
 	}
 }
 

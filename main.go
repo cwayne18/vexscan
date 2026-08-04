@@ -14,17 +14,22 @@ import (
 	"syscall"
 
 	"github.com/cwayne18/vexscan/internal/analyze"
+	"github.com/cwayne18/vexscan/internal/cvss"
 	"github.com/cwayne18/vexscan/internal/elfgraph"
 	"github.com/cwayne18/vexscan/internal/gist"
 	"github.com/cwayne18/vexscan/internal/modgraph"
 )
 
 func main() {
-	var packages, ecosystems, roots, vexhubs stringList
+	var packages, ecosystems, roots, vexhubs, severities stringList
 	flag.Var(&packages, "package", "package to check: a purl, an ecosystem:name shorthand (deb:openssl, golang:golang.org/x/net), or a bare name resolved against the inventory; repeatable")
 	flag.Var(&ecosystems, "ecosystem", "restrict the scan to these ecosystems (golang, os, pypi, npm, maven, or a distro family like debian); repeatable, default all")
 	flag.Var(&roots, "roots", "extra entrypoints for the reachability closures (shared libraries and language imports), for an image whose real command comes from outside its config; repeatable")
 	flag.Var(&vexhubs, "vexhub", "VEX Hub repository to check findings against, e.g. https://github.com/rancher/vexhub (also accepts a raw base URL or a local directory); repeatable, earliest wins")
+	flag.Var(&severities, "severity", "only report findings at these severities: "+
+		strings.Join(cvss.Labels, ", ")+"; comma-separated or repeatable "+
+		"(UNKNOWN means no rating was published, and must be named to be shown -- "+
+		"every --repo finding is UNKNOWN, because govulncheck's OpenVEX carries no severity)")
 	var (
 		image      = flag.String("image", "", "container image reference to inspect (mutually exclusive with --rootfs and --repo)")
 		rootfs     = flag.String("rootfs", "", "filesystem tree already on disk to inspect -- an unpacked image, a mounted volume, a machine's own / (mutually exclusive with --image and --repo)")
@@ -69,6 +74,19 @@ func main() {
 	case "text", "json", "inventory":
 	default:
 		fail("unknown --format %q; want text, json, or inventory", *format)
+	}
+	// Canonicalized here, and strictly, so that a typo is a command-line error
+	// before the pull rather than an empty report after it. cvss.Parse rather
+	// than cvss.Normalize for one reason: Normalize("CRITCAL") is UNKNOWN, so
+	// the lenient version would read a typo as a request for exactly the
+	// unrated findings -- the one misreading that looks like a working scan.
+	keep := make([]string, 0, len(severities))
+	for _, s := range severities {
+		label, ok := cvss.Parse(s)
+		if !ok {
+			fail("unknown --severity %q; want one of %s", s, strings.Join(cvss.Labels, ", "))
+		}
+		keep = append(keep, label)
 	}
 	cves := parseCVEs(*cvesFlag, *cvesFile)
 
@@ -128,6 +146,7 @@ func main() {
 		Module:             *module,
 		All:                *all,
 		Ecosystems:         ecosystems,
+		Severities:         keep,
 		CVEs:               cves,
 		Version:            *version,
 		OS:                 *goos,
@@ -430,6 +449,9 @@ Examples:
 
   # ... and the evidence behind every row of it
   vexscan --image registry.access.redhat.com/ubi9/ubi:latest --all --ecosystem os --details
+
+  # ... or just the ones worth waking someone for (the report says what it hid)
+  vexscan --image debian:12 --all --ecosystem os --severity CRITICAL,HIGH
 
   # One Python distribution, by any spelling of its name
   vexscan --image python:3.12-slim --package pypi:PyYAML

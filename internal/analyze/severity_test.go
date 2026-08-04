@@ -127,3 +127,149 @@ func TestSeverityOverlayLeavesUnresolvableFindingsAlone(t *testing.T) {
 		t.Errorf("unresolved finding was labelled: %+v", findings[0])
 	}
 }
+
+// rated is a linked finding at one severity, which is all severityFilter looks
+// at. An empty label is the real and common case: no advisory was resolved.
+func rated(id, label string) Finding {
+	return Finding{
+		Ecosystem: "os", ID: id, CVE: id,
+		Severity: label, Status: StatusLinked,
+	}
+}
+
+func labels(findings []Finding) []string {
+	out := make([]string, 0, len(findings))
+	for _, f := range findings {
+		out = append(out, f.ID)
+	}
+	return out
+}
+
+func TestNoSeverityFilterIsANoOp(t *testing.T) {
+	in := []Finding{rated("a", cvss.Critical), rated("b", cvss.Low)}
+	got, w := severityFilter(in, nil)
+	if len(got) != 2 {
+		t.Errorf("kept %v, want both", labels(got))
+	}
+	if w != nil {
+		t.Errorf("Withheld = %+v, want nil so no banner prints", w)
+	}
+}
+
+func TestSeverityFilterKeepsOnlyWhatWasNamed(t *testing.T) {
+	in := []Finding{
+		rated("crit", cvss.Critical),
+		rated("high", cvss.High),
+		rated("med", cvss.Medium),
+		rated("low", cvss.Low),
+	}
+	got, w := severityFilter(in, []string{cvss.Critical, cvss.High})
+	if len(got) != 2 || got[0].ID != "crit" || got[1].ID != "high" {
+		t.Errorf("kept %v, want [crit high]", labels(got))
+	}
+	if w == nil || w.Count != 2 {
+		t.Fatalf("Withheld = %+v, want 2 dropped", w)
+	}
+	if w.BySeverity[cvss.Medium] != 1 || w.BySeverity[cvss.Low] != 1 {
+		t.Errorf("BySeverity = %v, want one medium and one low", w.BySeverity)
+	}
+}
+
+// The decision that most surprises a Trivy user, pinned: an unrated finding is
+// dropped by --severity CRITICAL,HIGH, and counted as UNKNOWN so the banner can
+// say the drop happened.
+func TestAnUnratedFindingIsWithheldAsUnknown(t *testing.T) {
+	in := []Finding{rated("crit", cvss.Critical), rated("unrated", "")}
+	got, w := severityFilter(in, []string{cvss.Critical, cvss.High})
+	if len(got) != 1 || got[0].ID != "crit" {
+		t.Errorf("kept %v, want [crit]", labels(got))
+	}
+	if w == nil || w.BySeverity[cvss.Unknown] != 1 {
+		t.Fatalf("Withheld = %+v, want the unrated finding counted as UNKNOWN", w)
+	}
+}
+
+// An empty Severity and an explicit UNKNOWN are the same fact to a reader, so
+// naming UNKNOWN has to reach both.
+func TestNamingUnknownKeepsBothSpellingsOfUnrated(t *testing.T) {
+	in := []Finding{
+		rated("empty", ""),
+		rated("explicit", cvss.Unknown),
+		rated("high", cvss.High),
+	}
+	got, w := severityFilter(in, []string{cvss.Unknown})
+	if len(got) != 2 || got[0].ID != "empty" || got[1].ID != "explicit" {
+		t.Errorf("kept %v, want both unrated spellings", labels(got))
+	}
+	if w == nil || w.Count != 1 || w.BySeverity[cvss.High] != 1 {
+		t.Errorf("Withheld = %+v, want only the high one dropped", w)
+	}
+}
+
+// The exemption. unmapped emits this row so an id the user typed cannot vanish;
+// a severity filter deleting it would recreate exactly the silence that row
+// exists to prevent, and would do it to the id they asked about most directly.
+func TestARequestedIdThatMatchedNothingSurvivesTheFilter(t *testing.T) {
+	in := append(unmapped([]string{"CVE-2024-9999"}, nil), rated("med", cvss.Medium))
+	got, w := severityFilter(in, []string{cvss.Critical})
+	if len(got) != 1 || got[0].CVE != "CVE-2024-9999" {
+		t.Fatalf("kept %v, want the unmatched id to survive", labels(got))
+	}
+	if got[0].Reason != "no_component_matched" {
+		t.Errorf("Reason = %q, want it unchanged", got[0].Reason)
+	}
+	// It survived, so it is not counted as withheld -- the banner would be
+	// claiming to have hidden a row that is printed right below it.
+	if w == nil || w.Count != 1 || w.BySeverity[cvss.Medium] != 1 {
+		t.Errorf("Withheld = %+v, want only the medium finding counted", w)
+	}
+}
+
+// An undetermined finding with no severity is not exempt: only the
+// no_component_matched receipt is.
+func TestTheExemptionIsNarrow(t *testing.T) {
+	f := Finding{ID: "x", CVE: "x", Status: StatusUndetermined, Reason: "dlopen_reachable"}
+	got, w := severityFilter([]Finding{f}, []string{cvss.Critical})
+	if len(got) != 0 {
+		t.Errorf("kept %v, want an ordinary undetermined finding to be filtered", labels(got))
+	}
+	if w == nil || w.Count != 1 {
+		t.Errorf("Withheld = %+v, want it counted", w)
+	}
+}
+
+// A filter that hid nothing produces no banner, so the line that will one day
+// matter is not one a reader has been trained to skip.
+func TestAFilterThatHidNothingReportsNothing(t *testing.T) {
+	in := []Finding{rated("crit", cvss.Critical)}
+	got, w := severityFilter(in, []string{cvss.Critical, cvss.High})
+	if len(got) != 1 {
+		t.Errorf("kept %v, want the critical finding", labels(got))
+	}
+	if w != nil {
+		t.Errorf("Withheld = %+v, want nil when nothing was dropped", w)
+	}
+}
+
+func TestWithheldQuotesTheFlagBack(t *testing.T) {
+	_, w := severityFilter([]Finding{rated("low", cvss.Low)}, []string{cvss.Critical, cvss.High})
+	if w == nil {
+		t.Fatal("want a Withheld")
+	}
+	if len(w.Severities) != 2 || w.Severities[0] != cvss.Critical || w.Severities[1] != cvss.High {
+		t.Errorf("Severities = %v, want what --severity asked for", w.Severities)
+	}
+}
+
+// Filtering everything is legal and is the --repo case: every Go finding there
+// is UNKNOWN. What must not happen is it going unrecorded.
+func TestFilteringEverythingIsStillRecorded(t *testing.T) {
+	in := []Finding{rated("a", ""), rated("b", "")}
+	got, w := severityFilter(in, []string{cvss.High, cvss.Critical})
+	if len(got) != 0 {
+		t.Errorf("kept %v, want nothing", labels(got))
+	}
+	if w == nil || w.Count != 2 || w.BySeverity[cvss.Unknown] != 2 {
+		t.Fatalf("Withheld = %+v, want both counted as unrated", w)
+	}
+}
