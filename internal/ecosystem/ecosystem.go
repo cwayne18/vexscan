@@ -360,9 +360,18 @@ type Finding struct {
 	// Location is the path inside the target the finding is about, empty when
 	// the finding is about the whole target. Same value as Binary.
 	Location string `json:"location,omitempty"`
-	// PURL is the component's package URL, and the key a future vendor-VEX
-	// layer will match statements on. Plugins set this one; nothing else can.
+	// PURL is the component's package URL, and the key the vendor-VEX layer
+	// matches statements on. Plugins set this one; nothing else can.
 	PURL string `json:"purl,omitempty"`
+
+	// Product is the purl of the shipped artifact this finding was found in --
+	// the scanned image, or a Go binary's main module. It is the other half of
+	// a VEX lookup: a hub keys its documents by product and names components
+	// like PURL inside them.
+	//
+	// Plugins do not set it. The orchestrator stamps the image product on every
+	// finding, and a plugin that knows a narrower artifact overrides it.
+	Product string `json:"product,omitempty"`
 
 	Binary      string   `json:"binary,omitempty"`
 	Module      string   `json:"module"`
@@ -397,6 +406,12 @@ type Finding struct {
 	LLM           *llm.Verdict `json:"llm,omitempty"`
 	Evidence      []Evidence   `json:"evidence,omitempty"`
 
+	// VEX is a published vendor statement covering this finding, when a
+	// --vexhub was given and one matched. It never changes Status: the verdict
+	// above is what local evidence concluded, and stays comparable between a
+	// run with a hub and a run without one.
+	VEX *VEXStatement `json:"vex,omitempty"`
+
 	// Reachability is how the plugin's deterministic layer characterized a
 	// genuinely-affected component, in its own words ("linked (symbols
 	// retained; reachability not asserted)"). It exists so the orchestrator can
@@ -409,6 +424,57 @@ type Finding struct {
 // should be asked about and a reader should act on.
 func (f Finding) Affected() bool {
 	return f.Status == StatusLinked || f.Status == StatusReachable
+}
+
+// VEXStatement is a vendor's published claim about a finding, copied out of a
+// VEX hub document.
+//
+// Everything needed to audit the claim without re-fetching the hub is here:
+// which hub, which author, which product it was filed under, and any spelling
+// disagreement the match tolerated to get there.
+type VEXStatement struct {
+	// Status is OpenVEX's, not vexscan's: not_affected, affected, fixed,
+	// under_investigation. It is deliberately a different vocabulary from
+	// Finding.Status so the two can never be confused in the JSON.
+	Status          string `json:"status"`
+	Justification   string `json:"justification,omitempty"`
+	ImpactStatement string `json:"impact_statement,omitempty"`
+	ActionStatement string `json:"action_statement,omitempty"`
+
+	Author    string `json:"author,omitempty"`
+	Timestamp string `json:"timestamp,omitempty"`
+	// Product is the artifact purl the statement was filed under, and Hub the
+	// --vexhub it came from.
+	Product string `json:"product,omitempty"`
+	Hub     string `json:"hub,omitempty"`
+	// Match records how the statement's component purl differed from the
+	// finding's, when it did. Empty means they agreed exactly.
+	Match string `json:"match,omitempty"`
+}
+
+// Exculpatory reports whether the vendor's statement says the reader has
+// nothing to do here.
+//
+// Only such a statement moves a row out of AFFECTED. A vendor confirming a
+// finding, or saying they are still looking, must not make it quieter.
+func (v *VEXStatement) Exculpatory() bool {
+	return v != nil && (v.Status == "not_affected" || v.Status == "fixed")
+}
+
+// VEXHubResult records how one --vexhub fared, for the same reason
+// EcosystemResult does: a hub that could not be reached must not look like a
+// hub that had nothing to say.
+type VEXHubResult struct {
+	URL string `json:"url"`
+	// Author is whoever signed the documents actually read from this hub.
+	Author string `json:"author,omitempty"`
+	// Products is how many artifacts the hub indexes, and Matched how many
+	// findings it spoke to.
+	Products int `json:"products,omitempty"`
+	Matched  int `json:"matched"`
+	// Error is why the hub contributed nothing. Unlike an ecosystem error it
+	// does not make the whole run incomplete: see the comment on vexOverlay.
+	Error string `json:"error,omitempty"`
 }
 
 // osPURLTypes are the purl types whose namespace is a distribution rather than

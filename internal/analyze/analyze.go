@@ -94,6 +94,15 @@ type Options struct {
 	// not the same knob as Ecosystems, which chooses which plugins run.
 	OSVEcosystem string
 
+	// VEXHubs are VEX Hub repositories to check findings against (--vexhub),
+	// in priority order: the first hub with a statement about a finding wins,
+	// so an internal hub listed ahead of a vendor's overrides it.
+	//
+	// A statement never changes a finding's status. It records that someone has
+	// already published an answer, which the report uses to decide what a
+	// reader still has to look at.
+	VEXHubs []string
+
 	// GoVersion optionally pins the Go toolchain for repo-mode analysis
 	// (e.g. "1.24.0"). Mainly useful with --module stdlib, whose findings depend
 	// on the toolchain version.
@@ -152,6 +161,11 @@ type Result struct {
 	// looked inside contributes no findings, which is exactly what a directory
 	// full of nothing wrong contributes. Only one of those is good news.
 	Unreadable *target.Unreadable `json:"unreadable,omitempty"`
+
+	// VEXHubs records what each --vexhub contributed, including one that could
+	// not be read. It is not part of Failed(): see vexOverlay for why a hub
+	// failure is not the same kind of incompleteness as an ecosystem failure.
+	VEXHubs []ecosystem.VEXHubResult `json:"vex_hubs,omitempty"`
 }
 
 // Failed reports whether the findings are an incomplete account of the target
@@ -472,6 +486,11 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	}
 
 	severityOverlay(result.Findings, run.resolver.severities())
+	// The image is only a product for a scan that was given one: --rootfs
+	// analyzes a tree whose provenance nobody recorded, and inventing a purl
+	// from a directory name would look up an artifact that does not exist.
+	productOverlay(result.Findings, opts.Image)
+	result.VEXHubs = vexOverlay(ctx, opts.VEXHubs, result.Findings, run.resolver.aliases(), logf)
 	llmOverlay(ctx, llmClient, result.Findings, "", logf)
 	sortFindings(result.Findings)
 	return result, nil
@@ -609,6 +628,9 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 	result.Findings = append(result.Findings, unmapped(opts.CVEs, result.Findings)...)
 
 	severityOverlay(result.Findings, run.resolver.severities())
+	// No productOverlay here: repo mode has no image, and the only artifact a
+	// checkout is is its own module, which the Go plugin already recorded.
+	result.VEXHubs = vexOverlay(ctx, opts.VEXHubs, result.Findings, run.resolver.aliases(), logf)
 	llmOverlay(ctx, llmClient, result.Findings, "source tree", logf)
 	sortFindings(result.Findings)
 	return result, nil
@@ -821,6 +843,33 @@ func (r *advisoryResolver) severities() map[string]severity {
 					continue
 				}
 				out[key] = s
+			}
+		}
+	}
+	return out
+}
+
+// aliases maps every id an advisory is known by onto that advisory's whole set
+// of ids.
+//
+// It exists for the VEX overlay. A finding names its advisory by whichever id
+// its plugin was working from -- the Go plugin reports GO-2025-3547 -- while a
+// hub files under whichever its own scanner used, which for every hub seen so
+// far is the CVE. Neither side is wrong and neither carries the other's
+// spelling, so matching them means going through the record that lists both,
+// which the resolver has already fetched.
+func (r *advisoryResolver) aliases() map[string][]string {
+	out := map[string][]string{}
+	for _, set := range r.cache {
+		for _, adv := range set {
+			if adv == nil {
+				continue
+			}
+			ids := append([]string{adv.ID}, adv.Aliases...)
+			for _, key := range ids {
+				if key != "" {
+					out[key] = ids
+				}
 			}
 		}
 	}

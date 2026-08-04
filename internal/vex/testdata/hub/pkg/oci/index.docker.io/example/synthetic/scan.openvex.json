@@ -1,0 +1,90 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://openvex.dev/docs/public/vex-synthetic",
+  "author": "Example Security Team",
+  "version": 1,
+  "timestamp": "2026-01-01T00:00:00Z",
+  "statements": [
+    {
+      "vulnerability": { "name": "CVE-2020-0001" },
+      "products": [
+        { "@id": "pkg:oci/synthetic?repository_url=index.docker.io/example/synthetic" }
+      ],
+      "status": "not_affected",
+      "justification": "component_not_present",
+      "impact_statement": "This image does not ship the affected component at all.",
+      "timestamp": "2026-01-02T00:00:00Z"
+    },
+    {
+      "vulnerability": { "name": "CVE-2020-0002" },
+      "products": [
+        { "@id": "pkg:oci/synthetic?repository_url=index.docker.io/example/synthetic" }
+      ],
+      "status": "affected",
+      "action_statement": "Upgrade to 1.2.3.",
+      "timestamp": "2026-03-01T00:00:00Z"
+    },
+    {
+      "vulnerability": { "name": "CVE-2020-0002" },
+      "products": [
+        {
+          "@id": "pkg:oci/synthetic?repository_url=index.docker.io/example/synthetic",
+          "subcomponents": [ { "@id": "pkg:rpm/suse/libgcrypt20" } ]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "Named the dependency directly, so this is the more specific claim.",
+      "timestamp": "2026-02-01T00:00:00Z"
+    },
+    {
+      "vulnerability": { "name": "CVE-2020-0003" },
+      "products": [
+        {
+          "@id": "pkg:oci/synthetic?repository_url=index.docker.io/example/synthetic",
+          "subcomponents": [ { "@id": "pkg:rpm/suse/shadow" } ]
+        }
+      ],
+      "status": "under_investigation",
+      "timestamp": "2026-04-01T00:00:00Z"
+    },
+    {
+      "vulnerability": { "name": "CVE-2020-0003" },
+      "products": [
+        {
+          "@id": "pkg:oci/synthetic?repository_url=index.docker.io/example/synthetic",
+          "subcomponents": [ { "@id": "pkg:rpm/suse/shadow" } ]
+        }
+      ],
+      "status": "fixed",
+      "impact_statement": "Amended after the investigation closed.",
+      "timestamp": "2026-05-01T00:00:00Z"
+    },
+    {
+      "vulnerability": { "name": "CVE-2020-0004" },
+      "products": [
+        {
+          "@id": "pkg:oci/synthetic?repository_url=index.docker.io/example/synthetic",
+          "subcomponents": [ { "@id": "pkg:npm/lodash@1.0.0" } ]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_present",
+      "timestamp": "2026-01-02T00:00:00Z"
+    },
+    {
+      "vulnerability": { "name": "" },
+      "products": [
+        { "@id": "pkg:oci/synthetic?repository_url=index.docker.io/example/synthetic" }
+      ],
+      "status": "not_affected",
+      "timestamp": "2026-01-02T00:00:00Z"
+    },
+    {
+      "vulnerability": { "name": "CVE-2020-0005" },
+      "products": [],
+      "status": "not_affected",
+      "timestamp": "2026-01-02T00:00:00Z"
+    }
+  ]
+}

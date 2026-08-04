@@ -474,3 +474,179 @@ func TestSummaryDoesNotRepeatTheEcosystemName(t *testing.T) {
 		t.Errorf("the summary line is missing:\n%s", out)
 	}
 }
+
+// --vexhub
+
+// vexed is the gcc trio's libgcc-s1 row with a vendor statement attached: a
+// linked finding somebody has already published an answer to.
+func vexedFinding(status string) analyze.Finding {
+	f := gccTrio[1]
+	f.VEX = &ecosystem.VEXStatement{
+		Status:          status,
+		Justification:   "vulnerable_code_not_in_execute_path",
+		ImpactStatement: "The image authenticates via certificates, so the PAM path is never entered.",
+		Author:          "Rancher Security team",
+		Timestamp:       "2026-06-19T00:00:00Z",
+		Product:         "pkg:oci/hardened-kubernetes?repository_url=index.docker.io/rancher/hardened-kubernetes",
+		Hub:             "https://github.com/rancher/vexhub",
+	}
+	return f
+}
+
+func vexReport(t *testing.T, details bool, hubs []ecosystem.VEXHubResult, findings ...analyze.Finding) string {
+	t.Helper()
+	return renderText(&analyze.Result{
+		SchemaVersion: analyze.SchemaVersion, Target: "rancher/hardened-kubernetes:v1.30.1", Mode: "image",
+		Findings: findings, VEXHubs: hubs,
+	}, details)
+}
+
+// An exculpatory statement moves the row; the finding's own verdict does not
+// change, so the same scan rendered without a hub says exactly the same thing
+// about it.
+func TestAnExculpatoryStatementMovesTheRowOutOfAffected(t *testing.T) {
+	for _, status := range []string{"not_affected", "fixed"} {
+		out := vexReport(t, false, nil, vexedFinding(status))
+		vexed := strings.Join(sectionOf(t, out, "ALREADY VEXED"), "\n")
+		if !strings.Contains(vexed, "libgcc-s1") {
+			t.Errorf("%s: the row is not under ALREADY VEXED:\n%s", status, out)
+		}
+		if !strings.Contains(vexed, status) {
+			t.Errorf("%s: the vendor status is not shown:\n%s", status, out)
+		}
+		if strings.Contains(out, "AFFECTED (") {
+			t.Errorf("%s: an AFFECTED section was printed with nothing in it:\n%s", status, out)
+		}
+	}
+}
+
+// The one mistake this must not make: a vendor confirming a finding, or saying
+// they are still looking, cannot make it quieter.
+func TestANonExculpatoryStatementLeavesTheRowAffected(t *testing.T) {
+	for _, status := range []string{"affected", "under_investigation", ""} {
+		out := vexReport(t, false, nil, vexedFinding(status))
+		affected := strings.Join(sectionOf(t, out, "AFFECTED"), "\n")
+		if !strings.Contains(affected, "libgcc-s1") {
+			t.Errorf("%s: the row left AFFECTED:\n%s", status, out)
+		}
+		if strings.Contains(out, "ALREADY VEXED (") {
+			t.Errorf("%s: an ALREADY VEXED section was printed:\n%s", status, out)
+		}
+	}
+}
+
+// Nothing changes for a reader who did not pass --vexhub.
+func TestTheVexedSectionIsAbsentWithoutAHub(t *testing.T) {
+	out := report(t, false, gccTrio...)
+	if strings.Contains(out, "ALREADY VEXED") || strings.Contains(out, "already vexed") {
+		t.Errorf("a plain scan mentions VEX:\n%s", out)
+	}
+}
+
+// The affected count is what is still open, and the reader is told whose word
+// the rest moved on.
+func TestSummaryExcludesVexedRowsAndNamesTheAuthor(t *testing.T) {
+	hubs := []ecosystem.VEXHubResult{{
+		URL: "https://github.com/rancher/vexhub", Author: "Rancher Security team",
+		Products: 1082, Matched: 1,
+	}}
+	out := vexReport(t, false, hubs, vexedFinding("not_affected"), gccTrio[2])
+
+	sev := lineWith(t, out, "affected by severity:")
+	if !strings.Contains(sev, "1 medium") {
+		t.Errorf("the vexed row is still counted as affected: %q", sev)
+	}
+	line := lineWith(t, out, "already vexed:")
+	if !strings.Contains(line, "1 by Rancher Security team") {
+		t.Errorf("the summary does not say who vexed it: %q", line)
+	}
+}
+
+// A hub that could not be read is not silent, and is not an INCOMPLETE banner
+// either: the scan is complete, the grouping is what was lost.
+func TestAnUnreachableHubWarnsWithoutClaimingTheScanIsIncomplete(t *testing.T) {
+	hubs := []ecosystem.VEXHubResult{{
+		URL:   "https://invalid.example/nope",
+		Error: "vex: read index: no such host",
+	}}
+	out := vexReport(t, false, hubs, gccTrio...)
+
+	note := lineWith(t, out, "https://invalid.example/nope")
+	if !strings.HasPrefix(note, "NOTE:") {
+		t.Errorf("the hub warning is not a NOTE: %q", note)
+	}
+	if strings.Contains(out, "INCOMPLETE") {
+		t.Errorf("an unreachable hub was reported as an incomplete scan:\n%s", out)
+	}
+	// Nothing moved, so every linked row is still where a reader will look.
+	affected := strings.Join(sectionOf(t, out, "AFFECTED"), "\n")
+	if !strings.Contains(affected, "libgcc-s1") {
+		t.Errorf("a row moved despite the hub failing:\n%s", out)
+	}
+}
+
+// The vendor's own sentence is the most useful thing in the document, and the
+// table has no room for it.
+func TestDetailsPrintsTheVendorStatement(t *testing.T) {
+	out := vexReport(t, true, nil, vexedFinding("not_affected"))
+	for _, want := range []string{
+		"Rancher Security team says not_affected",
+		"vulnerable_code_not_in_execute_path",
+		"The image authenticates via certificates",
+		"pkg:oci/hardened-kubernetes",
+		"2026-06-19T00:00:00Z",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("--details is missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// A match that tolerated a different purl spelling says so, because that
+// tolerance is the part a reader might disagree with.
+func TestDetailsRecordsALooseComponentMatch(t *testing.T) {
+	f := vexedFinding("not_affected")
+	f.VEX.Match = "statement names pkg:rpm/suse/libgcrypt20; component is pkg:rpm/sles/libgcrypt20@1.9.4?arch=x86_64"
+	out := vexReport(t, true, nil, f)
+	if !strings.Contains(out, "matched loosely: statement names pkg:rpm/suse/libgcrypt20") {
+		t.Errorf("the tolerated disagreement is not shown:\n%s", out)
+	}
+}
+
+// The section swaps BASIS -- how vexscan decided, which is not what these rows
+// are here for -- for what the vendor said.
+func TestTheVexedSectionShowsTheVendorColumnsInsteadOfBasis(t *testing.T) {
+	out := vexReport(t, false, nil, vexedFinding("not_affected"))
+	header := sectionOf(t, out, "ALREADY VEXED")[0]
+	if !strings.Contains(header, "VEX STATUS") || !strings.Contains(header, "JUSTIFICATION") {
+		t.Errorf("the vendor columns are missing: %q", header)
+	}
+	if strings.Contains(header, "BASIS") {
+		t.Errorf("BASIS is still in the vexed section: %q", header)
+	}
+}
+
+// A "fixed" statement needs no justification, so the column falls back to the
+// vendor's sentence rather than rendering an empty cell.
+func TestTheJustificationColumnFallsBackToTheImpactStatement(t *testing.T) {
+	f := vexedFinding("fixed")
+	f.VEX.Justification = ""
+	out := vexReport(t, false, nil, f)
+	if !strings.Contains(out, "The image authenticates via certificates") {
+		t.Errorf("the justification cell is empty:\n%s", out)
+	}
+}
+
+// A vexed row that is only vexed because a hub matched must not survive a
+// status it never had: only linked and reachable findings can move at all.
+func TestOnlyAffectedFindingsCanBeVexed(t *testing.T) {
+	f := gccTrio[0] // not_present
+	f.VEX = &ecosystem.VEXStatement{Status: "not_affected", Author: "Someone"}
+	out := vexReport(t, false, nil, f)
+	if strings.Contains(out, "ALREADY VEXED") {
+		t.Errorf("a ruled-out finding was moved into ALREADY VEXED:\n%s", out)
+	}
+	if !strings.Contains(strings.Join(sectionOf(t, out, "RULED OUT"), "\n"), "gcc-12-base") {
+		t.Errorf("the ruled-out row left its section:\n%s", out)
+	}
+}

@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "packages": [
+    {
+      "id": "pkg:golang/github.com/Altinity/clickhouse-backup/v2",
+      "location": "pkg/golang/github.com/Altinity/clickhouse-backup/v2/scan.openvex.json"
+    },
+    {
+      "id": "pkg:oci/hardened-kubernetes?repository_url=index.docker.io%2Francher%2Fhardened-kubernetes",
+      "location": "pkg/oci/index.docker.io/rancher/hardened-kubernetes/scan.openvex.json"
+    },
+    {
+      "id": "pkg:oci/synthetic?repository_url=index.docker.io%2Fexample%2Fsynthetic",
+      "location": "pkg/oci/index.docker.io/example/synthetic/scan.openvex.json"
+    }
+  ]
+}

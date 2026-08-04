@@ -20,10 +20,11 @@ import (
 )
 
 func main() {
-	var packages, ecosystems, roots stringList
+	var packages, ecosystems, roots, vexhubs stringList
 	flag.Var(&packages, "package", "package to check: a purl, an ecosystem:name shorthand (deb:openssl, golang:golang.org/x/net), or a bare name resolved against the inventory; repeatable")
 	flag.Var(&ecosystems, "ecosystem", "restrict the scan to these ecosystems (golang, os, pypi, npm, maven, or a distro family like debian); repeatable, default all")
 	flag.Var(&roots, "roots", "extra entrypoints for the reachability closures (shared libraries and language imports), for an image whose real command comes from outside its config; repeatable")
+	flag.Var(&vexhubs, "vexhub", "VEX Hub repository to check findings against, e.g. https://github.com/rancher/vexhub (also accepts a raw base URL or a local directory); repeatable, earliest wins")
 	var (
 		image      = flag.String("image", "", "container image reference to inspect (mutually exclusive with --rootfs and --repo)")
 		rootfs     = flag.String("rootfs", "", "filesystem tree already on disk to inspect -- an unpacked image, a mounted volume, a machine's own / (mutually exclusive with --image and --repo)")
@@ -133,6 +134,7 @@ func main() {
 		Arch:               *arch,
 		OSVEcosystem:       *osvEco,
 		Roots:              roots,
+		VEXHubs:            vexhubs,
 		DlopenPolicy:       dlopenPolicy,
 		DynamicPolicy:      dynamicPolicy,
 		GoVersion:          *goVersion,

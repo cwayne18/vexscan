@@ -15,8 +15,12 @@ type evalCtx struct {
 	module    string
 	version   string
 	purl      string
-	stripped  bool
-	syms      *binscan.Symbols
+	// product is the purl of the binary's own main module -- the artifact a VEX
+	// hub files statements about this binary's dependencies under. Empty for a
+	// binary built outside a module, which simply means no hub lookup.
+	product  string
+	stripped bool
+	syms     *binscan.Symbols
 	// govuln returns the ids govulncheck binary mode marked not_affected. It is
 	// a function so the subprocess is only paid for when a verdict depends on it.
 	govuln func() map[string]struct{}
@@ -35,6 +39,7 @@ func evaluate(_ context.Context, ec evalCtx, id string, adv *osv.Advisory) ecosy
 		Module:   ec.module,
 		Version:  ec.version,
 		PURL:     ec.purl,
+		Product:  ec.product,
 		CVE:      id,
 		Stripped: &stripped,
 	}

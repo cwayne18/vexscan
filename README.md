@@ -556,12 +556,12 @@ Two more failure modes worth naming:
   than a false clean.
 
 If a whole class of images comes back `linked`, the answer is vendor VEX feeds
-(Red Hat CSAF, Debian tracker, Alpine secdb) rather than more heuristics. The
-`evidence` array on every finding is the extension point for that: a future
-vendor-feed source contributes `Evidence{Origin: "vendor-vex"}` alongside the
-local evidence, under one policy — local deterministic evidence outranks a
-vendor claim, and a vendor `not_affected` never downgrades a finding below
-`linked` on its own.
+rather than more heuristics. [`--vexhub`](#vex-hubs---vexhub) is the first of
+those: it contributes `Evidence{Origin: "vendor-vex"}` alongside the local
+evidence, under one policy — local deterministic evidence outranks a vendor
+claim, and a vendor `not_affected` never downgrades a finding below `linked` on
+its own. Direct distro feeds (Red Hat CSAF, Debian tracker, Alpine secdb) are
+the same shape and would slot in beside it.
 
 **Java's presence test is sharp and its inventory is the weak part.** The class
 check is the strongest below-package test in this tool after pclntab, and it
@@ -842,6 +842,84 @@ Two things report `UNKNOWN` that are worth knowing about:
   carries no severity field. Image mode goes entirely through the resolver and is
   fully covered — on `debian:12 --all` every finding gets a rating.
 
+### VEX hubs (`--vexhub`)
+
+Some vendors have already triaged the CVEs in their own images and published the
+answers. `--vexhub` points at one of those published sets — a
+[VEX Repository](https://github.com/aquasecurity/vex-repo-spec), such as
+[rancher/vexhub](https://github.com/rancher/vexhub) — and marks the findings a
+statement already covers, so attention goes to the rows nobody has spoken to.
+
+```sh
+vexscan --image rancher/hardened-kubernetes:v1.34.10-rke2r1-build20260724 --all \
+  --vexhub https://github.com/rancher/vexhub
+```
+
+```
+  affected by severity: 6 high, 26 unknown, 28 medium
+  already vexed: 3 by Rancher Security team
+
+AFFECTED (60) - vulnerable code is present and can be loaded
+...
+
+ALREADY VEXED (3) - a published statement answers these; vexscan's own verdict is unchanged
+SEVERITY  ADVISORY             PACKAGE                            VERSION  VEX STATUS    JUSTIFICATION
+HIGH      GHSA-cgrx-mc8f-2prm  github.com/opencontainers/selinux  v1.11.1  not_affected  vulnerable_code_not_in_execute_path
+```
+
+**A statement never rewrites `status`.** A `--vexhub` run and a plain run agree
+on every finding's verdict and on the JSON's `status` field; the hub changes
+only which section the row is printed under, and therefore what the affected
+count draws the eye to. `--details` prints the vendor's own sentence, which is
+usually the most useful thing in the document:
+
+```
+  vendor:   Rancher Security team says not_affected (vulnerable_code_not_in_execute_path)
+            Manually confirmed, only exploitable when running runc directly.
+            product pkg:golang/k8s.io/kubernetes, published 2026-06-19T00:00:00Z
+            matched loosely: statement names pkg:golang/github.com/opencontainers/selinux@v1.11.0; component is pkg:golang/github.com%2Fopencontainers%2Fselinux@v1.11.1
+```
+
+Only `not_affected` and `fixed` move a row. A vendor `affected` or
+`under_investigation` stays in `AFFECTED` and is annotated there — a vendor
+confirming a finding must not make it quieter. The flag is repeatable and the
+earliest hub to speak wins, so an internal hub listed first overrides a
+vendor's.
+
+What is looked up: the scanned image (`pkg:oci/…`) and each Go binary's own main
+module (`pkg:golang/…`), which is how a hub actually files Go statements. The
+hub's `index.json` is fetched once and only the documents for products actually
+present in the scan are pulled — the spec's transport is a ~30 MB tarball, and
+this reads two files out of it. Three caveats, all measured:
+
+- **Coverage is entirely a function of whether the hub has a document for the
+  exact product you scanned.** rancher/vexhub is 1,082 products — Rancher, SUSE,
+  Longhorn, NeuVector, StackState — and nothing else. `debian:12 --vexhub
+  https://github.com/rancher/vexhub` correctly matches nothing and prints no
+  `ALREADY VEXED` section at all.
+- **Subcomponents are matched on purl *type and name only*.** Real data leaves
+  no choice: the hub writes `pkg:rpm/suse/libgcrypt20` where vexscan emits
+  `pkg:rpm/sles/libgcrypt20@…?arch=x86_64`, and statements are pinned to the
+  version the vendor scanned (`selinux@v1.11.0`) rather than the one in your
+  image (`v1.11.1`). Namespace, version and qualifiers are ignored; every
+  disagreement that tolerance swallowed is written out in the evidence line and
+  under `--details` as `matched loosely`, so you can see what was actually
+  compared. A statement about an older version is applied to a newer one —
+  usually right for a "code not reachable" claim, and visible when it is not.
+- **The two sides name advisories differently, and the match depends on OSV
+  aliases to bridge them.** On the Rancher image above, vexscan's 13 advisories
+  are all `GHSA-`/`GO-` ids and the hub's 133 are almost all `CVE-`, with zero
+  literal overlap; expanding each finding through the alias list the resolver
+  already fetched is what makes any of them meet. A finding whose advisory OSV
+  gives no aliases for can only match a hub using the same spelling.
+
+An unreachable hub prints a `NOTE:` and **does not fail the run** — unlike an
+ecosystem that could not be read, which exits 1. The asymmetry is deliberate: an
+unreadable package database makes the report claim a clean image it never
+examined, while an unreachable hub only leaves rows in `AFFECTED` that a vendor
+had already answered. The first under-reports, which is the way this tool must
+never be wrong; the second over-reports, which is merely tiring.
+
 ### JSON
 
 The JSON is `schema_version: 2`:
@@ -852,14 +930,20 @@ The JSON is `schema_version: 2`:
   "target": "...", "mode": "image",          // or "rootfs", or "repo"
   "findings": [ /* flat, sorted — jq '.findings[]' still works */ ],
   "ecosystems": [ { "id": "os", "components": 65, "error": "" } ],
-  "unreadable": { "count": 3, "paths": ["/opt/vendor"] }  // omitted when nothing was skipped
+  "unreadable": { "count": 3, "paths": ["/opt/vendor"] },  // omitted when nothing was skipped
+  "vex_hubs": [ { "url": "...", "author": "...", "products": 1082, "matched": 3 } ]  // only with --vexhub
 }
 ```
 
 Each finding carries ecosystem-neutral identity (`ecosystem`, `id`, `package`,
 `version`, `location`, `purl`) plus `status`, `method`, `justification` and
 `evidence`, and `severity`/`cvss` when an advisory was resolved for it. Both are
-omitted when none was, which is not the same fact as `UNKNOWN`. The v1 Go
+omitted when none was, which is not the same fact as `UNKNOWN`. With
+[`--vexhub`](#vex-hubs---vexhub) a finding also carries `product` (the artifact
+it was found in) and, when one matched, `vex` — the statement's `status`,
+`justification`, `impact_statement`, `action_statement`, `author`, the product
+purl that matched and the hub it came from, so a consumer can audit the claim
+without re-fetching. The v1 Go
 spellings (`cve`, `module`, `binary`, `go_id`, `packages`,
 `granularity`, `stripped`) are still emitted for Go findings, mirrored from the
 neutral fields so they cannot drift.
@@ -910,6 +994,7 @@ be read, or part of the tree could not be read, `2` the command line was wrong.
 | `--go-version` | *(auto)* | Pin the Go toolchain for `--repo`, e.g. `1.24.0` (useful with `golang:stdlib`) |
 | `--osv-ecosystem` | *(auto)* | Override the OSV ecosystem derived from os-release, e.g. `Debian:12` |
 | `--roots` | | Extra entrypoints for the closures — shared libraries and language imports; repeatable |
+| `--vexhub` | | VEX Repository to check findings against, e.g. `https://github.com/rancher/vexhub` (also a raw base URL or a local directory); repeatable, earliest wins — see [VEX hubs](#vex-hubs---vexhub) |
 | `--dlopen-policy` | `taint` | `taint` (block conclusions) or `assume-none` |
 | `--dynamic-import-policy` | `taint` | The same knob for a language import graph's computed imports. These are far more common than `dlopen`, so `assume-none` discards much more |
 | `--trust-import-absence` | `false` | Let a missing dynamic import conclude `not_in_execute_path` (weaker than it looks) |

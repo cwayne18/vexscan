@@ -22,6 +22,7 @@ import (
 	"github.com/cwayne18/vexscan/internal/ecosystem"
 	"github.com/cwayne18/vexscan/internal/source"
 	"github.com/cwayne18/vexscan/internal/target"
+	"github.com/cwayne18/vexscan/internal/vex"
 )
 
 // Plugin analyzes Go modules.
@@ -81,6 +82,20 @@ func NormalizeModule(module string) string {
 type binary struct {
 	path string // absolute path in the extracted tree
 	rel  string // path as it appears inside the image
+	// main is the binary's own module path, out of its build info. It is the
+	// artifact a VEX hub keys statements about this binary's dependencies
+	// under, which the image itself is not: an image ships many binaries and a
+	// hub speaks about each one separately.
+	main string
+}
+
+// mainModulePath is a binary's own module path, or "" for one built outside a
+// module.
+func mainModulePath(bin binscan.Binary) string {
+	if bin.Info == nil {
+		return ""
+	}
+	return bin.Info.Main.Path
 }
 
 // state is the plugin-private payload carried in Component.Extra from the
@@ -141,13 +156,14 @@ func (p *Plugin) groupAll(root string, bins []binscan.Binary) []ecosystem.Compon
 			continue
 		}
 		rel := target.Rel(root, bin.Path)
+		main := mainModulePath(bin)
 		// The standard library is a module OSV publishes advisories against,
 		// and it is linked into every Go binary by definition, so an
 		// enumeration that left it out would miss the CVEs most likely to
 		// apply to all of them at once.
-		g.add(StdlibModule, binscan.NormalizeGoVersion(bin.Info.GoVersion), rel, bin.Path)
+		g.add(StdlibModule, binscan.NormalizeGoVersion(bin.Info.GoVersion), rel, bin.Path, main)
 		if m := bin.Info.Main; m.Path != "" && m.Version != "" {
-			g.add(m.Path, m.Version, rel, bin.Path)
+			g.add(m.Path, m.Version, rel, bin.Path, main)
 		}
 		for _, dep := range bin.Info.Deps {
 			m := dep
@@ -157,7 +173,7 @@ func (p *Plugin) groupAll(root string, bins []binscan.Binary) []ecosystem.Compon
 			if m.Path == "" || m.Version == "" {
 				continue
 			}
-			g.add(m.Path, m.Version, rel, bin.Path)
+			g.add(m.Path, m.Version, rel, bin.Path, main)
 		}
 	}
 	return g.components()
@@ -176,7 +192,7 @@ func (p *Plugin) group(root string, bins []binscan.Binary, modules []string) []e
 			if version == "" {
 				continue // module not linked into this binary
 			}
-			g.add(module, version, rel, bin.Path)
+			g.add(module, version, rel, bin.Path, mainModulePath(bin))
 		}
 	}
 	return g.components()
@@ -197,7 +213,7 @@ func newGrouper() *grouper {
 	return &grouper{byKey: map[string]*ecosystem.Component{}}
 }
 
-func (g *grouper) add(module, version, rel, path string) {
+func (g *grouper) add(module, version, rel, path, main string) {
 	key := module + "@" + version
 	c, ok := g.byKey[key]
 	if !ok {
@@ -218,7 +234,7 @@ func (g *grouper) add(module, version, rel, path string) {
 		return
 	}
 	c.Locations = append(c.Locations, rel)
-	st.binaries = append(st.binaries, binary{path: path, rel: rel})
+	st.binaries = append(st.binaries, binary{path: path, rel: rel, main: main})
 }
 
 func (g *grouper) components() []ecosystem.Component {
@@ -298,6 +314,7 @@ func (p *Plugin) AnalyzeImage(ctx context.Context, img *target.Image, items []ec
 				module:    item.Component.Name,
 				version:   item.Component.Version,
 				purl:      item.Component.PURL,
+				product:   vex.GoProduct(bin.main),
 				stripped:  stripped,
 				syms:      syms,
 				govuln:    govuln,
@@ -342,11 +359,46 @@ func (p *Plugin) AnalyzeSource(ctx context.Context, src *target.Source, subjects
 		modules = flaggedModules(stmts)
 	}
 
+	// In source mode the artifact is the checkout's own module, which is what a
+	// hub would have filed statements about this dependency graph under.
+	product := vex.GoProduct(moduleOf(src.Dir))
+
 	var out []ecosystem.Finding
 	for _, module := range modules {
-		out = append(out, findingsForModule(module, stmts, requested, !all)...)
+		fs := findingsForModule(module, stmts, requested, !all)
+		for i := range fs {
+			fs[i].Product = product
+		}
+		out = append(out, fs...)
 	}
 	return out, nil
+}
+
+// moduleOf reads the module path out of a checkout's go.mod.
+//
+// Hand-parsed rather than pulled in with golang.org/x/mod: the module
+// directive is the first non-comment line of every go.mod, and a dependency
+// for one line of parsing is a worse trade than the fifteen lines below.
+// Failure is silent and returns "" -- a missing module path only means no hub
+// lookup, and DetectSource has already established the file exists.
+func moduleOf(dir string) string {
+	b, err := os.ReadFile(filepath.Join(dir, "go.mod"))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if i := strings.Index(line, "//"); i >= 0 {
+			line = strings.TrimSpace(line[:i])
+		}
+		rest, ok := strings.CutPrefix(line, "module")
+		if !ok || (rest != "" && !strings.ContainsAny(rest[:1], " \t")) {
+			continue
+		}
+		// A module path may be quoted, though gofmt never writes it that way.
+		return strings.Trim(strings.TrimSpace(rest), `"`)
+	}
+	return ""
 }
 
 // flaggedModules is every module govulncheck had something to say about,

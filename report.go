@@ -8,6 +8,7 @@ import (
 
 	"github.com/cwayne18/vexscan/internal/analyze"
 	"github.com/cwayne18/vexscan/internal/cvss"
+	"github.com/cwayne18/vexscan/internal/ecosystem"
 )
 
 // The text report.
@@ -42,7 +43,7 @@ func renderText(res *analyze.Result, details bool) string {
 	}
 
 	writeSummary(&b, res)
-	for _, s := range sections(res.Findings) {
+	for _, s := range sections(res) {
 		writeSection(&b, s, details)
 	}
 	return b.String()
@@ -77,6 +78,17 @@ func writeHeader(b *strings.Builder, res *analyze.Result) {
 			fmt.Fprintf(b, "  ... and %d more\n", u.Count-len(u.Paths))
 		}
 	}
+	for _, h := range res.VEXHubs {
+		if h.Error == "" {
+			continue
+		}
+		// Not an INCOMPLETE banner, and deliberately not: the scan itself is
+		// complete. What was lost is the grouping, so findings the vendor had
+		// already answered are still sitting in AFFECTED. Saying so is still
+		// necessary -- a hub that contributed nothing because it could not be
+		// reached looks exactly like one with nothing to say.
+		fmt.Fprintf(b, "NOTE: VEX hub %s could not be read, so nothing was moved to ALREADY VEXED - %s\n", h.URL, h.Error)
+	}
 	b.WriteString("\n")
 }
 
@@ -103,12 +115,19 @@ func writeSummary(b *strings.Builder, res *analyze.Result) {
 	}
 
 	// The severity spread is the one number a reader wants before deciding how
-	// much of the rest to read.
+	// much of the rest to read. Findings a vendor has already answered are left
+	// out of it, so the count is what is still open rather than what was found.
 	counts := map[string]int{}
+	vexed := 0
 	for _, f := range res.Findings {
-		if f.Affected() {
-			counts[displaySeverity(f)]++
+		if !f.Affected() {
+			continue
 		}
+		if alreadyVexed(f) {
+			vexed++
+			continue
+		}
+		counts[displaySeverity(f)]++
 	}
 	var parts []string
 	for _, label := range []string{cvss.Critical, cvss.High, cvss.Unknown, cvss.Medium, cvss.Low, cvss.None} {
@@ -119,28 +138,78 @@ func writeSummary(b *strings.Builder, res *analyze.Result) {
 	if len(parts) > 0 {
 		fmt.Fprintf(b, "  affected by severity: %s\n", strings.Join(parts, ", "))
 	}
+	if vexed > 0 {
+		fmt.Fprintf(b, "  already vexed: %d by %s\n", vexed, vexAuthors(res))
+	}
 	b.WriteString("\n")
+}
+
+// vexAuthors names who published the statements, for the summary line. A
+// reader deciding whether to trust 61 rows moving out of AFFECTED needs to know
+// whose word it is on.
+func vexAuthors(res *analyze.Result) string {
+	var names []string
+	seen := map[string]bool{}
+	for _, h := range res.VEXHubs {
+		name := h.Author
+		if name == "" {
+			name = h.URL
+		}
+		if h.Matched == 0 || seen[name] {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		return "a published VEX statement"
+	}
+	return strings.Join(names, ", ")
 }
 
 // section is one heading and the findings under it.
 type section struct {
-	title    string
-	note     string
+	title string
+	note  string
+	// vex swaps the trailing columns for the vendor's status and reasoning,
+	// which is the only thing worth reading about a row nobody has to act on.
+	vex      bool
 	findings []analyze.Finding
 }
 
-// sections splits findings into what to act on, what could not be decided, and
-// what was ruled out.
+// alreadyVexed reports whether a finding is one the vendor has published an
+// answer to.
 //
-// Affected comes first because it is the part that requires action. Ruled out
-// comes last and is still printed in full: it is the tool's proof of work, and
-// the reason a reader can believe the short list above it.
-func sections(findings []analyze.Finding) []section {
-	var affected, undetermined, ruledOut []analyze.Finding
-	for _, f := range findings {
+// Only an exculpatory statement counts. A vendor saying "affected" or "still
+// looking" has spoken, but not in a way that lets a reader skip the row, and
+// moving it out of AFFECTED on that basis would be the one mistake this tool
+// must not make.
+func alreadyVexed(f analyze.Finding) bool {
+	return f.VEX.Exculpatory()
+}
+
+// sections splits findings into what to act on, what a vendor has already
+// answered, what could not be decided, and what was ruled out.
+//
+// Affected comes first because it is the part that requires action. Already
+// vexed sits directly beneath it, because it is the same evidence with somebody
+// else's conclusion attached, and a reader comparing the two should not have to
+// scroll. Ruled out comes last and is still printed in full: it is the tool's
+// proof of work, and the reason a reader can believe the short list above it.
+//
+// A vexed finding keeps its status. Nothing here rewrites a verdict -- the row
+// simply moves, so the affected count reflects what nobody has spoken to yet
+// while --format json stays identical to a run without --vexhub.
+func sections(res *analyze.Result) []section {
+	var affected, vexed, undetermined, ruledOut []analyze.Finding
+	for _, f := range res.Findings {
 		switch f.Status {
 		case analyze.StatusLinked, analyze.StatusReachable:
-			affected = append(affected, f)
+			if alreadyVexed(f) {
+				vexed = append(vexed, f)
+			} else {
+				affected = append(affected, f)
+			}
 		case analyze.StatusNotPresent, analyze.StatusNotInPath:
 			ruledOut = append(ruledOut, f)
 		default:
@@ -149,6 +218,12 @@ func sections(findings []analyze.Finding) []section {
 	}
 	out := []section{
 		{title: "AFFECTED", note: "vulnerable code is present and can be loaded", findings: affected},
+		{
+			title:    "ALREADY VEXED",
+			note:     "a published statement answers these; vexscan's own verdict is unchanged",
+			vex:      true,
+			findings: vexed,
+		},
 		{title: "UNDETERMINED", note: "not enough evidence to decide either way", findings: undetermined},
 		{title: "RULED OUT", note: "the vulnerable code is not present or cannot run", findings: ruledOut},
 	}
@@ -179,7 +254,14 @@ func writeSection(b *strings.Builder, s section, details bool) {
 	if showVerdict {
 		header = append(header, "VERDICT")
 	}
-	header = append(header, "BASIS")
+	if s.vex {
+		// BASIS is how vexscan reached its verdict, which for these rows is not
+		// the question -- the reader already knows the code is linked and is
+		// here to see what the vendor said about it instead.
+		header = append(header, "VEX STATUS", "JUSTIFICATION")
+	} else {
+		header = append(header, "BASIS")
+	}
 
 	table := [][]string{header}
 	for _, f := range rows {
@@ -192,7 +274,11 @@ func writeSection(b *strings.Builder, s section, details bool) {
 		if showVerdict {
 			cells = append(cells, string(f.Status))
 		}
-		cells = append(cells, f.Method)
+		if s.vex {
+			cells = append(cells, f.VEX.Status, truncate(vexReason(f.VEX), 44))
+		} else {
+			cells = append(cells, f.Method)
+		}
 		table = append(table, cells)
 	}
 	writeTable(b, table)
@@ -204,6 +290,23 @@ func writeSection(b *strings.Builder, s section, details bool) {
 		}
 	}
 	b.WriteString("\n")
+}
+
+// vexReason is the short why for a statement's table cell.
+//
+// The justification is a fixed OpenVEX term and fits a column. Its absence is
+// legal -- a "fixed" statement needs no excuse -- and the impact statement is
+// the next best thing, truncated by the caller. The full sentence is in
+// --details and in the JSON.
+func vexReason(v *ecosystem.VEXStatement) string {
+	switch {
+	case v == nil:
+		return ""
+	case v.Justification != "":
+		return v.Justification
+	default:
+		return v.ImpactStatement
+	}
 }
 
 // distinctStatuses counts how many different verdicts a set of rows holds.
@@ -371,6 +474,36 @@ func writeDetail(b *strings.Builder, f analyze.Finding) {
 			marker = " (blocking)"
 		}
 		fmt.Fprintf(b, "  evidence: [%s]%s %s\n", e.Origin, marker, e.Detail)
+	}
+	if v := f.VEX; v != nil {
+		// The impact statement is the vendor's own sentence about this
+		// vulnerability in this product, and is usually the most useful line in
+		// the whole block -- the table has no room for it, so this is where it
+		// goes.
+		author := v.Author
+		if author == "" {
+			author = v.Hub
+		}
+		fmt.Fprintf(b, "  vendor:   %s says %s", author, v.Status)
+		if v.Justification != "" {
+			fmt.Fprintf(b, " (%s)", v.Justification)
+		}
+		b.WriteString("\n")
+		for _, line := range []string{v.ImpactStatement, v.ActionStatement} {
+			if line != "" {
+				fmt.Fprintf(b, "            %s\n", line)
+			}
+		}
+		fmt.Fprintf(b, "            product %s", v.Product)
+		if v.Timestamp != "" {
+			fmt.Fprintf(b, ", published %s", v.Timestamp)
+		}
+		b.WriteString("\n")
+		if v.Match != "" {
+			// The component match was deliberately loose about spelling, so the
+			// disagreement it accepted is shown rather than hidden.
+			fmt.Fprintf(b, "            matched loosely: %s\n", v.Match)
+		}
 	}
 	if f.LLM != nil {
 		fmt.Fprintf(b, "  llm:      exploitable=%s confidence=%s\n", f.LLM.Exploitable, f.LLM.Confidence)
