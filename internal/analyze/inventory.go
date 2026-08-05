@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
+	"github.com/cwayne18/vexscan/internal/ecosystem/ospkg"
 	"github.com/cwayne18/vexscan/internal/langdb"
 	"github.com/cwayne18/vexscan/internal/osv"
 	"github.com/cwayne18/vexscan/internal/pkgdb"
@@ -89,6 +91,12 @@ func Inventory(ctx context.Context, opts Options) (*InventoryResult, error) {
 	}
 	logf := opts.Logf
 
+	// --rpm has no tree, and opening the empty one would only lead every
+	// reader below to correctly report that it found nothing.
+	if len(opts.RPM) > 0 {
+		return rpmInventory(ctx, opts)
+	}
+
 	img, cleanup, err := openTree(ctx, &opts)
 	if err != nil {
 		return nil, err
@@ -142,6 +150,49 @@ func Inventory(ctx context.Context, opts Options) (*InventoryResult, error) {
 			logf("    ! %s", m)
 		}
 	}
+	return res, nil
+}
+
+// rpmInventory lists what --rpm resolved to, which is the cheapest way to
+// check what a scan is about to be run against.
+//
+// It reports no Languages: an rpm header lists the files the package would
+// install and nothing about their contents, so the site-packages and
+// node_modules a python3-yaml rpm would create are not knowable from it. An
+// empty Languages list here means "not looked for", and saying otherwise by
+// running the scanner over an empty directory would mean "looked for and not
+// there".
+func rpmInventory(ctx context.Context, opts Options) (*InventoryResult, error) {
+	logf := opts.Logf
+	rpms, err := readRPMs(ctx, &opts)
+	if err != nil {
+		return nil, err
+	}
+
+	res := &InventoryResult{
+		Target:    strings.Join(opts.RPM, ", "),
+		Mode:      opts.mode(),
+		Databases: ospkg.SuppliedResults(opts.rpmPackages),
+	}
+
+	// An ecosystem that cannot be derived is recorded, not fatal. The whole
+	// point of this output is to be able to see what a scan would use before
+	// running one, and that includes seeing that it would not have an
+	// ecosystem to query with.
+	eco, distro, err := ospkg.SuppliedIdentity(opts.rpmPackages, opts.OSVEcosystem)
+	res.OS = &OSInfo{ID: distro, Ecosystem: eco}
+	if err != nil {
+		res.OS.EcosystemError = err.Error()
+		logf("  ! %v", err)
+	}
+	if len(opts.rpmPackages) > 0 {
+		res.OS.PrettyName = opts.rpmPackages[0].Meta.Distribution
+	}
+
+	for _, db := range res.Databases {
+		logf("  %s: %d packages from %s", db.Format, len(db.Packages), db.DB)
+	}
+	res.Unreadable = noteRPMFailures(res.Unreadable, rpms, logf)
 	return res, nil
 }
 

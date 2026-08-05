@@ -4,7 +4,6 @@ package pkgdb
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 
 	rpmdb "github.com/knqyf263/go-rpmdb/pkg"
@@ -103,71 +102,6 @@ func (r *RPM) Read(fsys target.RootFS) ([]Package, error) {
 	return pkgs, nil
 }
 
-// rpmEVR composes the version string OSV compares against.
-//
-// The epoch is always included, including when it is zero. That is not what
-// rpm -q prints, but it is what the Red Hat, Rocky and AlmaLinux OSV records
-// contain -- verified against api.osv.dev:
-//
-//	RHSA-2024:2447  openssl    fixed 1:3.0.7-27.el9
-//	RHSA-2023:6746  nghttp2    fixed 0:1.43.0-5.el9_3.1   <- explicit zero
-//	Rocky Linux:9   openssl    fixed 1:3.0.1-43.el9_0
-//	AlmaLinux:9     openssl    fixed 1:3.0.1-41.el9_0
-//
-// Azure Linux is the exception: its records carry no epoch at all ("3.3.0-1").
-// Package.Epoch is exposed separately so the OS plugin can drop the prefix for
-// that ecosystem rather than have this layer guess which consumer it has.
-func rpmEVR(epoch int, version, release string) string {
-	evr := version
-	if release != "" {
-		evr += "-" + release
-	}
-	return fmt.Sprintf("%d:%s", epoch, evr)
-}
-
-// sourceRPMName extracts the source package name from a SOURCERPM value like
-// "openssl-3.2.2-16.el10.src.rpm", which is name-version-release.src.rpm. The
-// name itself may contain hyphens ("java-21-openjdk"), so the tail is stripped
-// by position from the right rather than by splitting from the left.
-func sourceRPMName(srpm string) string {
-	s := strings.TrimSuffix(strings.TrimSpace(srpm), ".src.rpm")
-	s = strings.TrimSuffix(s, ".nosrc.rpm")
-	if s == "" || s == srpm {
-		// Not the expected shape; a bare name is still usable, anything else
-		// is better dropped than passed to OSV as a package name.
-		if strings.HasSuffix(srpm, ".rpm") {
-			return ""
-		}
-		return s
-	}
-	// Strip "-release" then "-version".
-	for i := 0; i < 2; i++ {
-		dash := strings.LastIndex(s, "-")
-		if dash <= 0 {
-			return ""
-		}
-		s = s[:dash]
-	}
-	return s
-}
-
-// normalizePaths makes rpm's file list tree-absolute and ordered. rpm stores
-// absolute paths already, but relocatable packages and malformed headers can
-// produce relative ones, which would silently fail to match anything.
-func normalizePaths(files []string) []string {
-	if len(files) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(files))
-	for _, f := range files {
-		if f = strings.TrimSpace(f); f == "" {
-			continue
-		}
-		if !strings.HasPrefix(f, "/") {
-			f = "/" + f
-		}
-		out = append(out, f)
-	}
-	sort.Strings(out)
-	return out
-}
+// rpmEVR, sourceRPMName and normalizePaths live in rpmfile.go, which carries no
+// build tag: the file reader needs them too, and it has to keep working in the
+// norpm build that omits everything above.

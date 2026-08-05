@@ -325,3 +325,42 @@ func TestWorkItemRequests(t *testing.T) {
 		}
 	})
 }
+
+// TestWorkItemRequestsFindsABundleByTheCVEItFixes is the --cves half of the
+// upstream fix. A SUSE advisory names no CVE in its id and carries no aliases,
+// so until the OSV map indexed what a record addresses, --cves CVE-2024-2511
+// against a SUSE image matched nothing and the user got silence.
+func TestWorkItemRequestsFindsABundleByTheCVEItFixes(t *testing.T) {
+	bundle := &osv.Advisory{
+		ID:       "SUSE-SU-2026:0312-1",
+		Upstream: []string{"CVE-2024-2511", "CVE-2024-4603", "CVE-2024-4741"},
+	}
+	// The shape buildMap now produces: the advisory's own id, plus every CVE
+	// it addresses, all resolving to the one record.
+	advMap := map[string]*osv.Advisory{
+		"SUSE-SU-2026:0312-1": bundle,
+		"CVE-2024-2511":       bundle,
+		"CVE-2024-4603":       bundle,
+		"CVE-2024-4741":       bundle,
+	}
+
+	t.Run("filtering by a bundled CVE reaches the advisory that patches it", func(t *testing.T) {
+		got := WorkItem{Advisories: advMap, Requested: []string{"CVE-2024-4603"}}.Requests()
+		// The request keeps the id the user asked about, so the row stays about
+		// their CVE rather than the two others the patch happens to fix.
+		want := []Request{{ID: "CVE-2024-4603", Advisory: bundle}}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("Requests() = %+v, want %+v", got, want)
+		}
+	})
+
+	// The extra keys must not turn one published advisory into four findings.
+	// Dedupe is by the advisory's own id, which every key shares.
+	t.Run("all mode still reports the bundle once", func(t *testing.T) {
+		got := WorkItem{Advisories: advMap}.Requests()
+		want := []Request{{ID: "SUSE-SU-2026:0312-1", Advisory: bundle}}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("Requests() = %+v, want %+v", got, want)
+		}
+	})
+}

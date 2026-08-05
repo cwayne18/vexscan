@@ -7,6 +7,7 @@ import (
 
 	"github.com/cwayne18/vexscan/internal/analyze"
 	"github.com/cwayne18/vexscan/internal/ecosystem"
+	"github.com/cwayne18/vexscan/internal/ecosystem/ospkg"
 	"github.com/cwayne18/vexscan/internal/llm"
 	"github.com/cwayne18/vexscan/internal/target"
 	"github.com/cwayne18/vexscan/internal/triage"
@@ -1169,5 +1170,189 @@ func TestTheDetailBlockShowsWhichCVEWasScored(t *testing.T) {
 	}
 	if !strings.Contains(line, "31.0%") || !strings.Contains(line, "0.031") {
 		t.Errorf("the detail should carry both the percentile and the raw score: %q", line)
+	}
+	// A single-CVE advisory must not grow a set size, or every Debian row does.
+	if strings.Contains(line, "highest of") {
+		t.Errorf("a one-CVE advisory reported a set size: %q", line)
+	}
+}
+
+// suseBundle is a distro advisory that fixes several CVEs and names none of
+// them in its own id, scored at its worst member.
+func suseBundle(pct float64, upstream ...string) analyze.Finding {
+	f := scored("SUSE-SU-2026:0312-1", "UNKNOWN", pct)
+	f.Package, f.Module, f.Version = "openssl-3", "libopenssl3", "3.1.4-150600.2.19"
+	f.PURL = "pkg:rpm/suse/libopenssl3@3.1.4-150600.2.19?arch=x86_64"
+	f.Upstream = upstream
+	f.Priority.CVE = upstream[0]
+	f.Priority.OfSet = len(upstream)
+	return f
+}
+
+func TestABundledAdvisorySaysWhatItFixesAndHowManyItStandsFor(t *testing.T) {
+	f := suseBundle(0.972, "CVE-2024-5535", "CVE-2024-2511", "CVE-2024-4603")
+	out := triaged(t, &analyze.TriageResult{Scored: 1}, true, f)
+
+	fixes := lineWith(t, out, "fixes:")
+	for _, cve := range f.Upstream {
+		if !strings.Contains(fixes, cve) {
+			t.Errorf("the fixes line omits %s: %q", cve, fixes)
+		}
+	}
+	epss := lineWith(t, out, "epss:")
+	if !strings.Contains(epss, "highest of 3") {
+		t.Errorf("the score is one CVE's out of three and does not say so: %q", epss)
+	}
+	if !strings.Contains(epss, "CVE-2024-5535") {
+		t.Errorf("the score does not name the member it came from: %q", epss)
+	}
+}
+
+// Stopping at five with no remainder would read as the whole list, which is the
+// same failure as a truncated report reading as a clean one.
+func TestALongBundleCountsTheCVEsItDoesNotName(t *testing.T) {
+	f := suseBundle(0.5, "CVE-2024-0001", "CVE-2024-0002", "CVE-2024-0003",
+		"CVE-2024-0004", "CVE-2024-0005", "CVE-2024-0006", "CVE-2024-0007")
+	out := triaged(t, &analyze.TriageResult{Scored: 1}, true, f)
+
+	line := lineWith(t, out, "fixes:")
+	if !strings.Contains(line, "(+2 more)") {
+		t.Errorf("a seven-CVE bundle showing five did not count the rest: %q", line)
+	}
+	if strings.Contains(line, "CVE-2024-0006") {
+		t.Errorf("more than five CVEs were named: %q", line)
+	}
+}
+
+// "CVE-2026-0001 is not in the feed yet" is a true statement about one of three
+// and a misleading one about the row.
+func TestAnUnscoredBundleSaysNoneOfThemRatherThanNamingOne(t *testing.T) {
+	f := suseBundle(0, "CVE-2026-0001", "CVE-2026-0002", "CVE-2026-0003")
+	f.Priority = &triage.Priority{CVE: "CVE-2026-0001", OfSet: 3}
+	out := triaged(t, &analyze.TriageResult{NotInFeed: 1}, true, f)
+
+	line := lineWith(t, out, "epss:")
+	if !strings.Contains(line, "none of this advisory's 3 CVEs") {
+		t.Errorf("an unscored bundle blamed a single CVE: %q", line)
+	}
+}
+
+// What an advisory fixes is a property of the advisory, not of the flag, so it
+// shows up with no --triage at all.
+func TestTheFixesLineDoesNotNeedTriage(t *testing.T) {
+	f := suseBundle(0, "CVE-2024-5535", "CVE-2024-2511")
+	f.Priority = nil
+	out := triaged(t, nil, true, f)
+
+	if !strings.Contains(lineWith(t, out, "fixes:"), "CVE-2024-2511") {
+		t.Error("an untriaged report does not say what the advisory fixes")
+	}
+	if strings.Contains(out, "epss:") {
+		t.Error("an untriaged report rendered a priority line")
+	}
+}
+
+// rpmReport renders a metadata-only result, the shape --rpm produces.
+func rpmReport(t *testing.T, tr *analyze.TriageResult, findings ...analyze.Finding) string {
+	t.Helper()
+	return renderText(&analyze.Result{
+		SchemaVersion: analyze.SchemaVersion,
+		Target:        "/tmp/libopenssl3-3.1.4-150600.2.19.x86_64.rpm",
+		Mode:          "rpm",
+		Ecosystems: []ecosystem.EcosystemResult{
+			{ID: "os", Ecosystems: []string{"SUSE"}, Components: 1},
+		},
+		Findings: findings, Triage: tr,
+	}, false)
+}
+
+// undecided is what a metadata-only scan produces for a package that ships an
+// ELF object: no test could run, so no claim is made.
+func undecided(cve string) analyze.Finding {
+	return analyze.Finding{
+		Ecosystem: "os", CVE: cve, ID: cve,
+		Package: "libopenssl3", Module: "libopenssl3", Version: "0:3.1.4-150600.2.19",
+		PURL:   "pkg:rpm/sles/libopenssl3@0:3.1.4-150600.2.19?arch=x86_64",
+		Status: analyze.StatusUndetermined,
+		Reason: ospkg.ReasonNoReachabilityTest,
+	}
+}
+
+// TestTheMetadataCaveatIsPrintedTwice is the v0.4.1 footer rule applied to the
+// caveat that changes the most: without it an undetermined row reads as one the
+// tool gave up on, rather than one the input cannot answer.
+func TestTheMetadataCaveatIsPrintedTwice(t *testing.T) {
+	// Long enough to earn a footer, which is the same 32 the real SLE package
+	// produces -- the case the repetition exists for.
+	var findings []analyze.Finding
+	for i := 0; i < 32; i++ {
+		findings = append(findings, undecided(fmt.Sprintf("SUSE-SU-2026:%04d-1", i)))
+	}
+	out := rpmReport(t, nil, findings...)
+
+	if n := strings.Count(out, "this read package metadata, not an installed system"); n != 2 {
+		t.Errorf("the caveat appears %d times, want it at both ends of the report", n)
+	}
+	if !strings.Contains(out, "32 finding(s) below are undetermined") {
+		t.Errorf("the caveat does not count the rows it explains:\n%s", out)
+	}
+}
+
+// An image scan must not grow the caveat, whatever its findings look like.
+func TestTheMetadataCaveatIsRPMOnly(t *testing.T) {
+	if out := report(t, false, gccTrio...); strings.Contains(out, "not an installed system") {
+		t.Errorf("an image report carried the --rpm caveat:\n%s", out)
+	}
+}
+
+// The caveat still prints with nothing to explain. "No findings" out of a
+// package file is a weaker statement than the same words out of an image, and
+// this is the whole of the difference.
+func TestTheMetadataCaveatSurvivesAnEmptyReport(t *testing.T) {
+	out := rpmReport(t, nil)
+	if !strings.Contains(out, "No ELF") {
+		t.Errorf("a clean metadata-only report did not say what it could not test:\n%s", out)
+	}
+	if strings.Contains(out, "finding(s) below") {
+		t.Errorf("a report with no rows counted some:\n%s", out)
+	}
+}
+
+// A package that ships no ELF object is ruled out on the header alone, and the
+// caveat has to distinguish that from the rows it could not decide -- otherwise
+// "RULED OUT (2)" sits under a note saying nothing could be ruled out.
+func TestTheCaveatSeparatesRuledOutFromUndecided(t *testing.T) {
+	noCode := undecided("RLSA-2026:25239")
+	noCode.Status = analyze.StatusNotPresent
+	noCode.Reason = ""
+	noCode.Method = ospkg.MethodNoCode
+	noCode.Justification = "vulnerable_code_not_present"
+
+	out := rpmReport(t, nil, noCode, undecided("RLSA-2026:22312"))
+	for _, want := range []string{
+		"1 finding(s) below are undetermined",
+		"1 finding(s) below are ruled out on the header alone",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("caveat is missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestThePriorityLineIsNotPrintedOverAnEmptyPopulation is the metadata-only
+// case making a latent contradiction visible: it counts affected rows, a
+// metadata-only scan has none by construction, and "0 scored" printed above a
+// table of EPSS percentages is a summary the report itself refutes.
+func TestThePriorityLineIsNotPrintedOverAnEmptyPopulation(t *testing.T) {
+	f := undecided("SUSE-SU-2024:3106-1")
+	f.Priority = &triage.Priority{CVE: "CVE-2024-5535", Scored: true, Percentile: 0.992, OfSet: 1}
+
+	out := rpmReport(t, &analyze.TriageResult{EPSSDate: "2026-08-04"}, f)
+	if strings.Contains(out, "0 scored") {
+		t.Errorf("the summary said nothing was scored over a row showing 99.2%%:\n%s", out)
+	}
+	// The date survives: a percentile is a claim about a day either way.
+	if !strings.Contains(out, "priority data: EPSS 2026-08-04") {
+		t.Errorf("the feed date went with it:\n%s", out)
 	}
 }

@@ -42,6 +42,13 @@ type Plugin struct {
 	// them, which os-release does not record.
 	Ecosystem string
 
+	// Packages, when non-empty, is the inventory to use instead of reading a
+	// database out of the tree. It is how --rpm scans packages that were never
+	// installed anywhere, and it puts the plugin in metadata-only mode: there
+	// is no filesystem behind these packages, so no closure can run and no
+	// finding can earn a linked verdict.
+	Packages []Supplied
+
 	// Mine reports that this plugin wants advisory prose mined for it. It only
 	// says what the orchestrator should spend; the validation that decides
 	// whether a mined hint may matter lives in checkSymbols regardless.
@@ -77,6 +84,7 @@ type Options struct {
 	Roots              []string
 	DlopenPolicy       elfgraph.DlopenPolicy
 	Ecosystem          string
+	Packages           []Supplied
 	Mine               bool
 	TrustImportAbsence bool
 	ReadELF            elfgraph.Reader
@@ -94,6 +102,7 @@ func New(opts Options) *Plugin {
 		Roots:              opts.Roots,
 		DlopenPolicy:       opts.DlopenPolicy,
 		Ecosystem:          opts.Ecosystem,
+		Packages:           opts.Packages,
 		Mine:               opts.Mine,
 		TrustImportAbsence: opts.TrustImportAbsence,
 		ReadELF:            opts.ReadELF,
@@ -124,6 +133,12 @@ type state struct {
 	// pkg is the database row, or the zero value when absent is set.
 	pkg pkgdb.Package
 
+	// meta is the rpm header metadata, populated only in metadata-only mode.
+	// It is the entire evidence base there: with no filesystem to walk, what
+	// the header says about the files this package would install is all the
+	// presence test has to work from.
+	meta pkgdb.Meta
+
 	// absent marks a component the user asked about that no database lists.
 	// It carries no version, so its advisory lookup returns every advisory ever
 	// filed against the name -- which is what makes "you asked about openssl and
@@ -140,6 +155,14 @@ type prepared struct {
 	release   string // narrows a bare-family ecosystem; see osv.Release.ProductRelease
 	distro    string // os-release ID, for the purl namespace
 	dbs       []pkgdb.Result
+
+	// metadataOnly means the inventory was handed in rather than read out of a
+	// tree, so there is no filesystem to test presence against. Every verdict
+	// that needs one is gated on this being false.
+	metadataOnly bool
+	// meta is the header metadata for the supplied packages, keyed by metaKey.
+	// Empty unless metadataOnly.
+	meta map[string]pkgdb.Meta
 
 	// The closure is the expensive part -- every ELF object in the image gets
 	// opened -- and a scan that resolves to no installed package never needs
@@ -190,6 +213,17 @@ func (p *Plugin) prepare(img *target.Image) (*prepared, error) {
 		read:  p.ReadSymbols,
 		cache: map[string]symbolEntry{},
 	}}
+	// A handed-in inventory replaces the tree entirely: nothing below this
+	// reads a database, an os-release, or a file, because with --rpm there is
+	// nothing to read one out of.
+	if len(p.Packages) > 0 {
+		if err := p.prepareSupplied(pr); err != nil {
+			return nil, err
+		}
+		p.prep = pr
+		return pr, nil
+	}
+
 	found := false
 	for _, r := range pkgdb.Readers() {
 		if _, ok := r.Detect(img.FS); ok {
@@ -303,7 +337,7 @@ func (pr *prepared) component(pkg pkgdb.Package) ecosystem.Component {
 		Version:   version,
 		PURL:      purl(pr.distro, pkg, version),
 		Locations: []string{pkg.DB},
-		Extra:     &state{pkg: pkg},
+		Extra:     &state{pkg: pkg, meta: pr.meta[metaKey(pkg)]},
 	}
 }
 
@@ -395,13 +429,17 @@ func (p *Plugin) AnalyzeImage(_ context.Context, img *target.Image, items []ecos
 
 	// The closure is only needed for a component that is actually installed;
 	// a run that resolves to nothing but absent packages should not pay for it.
+	// In metadata-only mode there is nothing to close over at all -- the tree
+	// behind these packages is empty because they were never installed -- so
+	// building one would spend the time to conclude that nothing is reachable,
+	// which is not a conclusion this mode is entitled to draw.
 	var g *elfgraph.Graph
 	for _, item := range items {
 		st, ok := item.Component.Extra.(*state)
 		if !ok {
 			return nil, fmt.Errorf("os: component %s was not produced by this plugin", item.Component.Key())
 		}
-		if !st.absent {
+		if !st.absent && !pr.metadataOnly {
 			if g, err = p.graph(pr); err != nil {
 				return nil, err
 			}
@@ -412,7 +450,7 @@ func (p *Plugin) AnalyzeImage(_ context.Context, img *target.Image, items []ecos
 	var out []ecosystem.Finding
 	for _, item := range items {
 		st := item.Component.Extra.(*state)
-		ev := p.evaluator(g, st, pr.syms)
+		ev := p.evaluator(pr, g, st)
 		for _, req := range item.Requests() {
 			out = append(out, ev.evaluate(item.Component, req))
 		}

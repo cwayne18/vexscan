@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -29,6 +30,7 @@ import (
 	"github.com/cwayne18/vexscan/internal/llm"
 	"github.com/cwayne18/vexscan/internal/modgraph"
 	"github.com/cwayne18/vexscan/internal/osv"
+	"github.com/cwayne18/vexscan/internal/rpmsrc"
 	"github.com/cwayne18/vexscan/internal/source"
 	"github.com/cwayne18/vexscan/internal/target"
 	"github.com/cwayne18/vexscan/internal/triage"
@@ -61,6 +63,22 @@ type Options struct {
 	Repo   string // git repo (source mode); mutually exclusive with Image
 	Ref    string // branch/tag/commit for Repo
 	Path   string // module subdirectory within Repo (default ".")
+
+	// RPM are package files to scan without installing them (--rpm): a file, a
+	// directory of them, or a URL. Mutually exclusive with the other three.
+	//
+	// This is the one target with no filesystem behind it, and every
+	// difference in the report follows from that: no reachability closure can
+	// run, so nothing can be linked and nothing can be ruled out as
+	// unreachable. What a header can still answer -- would this package
+	// install any code at all -- it does.
+	RPM []string
+
+	// rpmPackages is what RPM resolved to. It is unexported and filled in by
+	// runTree rather than by the caller, because reading it is I/O and Validate
+	// promises to do none: a scan must be able to fail on a bad flag before it
+	// fetches anything.
+	rpmPackages []ospkg.Supplied
 
 	// Packages are the raw --package selectors: purls, ecosystem:name
 	// shorthand, or bare names resolved against whatever inventory contains
@@ -244,10 +262,14 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 // checkTarget reports whether exactly one target was named.
 func (o Options) checkTarget() error {
 	var named []string
-	for _, t := range []struct{ flag, val string }{
-		{"--image", o.Image}, {"--rootfs", o.RootFS}, {"--repo", o.Repo},
+	for _, t := range []struct {
+		flag string
+		set  bool
+	}{
+		{"--image", o.Image != ""}, {"--rootfs", o.RootFS != ""},
+		{"--repo", o.Repo != ""}, {"--rpm", len(o.RPM) > 0},
 	} {
-		if t.val != "" {
+		if t.set {
 			named = append(named, t.flag)
 		}
 	}
@@ -255,7 +277,7 @@ func (o Options) checkTarget() error {
 	case 1:
 		return nil
 	case 0:
-		return fmt.Errorf("one of --image, --rootfs or --repo is required")
+		return fmt.Errorf("one of --image, --rootfs, --repo or --rpm is required")
 	default:
 		return fmt.Errorf("set only one of %s", strings.Join(named, ", "))
 	}
@@ -273,6 +295,7 @@ func registryFor(opts Options) *ecosystem.Registry {
 			Roots:              opts.Roots,
 			DlopenPolicy:       opts.DlopenPolicy,
 			Ecosystem:          opts.OSVEcosystem,
+			Packages:           opts.rpmPackages,
 			Mine:               opts.MineAdvisories && opts.UseLLM,
 			TrustImportAbsence: opts.TrustImportAbsence,
 			Logf:               opts.Logf,
@@ -358,10 +381,14 @@ func targeted(subjects []ecosystem.Subject) bool {
 
 // mode names which kind of filesystem target this run is scanning.
 func (o Options) mode() string {
-	if o.RootFS != "" {
+	switch {
+	case len(o.RPM) > 0:
+		return "rpm"
+	case o.RootFS != "":
 		return "rootfs"
+	default:
+		return "image"
 	}
-	return "image"
 }
 
 // openTree produces the tree the image analyzers run against, and a cleanup to
@@ -374,6 +401,10 @@ func (o Options) mode() string {
 // It takes *Options because image mode defaults the platform and reports what
 // it chose.
 func openTree(ctx context.Context, opts *Options) (*target.Image, func(), error) {
+	if len(opts.RPM) > 0 {
+		return openRPMTree(opts)
+	}
+
 	if opts.RootFS != "" {
 		img, err := openRootFS(opts.RootFS)
 		if err != nil {
@@ -404,6 +435,24 @@ func openTree(ctx context.Context, opts *Options) (*target.Image, func(), error)
 		return nil, nil, fmt.Errorf("extract image: %w", err)
 	}
 	return img, cleanup, nil
+}
+
+// openRPMTree gives --rpm a tree to be scanned against: an empty one.
+//
+// A real empty directory rather than a nil filesystem, and the difference is
+// not cosmetic. Every walk, every Unreadable check and every plugin's "does
+// this apply" question runs over it unchanged, and each of them gets the
+// truthful answer -- there is no filesystem here, because these packages were
+// never installed. A nil RootFS would make the same statement by panicking.
+func openRPMTree(opts *Options) (*target.Image, func(), error) {
+	dest, err := os.MkdirTemp("", "vexscan-rpm-")
+	if err != nil {
+		return nil, nil, err
+	}
+	return &target.Image{
+		Ref: strings.Join(opts.RPM, ", "),
+		FS:  target.NewDirFS(dest),
+	}, func() { os.RemoveAll(dest) }, nil
 }
 
 // openRootFS points a target at a directory the user already has.
@@ -448,6 +497,15 @@ func openRootFS(dir string) (*target.Image, error) {
 // in the tree removes it.
 func runTree(ctx context.Context, opts Options) (*Result, error) {
 	logf := opts.Logf
+
+	// Before plan(), because the plugin set is built holding the inventory:
+	// registryFor hands these to the OS plugin at construction time. And in
+	// here rather than in Validate, which promises to touch neither disk nor
+	// network.
+	rpms, err := readRPMs(ctx, &opts)
+	if err != nil {
+		return nil, err
+	}
 
 	// Plan the scan and build the LLM client before the extraction: a bad
 	// selector or a rejected token should fail in the first second, not after a
@@ -514,6 +572,7 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 			logf("    ! %s", p)
 		}
 	}
+	result.Unreadable = noteRPMFailures(result.Unreadable, rpms, logf)
 
 	severityOverlay(result.Findings, run.resolver.severities())
 	// Filtering here, rather than in the renderer, is what keeps every count
@@ -525,12 +584,73 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	// analyzes a tree whose provenance nobody recorded, and inventing a purl
 	// from a directory name would look up an artifact that does not exist.
 	productOverlay(result.Findings, opts.Image)
+	sets := run.resolver.cveSets()
+	upstreamOverlay(result.Findings, sets.Upstream)
 	result.VEXHubs = vexOverlay(ctx, opts.VEXHubs, result.Findings, run.resolver.aliases(), logf)
-	result.Triage = triageOverlay(ctx, opts.Triage, result.Findings, run.resolver.aliases(), logf)
+	result.Triage = triageOverlay(ctx, opts.Triage, result.Findings, sets.All, logf)
 	llmOverlay(ctx, llmClient, result.Findings, "", logf)
 	sortFindings(result.Findings)
 	return result, nil
 }
+
+// readRPMs resolves --rpm into the inventory the OS plugin will scan, and
+// records it on opts for registryFor to pick up.
+//
+// It returns the whole result rather than just the packages because what would
+// not parse matters as much as what did: see noteRPMFailures.
+func readRPMs(ctx context.Context, opts *Options) (*rpmsrc.Result, error) {
+	if len(opts.RPM) == 0 {
+		return nil, nil
+	}
+	res, err := rpmsrc.Read(ctx, opts.RPM, opts.Logf)
+	if err != nil {
+		return nil, err
+	}
+	opts.rpmPackages = make([]ospkg.Supplied, 0, len(res.Packages))
+	for _, p := range res.Packages {
+		opts.rpmPackages = append(opts.rpmPackages, ospkg.Supplied{Package: p.Package, Meta: p.Meta})
+	}
+	for _, n := range res.Skipped {
+		opts.Logf("  not scanned: %s (%s)", n.Src, n.Reason)
+	}
+	return res, nil
+}
+
+// noteRPMFailures records the package files that would not parse.
+//
+// They go into Unreadable because that is already what the whole tool means by
+// "this report is not a complete account of what you pointed it at": it drives
+// the log line, the report footer and the exit code, and every one of those is
+// the right response here. Unreadable's own rule is that the loss surfaces at
+// the reader that wanted it and can name what it lost -- so each one is named,
+// with the reason, rather than counted.
+//
+// It folds into the set it is given and returns it, rather than writing to a
+// report, because --format inventory needs the same accounting and has no
+// report to write to.
+func noteRPMFailures(u *target.Unreadable, rpms *rpmsrc.Result, logf func(string, ...any)) *target.Unreadable {
+	if rpms == nil || len(rpms.Failed) == 0 {
+		return u
+	}
+	if u == nil {
+		u = &target.Unreadable{}
+	}
+	logf("  ! %d rpm package file(s) could not be read; the scan does not account for them", len(rpms.Failed))
+	for _, n := range rpms.Failed {
+		logf("    ! %s: %s", n.Src, n.Reason)
+		u.Count++
+		if len(u.Paths) < maxRPMFailureSample {
+			u.Paths = append(u.Paths, fmt.Sprintf("%s: %s", n.Src, n.Reason))
+		}
+	}
+	return u
+}
+
+// maxRPMFailureSample bounds the named sample in the JSON, for the same reason
+// target caps its own: a directory whose every file is an HTML error page
+// would otherwise put a few thousand near-identical lines in the report. The
+// count stays exact.
+const maxRPMFailureSample = 10
 
 // imageRun is the state every plugin in one image scan shares: what was asked
 // for, and the advisory cache that keeps two plugins from querying OSV twice
@@ -672,8 +792,10 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 	result.Findings, result.Withheld = severityFilter(result.Findings, opts.Severities)
 	// No productOverlay here: repo mode has no image, and the only artifact a
 	// checkout is is its own module, which the Go plugin already recorded.
+	sets := run.resolver.cveSets()
+	upstreamOverlay(result.Findings, sets.Upstream)
 	result.VEXHubs = vexOverlay(ctx, opts.VEXHubs, result.Findings, run.resolver.aliases(), logf)
-	result.Triage = triageOverlay(ctx, opts.Triage, result.Findings, run.resolver.aliases(), logf)
+	result.Triage = triageOverlay(ctx, opts.Triage, result.Findings, sets.All, logf)
 	llmOverlay(ctx, llmClient, result.Findings, "source tree", logf)
 	sortFindings(result.Findings)
 	return result, nil
@@ -917,6 +1039,102 @@ func (r *advisoryResolver) aliases() map[string][]string {
 		}
 	}
 	return out
+}
+
+// idSets is what the CVE-joining consumers need out of the advisory cache.
+//
+// It is separate from aliases() because the two relations are not the same
+// claim, and confusing them has consequences in opposite directions. See
+// cveSets.
+type idSets struct {
+	// All maps every id an advisory is known by onto every id it relates to at
+	// all: its own, its aliases, and the CVEs it says it addresses.
+	All map[string][]string
+	// Upstream maps a bundling advisory -- by its own id and by each CVE it
+	// fixes -- onto just the CVEs it addresses, so the report can name them
+	// without re-deriving the difference. Advisories about a single
+	// vulnerability are absent, not present with a one-element list.
+	Upstream map[string][]string
+}
+
+// cveSets is the advisory cache viewed as "what CVEs is this finding about".
+//
+// aliases() answers a narrower question -- what else is this same vulnerability
+// called -- and VEX matching must keep using it: a hub statement about one CVE
+// must not suppress a finding about the eight that SUSE-SU-2026:0312-1 bundles.
+// Over-suppression is the one failure this tool may not have.
+//
+// Prioritisation and --cves need the wider set and are safe with it, because
+// both take a maximum over the set rather than a single value: a bundle is as
+// urgent as the most-exploited thing its patch fixes, and a user filtering for
+// a CVE wants the advisory that addresses it. On SUSE and Red Hat the wider set
+// is the only one that resolves anything at all -- SUSE-SU-2026:0312-1 and
+// RHSA-2024:2447 carry no aliases and no CVE in their own ids.
+//
+// Like aliases(), this costs no network traffic: every record was already
+// fetched to decide whether the finding existed.
+func (r *advisoryResolver) cveSets() idSets {
+	out := idSets{All: map[string][]string{}, Upstream: map[string][]string{}}
+	for _, set := range r.cache {
+		for _, adv := range set {
+			if adv == nil {
+				continue
+			}
+			ids := append([]string{adv.ID}, adv.Aliases...)
+			ids = append(ids, adv.Upstream...)
+			for _, key := range ids {
+				if key != "" {
+					out.All[key] = ids
+				}
+			}
+			// Keyed by the advisory's own id, for an ordinary scan where the
+			// row is the bundle; and by each CVE it fixes, for --cves where
+			// the row is one member and the fixed version it reports came out
+			// of a patch covering all of them. Saying so is the difference
+			// between "this upgrade fixes your CVE" and "this upgrade fixes
+			// your CVE and seven others you did not ask about".
+			if len(adv.Upstream) > 0 {
+				for _, key := range append([]string{adv.ID}, adv.Upstream...) {
+					if key != "" {
+						out.Upstream[key] = adv.Upstream
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+// upstreamOverlay records, on each finding, the CVEs its advisory addresses.
+//
+// It runs beside severityOverlay for the same reason severityOverlay exists at
+// all: a plugin is handed a presence question and never sees the advisory, so
+// anything read off the record has to be attached where the records live.
+//
+// Only a genuine bundle is annotated. A Debian record addresses the one CVE its
+// own id already spells -- DEBIAN-CVE-2023-45853 addresses CVE-2023-45853 --
+// and repeating it would put an "addresses:" line under every Debian row
+// telling the reader what the row says.
+func upstreamOverlay(findings []Finding, ups map[string][]string) {
+	for i := range findings {
+		f := &findings[i]
+		for _, key := range []string{f.ID, f.CVE, f.GoID} {
+			if key == "" {
+				continue
+			}
+			u, ok := ups[key]
+			if !ok {
+				continue
+			}
+			// findingCVEs with no id sets is exactly "what this row's own ids
+			// already name", which is the thing an addresses: line must add to.
+			if len(u) == 1 && slices.Contains(findingCVEs(*f, nil), u[0]) {
+				break
+			}
+			f.Upstream = u
+			break
+		}
+	}
 }
 
 // severityOverlay labels each finding with its advisory's severity, in place.

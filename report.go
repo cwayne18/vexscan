@@ -9,6 +9,7 @@ import (
 	"github.com/cwayne18/vexscan/internal/analyze"
 	"github.com/cwayne18/vexscan/internal/cvss"
 	"github.com/cwayne18/vexscan/internal/ecosystem"
+	"github.com/cwayne18/vexscan/internal/ecosystem/ospkg"
 )
 
 // The text report.
@@ -139,7 +140,49 @@ func writeCaveats(b *strings.Builder, res *analyze.Result) {
 		// reached looks exactly like one with nothing to say.
 		fmt.Fprintf(b, "NOTE: VEX hub %s could not be read, so nothing was moved to ALREADY VEXED - %s\n", h.URL, h.Error)
 	}
+	writeMetadataCaveat(b, res)
 	writeTriageCaveats(b, res)
+}
+
+// writeMetadataCaveat says that --rpm read a package file and not a system.
+//
+// It is a NOTE and not an INCOMPLETE banner: nothing failed, and the scan read
+// everything there was to read. What it changes is what the rows are allowed to
+// mean -- an undetermined row here is not one the tool gave up on, it is one
+// the input cannot answer. Without this the report is indistinguishable from an
+// image scan that could not close over anything.
+func writeMetadataCaveat(b *strings.Builder, res *analyze.Result) {
+	if res.Mode != "rpm" {
+		return
+	}
+	undetermined, noCode := 0, 0
+	for _, f := range res.Findings {
+		switch {
+		case f.Reason == ospkg.ReasonNoReachabilityTest:
+			undetermined++
+		case f.Status == analyze.StatusNotPresent && f.Method == ospkg.MethodNoCode:
+			noCode++
+		}
+	}
+	// The first two lines are unconditional. They are worth printing even with
+	// no findings at all to explain: "No findings" out of a package file is a
+	// weaker statement than the same words out of an image, and this is the
+	// whole of the difference.
+	b.WriteString("NOTE: this read package metadata, not an installed system. No ELF\n")
+	b.WriteString("      reachability test could run -- there is no filesystem to trace.\n")
+
+	if undetermined > 0 {
+		fmt.Fprintf(b, "      %d finding(s) below are undetermined for that reason. For scale: on a\n", undetermined)
+		// The reference measurement is here because the obvious next question
+		// is what the missing test would have been worth, and the honest answer
+		// on the distribution this was built against is: about one finding.
+		b.WriteString("      measured SUSE 15.6 image that test ruled out 1 finding of 47.\n")
+	}
+	if noCode > 0 {
+		fmt.Fprintf(b, "      %d finding(s) below are ruled out on the header alone, which is the\n", noCode)
+		b.WriteString("      same evidence an installed scan would have used: the package ships no\n")
+		b.WriteString("      ELF object at all.\n")
+	}
 }
 
 // writeTriageCaveats explains anything --triage could not do.
@@ -336,6 +379,14 @@ func writePriority(b *strings.Builder, res *analyze.Result) {
 		if unscored > 0 {
 			parts = append(parts, fmt.Sprintf("%d unscored", unscored))
 		}
+	}
+	// Nothing in the population is not the same as nothing scored, and a
+	// metadata-only scan makes the difference visible: every row there is
+	// undetermined, so the affected population is empty by construction while
+	// the rows themselves carry percentiles. "0 scored" printed over a table of
+	// EPSS columns is a summary the report contradicts three lines later.
+	if scored+unscored+kev == 0 {
+		parts = nil
 	}
 	if len(parts) > 0 {
 		fmt.Fprintf(b, "  priority: %s\n", strings.Join(parts, ", "))
@@ -694,9 +745,17 @@ func writePriorityDetail(b *strings.Builder, f analyze.Finding) {
 		if p.CVE != f.CVE {
 			line += " for " + p.CVE
 		}
+		// An advisory that bundles a patch is reported at its worst member, so
+		// the row's rank is one CVE's and the row is about several. Saying which
+		// of how many is what lets the reader check that rather than assume it.
+		if p.OfSet > 1 {
+			line += fmt.Sprintf(", highest of %d", p.OfSet)
+		}
 		fmt.Fprintf(b, "  epss:     %s\n", line)
 	case p.CVE == "":
 		fmt.Fprintf(b, "  epss:     not scored - this advisory has no CVE id, and both feeds are keyed by CVE\n")
+	case p.OfSet > 1:
+		fmt.Fprintf(b, "  epss:     not scored - none of this advisory's %d CVEs are in the feed yet\n", p.OfSet)
 	default:
 		fmt.Fprintf(b, "  epss:     not scored - %s is not in the feed yet\n", p.CVE)
 	}
@@ -804,6 +863,19 @@ func truncate(s string, max int) string {
 	return string(r[:max-1]) + "…"
 }
 
+// listCVEs joins the CVEs an advisory bundles, naming at most max of them and
+// counting the rest.
+//
+// The count is not decoration. A distro advisory that fixes fourteen CVEs is a
+// different object from one that fixes two, and a line that stopped at five
+// with no remainder would read as the whole list.
+func listCVEs(cves []string, max int) string {
+	if len(cves) <= max {
+		return strings.Join(cves, ", ")
+	}
+	return fmt.Sprintf("%s (+%d more)", strings.Join(cves[:max], ", "), len(cves)-max)
+}
+
 // writeDetail prints everything known about one finding: the block the report
 // used to print for every finding, plus the evidence and the plugin's own
 // characterisation, neither of which the text output has ever shown.
@@ -814,6 +886,9 @@ func writeDetail(b *strings.Builder, f analyze.Finding) {
 	}
 	fmt.Fprintf(b, "%-22s %s\n", statusLabel(f.Status), component(f))
 	fmt.Fprintf(b, "  cve:      %s\n", id)
+	if len(f.Upstream) > 0 {
+		fmt.Fprintf(b, "  fixes:    %s\n", listCVEs(f.Upstream, 5))
+	}
 	if f.Ecosystem != "" {
 		fmt.Fprintf(b, "  from:     %s\n", f.Ecosystem)
 	}

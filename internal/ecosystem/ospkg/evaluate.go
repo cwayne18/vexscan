@@ -19,7 +19,18 @@ const (
 	// MethodClosure: the DT_NEEDED closure was resolved from the image's
 	// entrypoint and none of the package's objects appeared in it.
 	MethodClosure = "elf-needed-closure"
+	// MethodRPMFile: the rpm header was read and there was no filesystem to
+	// test anything against. It is an evidence origin rather than a method,
+	// because it names the absence of a test and not a test -- the statuses it
+	// accompanies are undetermined.
+	MethodRPMFile = "rpm-file-metadata"
 )
+
+// ReasonNoReachabilityTest is the reason on every finding a metadata-only scan
+// could not decide. It is exported because the report counts them to write its
+// caveat, and a caveat that disagreed with the rows it explains would be worse
+// than none.
+const ReasonNoReachabilityTest = "no_reachability_test_possible"
 
 // evaluator holds what every finding for one component needs.
 type evaluator struct {
@@ -27,11 +38,14 @@ type evaluator struct {
 	st    *state
 	sym   *symbolCache
 	trust bool // --trust-import-absence
-	logf  func(string, ...any)
+	// meta is set when the inventory was handed in rather than read out of a
+	// tree, and g is nil. See evaluateMetadata.
+	meta bool
+	logf func(string, ...any)
 }
 
-func (p *Plugin) evaluator(g *elfgraph.Graph, st *state, sym *symbolCache) evaluator {
-	return evaluator{g: g, st: st, sym: sym, trust: p.TrustImportAbsence, logf: p.Logf}
+func (p *Plugin) evaluator(pr *prepared, g *elfgraph.Graph, st *state) evaluator {
+	return evaluator{g: g, st: st, sym: pr.syms, trust: p.TrustImportAbsence, meta: pr.metadataOnly, logf: p.Logf}
 }
 
 // evaluate decides one advisory against one installed package.
@@ -67,6 +81,10 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 		f.Status = ecosystem.StatusUndetermined
 		f.Reason = "no_osv_package_mapping"
 		return f
+	}
+
+	if e.meta {
+		return e.evaluateMetadata(f)
 	}
 
 	pkg := e.st.pkg
@@ -155,6 +173,44 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 		f.Reachability = fmt.Sprintf("loaded: the dynamic linker reaches %s from %s (whether the vulnerable function is called is not asserted)",
 			objects(files.Reachable), e.entrypoint())
 	}
+	return f
+}
+
+// evaluateMetadata decides one advisory against a package file, with no
+// filesystem behind it.
+//
+// Two answers are available and the third one is not. A package whose header
+// lists no ELF object installs no code that could execute, and that is the
+// same evidence MethodNoCode rests on when it is read out of an image -- so it
+// is reused verbatim rather than given a weaker name for having come from a
+// file. Everything else is undetermined.
+//
+// It is never linked and never not_in_path. Both of those are claims about
+// what the dynamic linker would load, no closure ran, and there is nothing to
+// have run one over. An honest undetermined is the whole reason this mode can
+// be trusted at all: what it cannot see, it says it cannot see.
+func (e evaluator) evaluateMetadata(f ecosystem.Finding) ecosystem.Finding {
+	pkg, meta := e.st.pkg, e.st.meta
+
+	if !meta.HasELF() {
+		f.Status = ecosystem.StatusNotPresent
+		f.Justification = "vulnerable_code_not_present"
+		f.Method = MethodNoCode
+		f.Evidence = []ecosystem.Evidence{{
+			Origin: MethodNoCode,
+			Detail: fmt.Sprintf("%s would install %d files and its header classifies none of them as an ELF object",
+				pkg.Name, len(pkg.Files)),
+		}}
+		return f
+	}
+
+	f.Status = ecosystem.StatusUndetermined
+	f.Reason = ReasonNoReachabilityTest
+	f.Evidence = []ecosystem.Evidence{{
+		Origin: MethodRPMFile,
+		Detail: fmt.Sprintf("%s would install %s, but this scan read a package file and not a system, so nothing can be said about whether they would be loaded",
+			pkg.Name, objects(meta.ELF)),
+	}}
 	return f
 }
 

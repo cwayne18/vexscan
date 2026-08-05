@@ -22,10 +22,12 @@ import (
 )
 
 func main() {
-	var packages, ecosystems, roots, vexhubs, severities stringList
+	var packages, ecosystems, roots, vexhubs, severities, rpms stringList
 	flag.Var(&packages, "package", "package to check: a purl, an ecosystem:name shorthand (deb:openssl, golang:golang.org/x/net), or a bare name resolved against the inventory; repeatable")
 	flag.Var(&ecosystems, "ecosystem", "restrict the scan to these ecosystems (golang, os, pypi, npm, maven, or a distro family like debian); repeatable, default all")
 	flag.Var(&roots, "roots", "extra entrypoints for the reachability closures (shared libraries and language imports), for an image whose real command comes from outside its config; repeatable")
+	flag.Var(&rpms, "rpm", "rpm package file to scan without installing it -- a path, a directory of them, or a URL; repeatable "+
+		"(mutually exclusive with --image, --rootfs and --repo; reads only the header, so a URL costs kilobytes not megabytes)")
 	flag.Var(&vexhubs, "vexhub", "VEX Hub repository to check findings against, e.g. https://github.com/rancher/vexhub (also accepts a raw base URL or a local directory); repeatable, earliest wins")
 	flag.Var(&severities, "severity", "only report findings at these severities: "+
 		strings.Join(cvss.Labels, ", ")+"; comma-separated or repeatable "+
@@ -70,8 +72,12 @@ func main() {
 	// needs no subject and no advisory lookup.
 	inventoryMode := *format == "inventory"
 
-	if named := countNamed(*image, *rootfs, *repo); named != 1 {
-		fail("set exactly one of --image, --rootfs or --repo")
+	named := countNamed(*image, *rootfs, *repo)
+	if len(rpms) > 0 {
+		named++
+	}
+	if named != 1 {
+		fail("set exactly one of --image, --rootfs, --repo or --rpm")
 	}
 	switch *format {
 	case "text", "json", "inventory":
@@ -131,6 +137,7 @@ func main() {
 			Image:        *image,
 			RootFS:       *rootfs,
 			Repo:         *repo,
+			RPM:          rpms,
 			OS:           *goos,
 			Arch:         *arch,
 			OSVEcosystem: *osvEco,
@@ -143,6 +150,7 @@ func main() {
 		Image:              *image,
 		RootFS:             *rootfs,
 		Repo:               *repo,
+		RPM:                rpms,
 		Ref:                *ref,
 		Path:               *repoPath,
 		Packages:           packages,

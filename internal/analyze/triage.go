@@ -67,23 +67,24 @@ func (t *TriageResult) Usable() bool {
 //
 // The join is the interesting part. Both feeds are keyed by CVE and vexscan's
 // findings frequently are not: on a Rancher image not one finding of seventy
-// carries a CVE in any of its three id fields. findingIDs walks the OSV alias
-// list the resolver already fetched, which is what lets GO-2025-3547 be scored
-// as CVE-2024-7598. Advisories that reach no CVE at all are counted and named
-// rather than quietly left at zero.
-func triageOverlay(ctx context.Context, loader *triage.Loader, findings []Finding, aliases map[string][]string, logf func(string, ...any)) *TriageResult {
+// carries a CVE in any of its three id fields, and on SUSE not one of forty-six
+// does either. findingIDs walks the id sets the resolver already fetched, which
+// is what lets GO-2025-3547 be scored as CVE-2024-7598 and SUSE-SU-2026:0312-1
+// be scored as the worst of the eight CVEs its patch fixes. Advisories that
+// reach no CVE at all are counted and named rather than quietly left at zero.
+func triageOverlay(ctx context.Context, loader *triage.Loader, findings []Finding, sets map[string][]string, logf func(string, ...any)) *TriageResult {
 	if loader == nil {
 		return nil
 	}
 
-	// Resolve every finding's CVE first, so the feed parser can throw away the
+	// Resolve every finding's CVEs first, so the feed parser can throw away the
 	// other 355,000 rows as it streams them.
-	cves := make([]string, len(findings))
+	cves := make([][]string, len(findings))
 	want := map[string]bool{}
 	for i, f := range findings {
-		cves[i] = findingCVE(f, aliases)
-		if cves[i] != "" {
-			want[cves[i]] = true
+		cves[i] = findingCVEs(f, sets)
+		for _, cve := range cves[i] {
+			want[cve] = true
 		}
 	}
 	logf("Triaging %d findings against EPSS and CISA KEV (%d CVE ids)", len(findings), len(want))
@@ -101,12 +102,12 @@ func triageOverlay(ctx context.Context, loader *triage.Loader, findings []Findin
 		CatalogSize: len(data.KEV),
 	}
 	for i := range findings {
-		p := data.Lookup(cves[i])
+		p := data.LookupSet(cves[i])
 		findings[i].Priority = &p
 		switch {
 		case p.Scored:
 			res.Scored++
-		case cves[i] == "":
+		case len(cves[i]) == 0:
 			res.NoCVE++
 		default:
 			res.NotInFeed++
@@ -121,20 +122,36 @@ func triageOverlay(ctx context.Context, loader *triage.Loader, findings []Findin
 	return res
 }
 
-// findingCVE is the bare CVE id to look a finding up by, or "" when its
-// advisory has never been assigned one.
+// findingCVEs is every bare CVE id a finding can be looked up by, in the order
+// the ids were reached, deduplicated. Empty when its advisory has never been
+// assigned one.
+//
+// It is a set rather than a single id because a distro advisory is a bundle:
+// SUSE-SU-2026:0312-1 addresses eight CVEs and names none of them in its own
+// id. Returning the first would be returning whichever the record happened to
+// list first. LookupSet takes the worst of them instead.
 //
 // Distro prefixes are stripped the way report.go's shortAdvisory strips them
 // for display: DEBIAN-CVE-2026-54369 is CVE-2026-54369 wearing a database's
 // name.
-func findingCVE(f Finding, aliases map[string][]string) string {
-	for _, id := range findingIDs(f, aliases) {
-		if bareCVE.MatchString(id) {
-			return id
-		}
-		if _, rest, found := strings.Cut(id, "-"); found && bareCVE.MatchString(rest) {
-			return rest
+func findingCVEs(f Finding, sets map[string][]string) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(cve string) {
+		if !seen[cve] {
+			seen[cve] = true
+			out = append(out, cve)
 		}
 	}
-	return ""
+	for _, id := range findingIDs(f, sets) {
+		switch {
+		case bareCVE.MatchString(id):
+			add(id)
+		default:
+			if _, rest, found := strings.Cut(id, "-"); found && bareCVE.MatchString(rest) {
+				add(rest)
+			}
+		}
+	}
+	return out
 }

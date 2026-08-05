@@ -74,6 +74,19 @@ type Advisory struct {
 	ID string
 	// Aliases are all other identifiers this advisory is known by.
 	Aliases []string
+	// Upstream is the vulnerabilities this record addresses, which for a distro
+	// advisory is the CVEs its patch fixes.
+	//
+	// It is deliberately not merged into Aliases, because an alias is a claim
+	// of identity and this is not one. Every distro database uses this field
+	// and none uses aliases: SUSE-SU-2026:0312-1 addresses eight unrelated
+	// CVEs, RHSA-2024:2447 seven. Treating those as eight names for one thing
+	// would let buildMap file the record under eight keys and borrowSeverity
+	// copy one CVE's vector onto the other seven.
+	//
+	// Consumers that join on CVE read it anyway, because a bundle still has to
+	// be findable by what it fixes -- see advisoryResolver.cveSets.
+	Upstream []string
 	// Summary and Details are the advisory prose. They are the input to
 	// advisory-text mining for ecosystems that publish no package-level data.
 	Summary string
@@ -219,8 +232,11 @@ type queryRequest struct {
 type vuln struct {
 	ID      string   `json:"id"`
 	Aliases []string `json:"aliases"`
-	Summary string   `json:"summary"`
-	Details string   `json:"details"`
+	// Upstream is what a distro advisory says it fixes. See Advisory.Upstream
+	// for why it is kept apart from Aliases.
+	Upstream []string `json:"upstream"`
+	Summary  string   `json:"summary"`
+	Details  string   `json:"details"`
 	// Severity is OSV's list of scores, one per scoring system. A record may
 	// carry a CVSS_V3 entry, a CVSS_V4 entry, both, or neither.
 	Severity []struct {
@@ -470,7 +486,39 @@ func buildMap(ref Ref, vulns []vuln) map[string]*Advisory {
 		}
 	}
 	borrowSeverity(out, kept)
+	indexUpstream(out, kept)
 	return out
+}
+
+// indexUpstream makes a bundle findable by the CVEs it fixes, without letting
+// them speak for it.
+//
+// --cves CVE-2024-5535 has to reach the SUSE-SU record that patches it; on a
+// SUSE image today it reaches nothing, because no SUSE advisory names a CVE in
+// its own id or its aliases. So the upstream list has to become map keys.
+//
+// What must not follow is severity crossing between bundle-mates, and the
+// ordering is what prevents it: this runs strictly after every identity key is
+// placed and after borrowSeverity has finished, so borrowSeverity never sees
+// these entries and cannot copy one CVE's vector onto the other seven. It also
+// never displaces an existing key, so a real record about CVE-2024-5535 always
+// outranks a bundle that merely fixes it.
+//
+// Where two bundles address the same CVE and neither is itself a record for it,
+// the first the API returned wins -- the same first-wins rule merge applies to
+// conflicting names. The question asked was whether anything patches this CVE,
+// and either answer is true.
+func indexUpstream(out map[string]*Advisory, kept []*Advisory) {
+	for _, adv := range kept {
+		for _, key := range adv.Upstream {
+			if key == "" {
+				continue
+			}
+			if _, ok := out[key]; !ok {
+				out[key] = adv
+			}
+		}
+	}
 }
 
 // borrowSeverity fills in a winning advisory's missing severity from another
@@ -529,6 +577,7 @@ func advisoryFor(ref Ref, v vuln) *Advisory {
 	adv := &Advisory{
 		ID:                v.ID,
 		Aliases:           v.Aliases,
+		Upstream:          v.Upstream,
 		Summary:           v.Summary,
 		Details:           v.Details,
 		CVSSVector:        cvssVector(v),

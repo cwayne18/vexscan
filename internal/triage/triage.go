@@ -67,6 +67,12 @@ type Priority struct {
 	EPSS       float64   `json:"epss,omitempty"`
 	Percentile float64   `json:"percentile,omitempty"`
 	KEV        *KEVEntry `json:"kev,omitempty"`
+
+	// OfSet is how many CVEs were weighed, when the advisory addresses more
+	// than one and the fields above are the worst of them. Zero for the
+	// ordinary case of an advisory about the single vulnerability its row
+	// already names. See LookupSet.
+	OfSet int `json:"of_set,omitempty"`
 }
 
 // Known reports whether triage found anything at all about this finding. A
@@ -117,6 +123,48 @@ func (d *Data) Lookup(cve string) Priority {
 		p.KEV = &entry
 	}
 	return p
+}
+
+// LookupSet returns what is known about an advisory that addresses several
+// CVEs at once, which every distro advisory that bundles a patch does:
+// SUSE-SU-2026:0312-1 fixes eight.
+//
+// The answer is the worst of them. A package carrying a patch for eight
+// vulnerabilities is as exposed as the most-exploited one, and there is no
+// defensible way to pick a single representative out of eight -- taking the
+// first would be taking whichever order the record happened to list them in.
+// Averaging would be worse still: it would let seven quiet CVEs bury one that
+// is being exploited today, which is the precise failure this flag exists to
+// prevent.
+//
+// The winner is ranked KEV first and then by percentile, which is the order the
+// report sorts rows in, applied inside a row. CVE names whichever member won,
+// so the reader can check the claim.
+func (d *Data) LookupSet(cves []string) Priority {
+	if len(cves) == 0 {
+		return Priority{}
+	}
+	best := d.Lookup(cves[0])
+	for _, cve := range cves[1:] {
+		if p := d.Lookup(cve); outranks(p, best) {
+			best = p
+		}
+	}
+	if len(cves) > 1 {
+		best.OfSet = len(cves)
+	}
+	return best
+}
+
+// outranks reports whether a is the more urgent of two members of one bundle.
+func outranks(a, b Priority) bool {
+	if (a.KEV != nil) != (b.KEV != nil) {
+		return a.KEV != nil
+	}
+	if a.Scored != b.Scored {
+		return a.Scored
+	}
+	return a.Percentile > b.Percentile
 }
 
 // Loader fetches and caches the feeds. The zero value is not usable; call New.

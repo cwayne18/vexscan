@@ -74,6 +74,100 @@ func TestQueryAliasMappingAndPreference(t *testing.T) {
 	}
 }
 
+// Every distro database relates its records with "upstream" and none with
+// "aliases". The shape below is SUSE-SU-2026:0312-1's, trimmed: no aliases at
+// all, and eight CVEs it says its patch fixes.
+const suseResponse = `{
+  "vulns": [
+    {
+      "id": "SUSE-SU-2026:0312-1",
+      "aliases": [],
+      "upstream": ["CVE-2024-2511", "CVE-2024-4603", "CVE-2024-5535"],
+      "affected": [{"package": {"name": "openssl-3"}}]
+    },
+    {
+      "id": "SUSE-SU-2026:1177-1",
+      "aliases": [],
+      "upstream": ["CVE-2024-5535"],
+      "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}],
+      "affected": [{"package": {"name": "openssl-3"}}]
+    }
+  ]
+}`
+
+func TestUpstreamIsReadButIsNotAnAlias(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(suseResponse))
+	}))
+	defer srv.Close()
+
+	c := NewClient()
+	c.BaseURL = srv.URL
+
+	m, err := c.Query(context.Background(), Ref{Ecosystem: "SUSE", Name: "openssl-3", Version: "3.1.4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	adv, ok := m["SUSE-SU-2026:0312-1"]
+	if !ok {
+		t.Fatal("the advisory is not in the map under its own id")
+	}
+	if len(adv.Upstream) != 3 || adv.Upstream[0] != "CVE-2024-2511" {
+		t.Errorf("Upstream = %v, want the three CVEs the record addresses", adv.Upstream)
+	}
+	if len(adv.Aliases) != 0 {
+		t.Errorf("Aliases = %v, want empty -- upstream must not leak into it", adv.Aliases)
+	}
+
+	// A bundle is findable by what it fixes, which is what makes --cves work on
+	// a distro whose ids name no CVE at all. It is the same advisory under each
+	// key, not a copy per CVE: one row is still one thing the distro published.
+	for _, cve := range adv.Upstream {
+		got, ok := m[cve]
+		if !ok {
+			t.Errorf("%s is not a key; --cves could not reach the bundle that fixes it", cve)
+			continue
+		}
+		if got != adv {
+			t.Errorf("%s resolves to %s, want the same advisory its own id does", cve, got.ID)
+		}
+	}
+
+	// Two SUSE records sharing an upstream CVE are two different patches, and
+	// the second's vector must not be borrowed onto the first. This is what the
+	// ordering inside buildMap buys: borrowSeverity runs before the CVE keys
+	// exist, so it can never walk from one bundle-mate to another.
+	if adv.CVSSVector != "" {
+		t.Errorf("CVSSVector = %q, want empty -- severity was borrowed across a shared upstream CVE", adv.CVSSVector)
+	}
+}
+
+// TestARealRecordOutranksABundleThatMerelyFixesIt pins the precedence between
+// the two passes. When a query returns both a CVE's own record and a distro
+// advisory addressing it, looking up the CVE must find the record about it --
+// with its own severity and its own ranges -- not the patch that mentions it.
+func TestARealRecordOutranksABundleThatMerelyFixesIt(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"vulns":[
+			{"id":"SUSE-SU-2026:0312-1","upstream":["CVE-2024-2511"]},
+			{"id":"CVE-2024-2511","severity":[{"type":"CVSS_V3","score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"}]}
+		]}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient()
+	c.BaseURL = srv.URL
+
+	m, err := c.Query(context.Background(), Ref{Ecosystem: "SUSE", Name: "openssl-3", Version: "3.1.4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m["CVE-2024-2511"]; got == nil || got.ID != "CVE-2024-2511" {
+		t.Fatalf("CVE-2024-2511 resolves to %v, want the record about it", got)
+	}
+}
+
 func TestQueryNormalizesStdlibVersion(t *testing.T) {
 	tests := []struct {
 		name        string

@@ -68,35 +68,6 @@ func TestRPMReadsARealSQLiteDatabase(t *testing.T) {
 	}
 }
 
-// TestRPMVersionsCarryTheEpochEvenWhenZero pins the encoding against what OSV
-// actually publishes. Verified live:
-//
-//	RHSA-2024:2447  openssl  fixed 1:3.0.7-27.el9
-//	RHSA-2023:6746  nghttp2  fixed 0:1.43.0-5.el9_3.1
-//	Rocky Linux:9   openssl  fixed 1:3.0.1-43.el9_0
-//	AlmaLinux:9     openssl  fixed 1:3.0.1-41.el9_0
-//
-// The explicit "0:" is not what "rpm -q" prints, so the obvious
-// version-release composition is the wrong one.
-func TestRPMVersionsCarryTheEpochEvenWhenZero(t *testing.T) {
-	tests := []struct {
-		epoch                  int
-		version, release, want string
-	}{
-		{0, "1.43.0", "5.el9_3.1", "0:1.43.0-5.el9_3.1"},
-		{1, "3.0.7", "27.el9", "1:3.0.7-27.el9"},
-		{2, "1.2.3", "1", "2:1.2.3-1"},
-		// No release recorded: emit the epoch and version alone rather than a
-		// trailing hyphen, which no comparator would parse.
-		{0, "1.0", "", "0:1.0"},
-	}
-	for _, tt := range tests {
-		if got := rpmEVR(tt.epoch, tt.version, tt.release); got != tt.want {
-			t.Errorf("rpmEVR(%d, %q, %q) = %q, want %q", tt.epoch, tt.version, tt.release, got, tt.want)
-		}
-	}
-}
-
 // TestRPMEpochIsRecoverable: Azure Linux is the one rpm ecosystem whose OSV
 // records carry no epoch ("openssl fixed 3.3.0-1"). The OS plugin needs to
 // strip the prefix for it, so Epoch has to survive as a separate field.
@@ -175,29 +146,6 @@ func TestRPMSQLiteDriverIsRegistered(t *testing.T) {
 	}
 	if len(pkgs) == 0 {
 		t.Fatal("no packages")
-	}
-}
-
-func TestSourceRPMName(t *testing.T) {
-	tests := []struct{ in, want string }{
-		{"openssl-3.2.2-16.el10.src.rpm", "openssl"},
-		{"glibc-2.34-274.el9_8.src.rpm", "glibc"},
-		{"gcc-11.5.0-14.el9.src.rpm", "gcc"},
-		// Hyphens in the name itself: stripping from the left would give
-		// "java", which is not a package in any rpm ecosystem.
-		{"java-21-openjdk-21.0.5.0.11-3.el9.src.rpm", "java-21-openjdk"},
-		{"redhat-release-9.8-1.0.el9.src.rpm", "redhat-release"},
-		{"kernel-4.18.0-553.8.1.el8_10.nosrc.rpm", "kernel"},
-		// gpg-pubkey pseudo-packages and anything else without the expected
-		// shape yield nothing rather than a name OSV would silently not match.
-		{"", ""},
-		{"weird.rpm", ""},
-		{"nodashes.src.rpm", ""},
-	}
-	for _, tt := range tests {
-		if got := sourceRPMName(tt.in); got != tt.want {
-			t.Errorf("sourceRPMName(%q) = %q, want %q", tt.in, got, tt.want)
-		}
 	}
 }
 

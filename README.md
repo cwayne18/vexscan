@@ -1,8 +1,8 @@
 # vexscan
 
-`vexscan` answers one question, for a container image, a filesystem tree, or a
-source repo: **is this CVE's vulnerable code actually present, and can it
-actually run?**
+`vexscan` answers one question, for a container image, a filesystem tree, a
+source repo, or an RPM that was never installed: **is this CVE's vulnerable code
+actually present, and can it actually run?**
 
 Scanners flag a CVE whenever a vulnerable *version* is installed. That is the
 right default for a scanner and the wrong basis for a triage decision — the
@@ -77,6 +77,11 @@ vexscan --image jenkins/jenkins:lts --all --ecosystem maven
 # volume, a machine's own / (see below: no entrypoint, so pass --roots)
 vexscan --rootfs /mnt/rootfs --all --roots /usr/bin/myapp
 
+# An RPM nobody installed — a file, a directory of them, or a URL. Reads only
+# the header, so the URL below costs 17 KB of a 2.3 MB package (see below)
+vexscan --rpm ./openssl-libs-3.5.5-2.el9_8.x86_64.rpm --all
+vexscan --rpm https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/Packages/o/openssl-libs-3.5.5-2.el9_8.x86_64.rpm --all
+
 # Source repo (govulncheck source-mode reachability)
 vexscan --repo github.com/rancher/rancher \
   --package golang:golang.org/x/net --cves CVE-2023-39325
@@ -87,6 +92,7 @@ vexscan --repo github.com/npm/cli --all --ecosystem npm
 # Just list what is installed, with the names OSV will be queried by
 vexscan --image debian:12 --format inventory
 vexscan --rootfs /mnt/rootfs --format inventory
+vexscan --rpm ./repo/x86_64/ --format inventory
 ```
 
 ## Selecting what to check
@@ -134,6 +140,19 @@ Three ways to say what to check, and you need exactly one of them:
 `--ecosystem` (repeatable) restricts which plugins run. Naming one that no
 plugin provides is an error rather than a silent empty report — as is a
 `--package` aimed at an ecosystem that is not selected.
+
+`--cves` matches an id anywhere the advisory is known by it, including as one of
+the CVEs a distro advisory says its patch fixes. This matters on SUSE and Red
+Hat, where the published id names no CVE at all: `SUSE-SU-2026:0312-1` addresses
+eight and `RHSA-2024:2447` seven, and neither carries an alias. Asking for one
+of those CVEs finds the advisory that patches it, reported under the id you
+asked about, with `--details` listing the rest of the bundle so you can see the
+upgrade covers more than you asked for.
+
+> Before v0.5.1 this matched nothing on those distros. `--cves` against a SUSE
+> image returned an unmatched-id row for every CVE, which read as "not
+> affected". If you scanned SUSE or RHEL by CVE with an earlier release, rerun
+> it.
 
 ## Scanning a filesystem instead of an image (`--rootfs`)
 
@@ -228,6 +247,114 @@ creates every directory `0755`.)
 `/proc`, `/sys` and `/dev` are skipped rather than reported. They ship no code,
 and `/proc` alone is tens of thousands of synthetic entries that stat as regular
 files.
+
+## Scanning package files (`--rpm`)
+
+`--rpm` scans an RPM that was never installed anywhere: a file, a directory of
+them, or a URL. It is for the question you have before a package reaches a
+machine — *is this build carrying anything?* — and for the case where there is
+no machine to point at, such as a mirror you are about to sync or an artifact a
+build just produced.
+
+```sh
+vexscan --rpm ./openssl-libs-3.5.5-2.el9_8.x86_64.rpm --all
+vexscan --rpm https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/Packages/o/openssl-libs-3.5.5-2.el9_8.x86_64.rpm --all
+vexscan --rpm ./repo/x86_64/ --format inventory
+```
+
+The flag is repeatable and mutually exclusive with `--image`, `--rootfs` and
+`--repo`. A directory is walked for `*.rpm`, sorted, so a repeated scan queries
+in the same order. The report says `"mode": "rpm"`.
+
+### It reads the header, not the package
+
+An RPM is a 96-byte lead, a signature header, the main header, and then a
+compressed cpio payload that is nearly all of the file. Every field `vexscan`
+needs is in the main header, and each section states its own length in its first
+16 bytes — so the reader knows exactly where the header ends and stops there.
+Over HTTP that is a plain `GET` with the body closed early, not a range request,
+so it works against mirrors that ignore `Range`. Measured:
+
+| | file | read | |
+|---|---|---|---|
+| `openssl-libs-3.5.5-2.el9_8.x86_64.rpm` (Rocky 9, over HTTP) | 2.3 MB | 17.5 KB | **0.7%** |
+| `libopenssl3-3.1.4-150600.2.19.x86_64.rpm` (SLE 15.6, local) | 1.7 MB | 82.9 KB | 4.6% |
+| `python3-jinja2-2.11.3-8.el9_5.noarch.rpm` (Rocky 9, over HTTP) | 227.6 KB | 23.5 KB | 10.3% |
+
+The payload is never decompressed, and there is no xz or zstd dependency: the
+file list and `file(1)`'s classification of every entry are both carried in the
+header, which is what makes "does this package ship any code at all" answerable
+without unpacking anything.
+
+### The source name is why this finds anything
+
+Red Hat and SUSE file advisories under the **source** package, and the binary
+package you have is usually named something else. `vexscan` queries both, from
+`SOURCERPM` in the header — which on the SLE package above is the difference
+between 32 findings and none:
+
+| queried as | ecosystem | findings |
+|---|---|---|
+| `libopenssl3` (the binary name) | SUSE | 0 |
+| `openssl-3` (the source name) | SUSE | 32 |
+
+The distribution comes from the `VENDOR` and `DISTRIBUTION` headers, so no
+`/etc/os-release` is needed: `Rocky Linux 9` → `Rocky Linux:9`,
+`SUSE Linux Enterprise 15` → `SUSE`, and so on for openSUSE, AlmaLinux,
+Alpaquita, openEuler, Mageia, Azure Linux and Red Hat. A distribution OSV does
+not carry — Fedora, Oracle Linux, CentOS Stream — is **an error naming
+`--osv-ecosystem`**, not a guess at a near neighbour: querying the wrong
+ecosystem answers with nothing, which reads exactly like a clean package. Two
+distributions in one directory is the same error, for the same reason.
+
+### What it cannot tell you
+
+There is no filesystem, so no `DT_NEEDED` closure can run, so **nothing is ever
+`linked` and nothing is ever `not_in_execute_path`**. Every finding for a package
+that ships an ELF object is `undetermined`, and the report says so at both ends:
+
+```
+NOTE: this read package metadata, not an installed system. No ELF
+      reachability test could run -- there is no filesystem to trace.
+      32 finding(s) below are undetermined for that reason. For scale: on a
+      measured SUSE 15.6 image that test ruled out 1 finding of 47.
+```
+
+That last number is the honest measure of what you give up. On
+`registry.suse.com/bci/bci-base:15.6` the reachability test ruled out exactly one
+finding of 47, and it did so via `pkgdb-no-code` — the one verdict the header can
+reach on its own. So a package that ships no ELF object at all is still ruled
+out here, on the same evidence an installed scan would have used:
+
+```
+RULED OUT (2) - the vulnerable code is not present or cannot run
+SEVERITY  ADVISORY         PACKAGE       VERSION          BASIS
+CRITICAL  RLSA-2026:25239  openssl-perl  1:3.5.5-2.el9_8  pkgdb-no-code
+HIGH      RLSA-2026:22312  openssl-perl  1:3.5.5-2.el9_8  pkgdb-no-code
+```
+
+Three further caveats:
+
+- **An `.rpm` is a claim about what *would* be installed.** The file list is what
+  the package declares, not what is on a disk somewhere, and nothing here checks
+  that any of it was ever unpacked.
+- **`updates.suse.com` returns 403 without SCC credentials.** URL input works
+  against openSUSE, Rocky, AlmaLinux and Fedora mirrors; SLE-proper packages have
+  to be local files.
+- **A `.src.rpm` is skipped, with a log line.** It is a build input, not
+  something that installs. A directory holding nothing else is an error rather
+  than a clean scan.
+
+One package file in a directory that will not parse does not cost you the other
+three hundred: it is recorded, named with its reason, and reported the same way
+an unreadable directory is — which means the scan **exits 1**.
+
+```
+Reading 3 rpm package file(s) from /tmp/rpmdir...
+  rpm: 2 packages from /tmp/rpmdir
+  ! 1 rpm package file(s) could not be read; the scan does not account for them
+    ! /tmp/rpmdir/broken.rpm: not an rpm package file (bad lead magic)
+```
 
 ## How the tests work
 
@@ -997,7 +1124,27 @@ negligible until you know it is the 87th percentile of all 355,094 scored CVEs.
   epss:     0.03249 (87.1th percentile), as CVE-2019-1010022
 ```
 
-Four things are worth knowing before you rely on it:
+Five things are worth knowing before you rely on it:
+
+- **A distro advisory is a bundle, and it is scored at its worst member.**
+  `SUSE-SU-2026:0312-1` fixes eight CVEs and `RHSA-2024:2447` seven; one Red Hat
+  advisory on `ubi9` fixes thirty-two. The row takes the highest EPSS percentile
+  and any KEV hit across the whole set, because the package is as exposed as the
+  most-exploited thing the patch addresses — averaging would let seven quiet
+  CVEs bury one being exploited today. `--details` names every CVE and says
+  which one the score came from:
+
+  ```
+  fixes:    CVE-2025-15467, CVE-2025-68160, CVE-2025-69418, CVE-2025-69419, CVE-2025-69420 (+3 more)
+  epss:     98.7% percentile (epss 0.47621) for CVE-2025-15467, highest of 8
+  ```
+
+  This matters most on SUSE, which publishes **no CVSS at all** — all 46
+  advisories on `bci/bci-base:15.6` render UNKNOWN, so EPSS is the only ordering
+  signal that distro has. Before v0.5.1 it scored **0 of 47** findings there,
+  because SUSE and Red Hat ids name no CVE and carry no aliases; it now scores
+  41, and the six at or above the 90th percentile sort to the top of a table
+  that was previously in no meaningful order.
 
 - **Both feeds are keyed by CVE, and many advisories are not.** On the Rancher
   image below, *not one* of 865 findings carries a CVE in any of its own fields —
@@ -1192,6 +1339,7 @@ be read, or part of the tree could not be read, `2` the command line was wrong.
 | `--image` | | Container image to inspect |
 | `--rootfs` | | Filesystem tree already on disk to inspect — see [`--rootfs`](#scanning-a-filesystem-instead-of-an-image---rootfs) |
 | `--repo` | | Git source repo to analyze: govulncheck source mode for Go, lock file inventory for Python and npm |
+| `--rpm` | | RPM package file to scan without installing it — a path, a directory of them, or a URL; repeatable. Reads only the header, so a URL costs kilobytes not megabytes — see [`--rpm`](#scanning-package-files---rpm) |
 | `--package` | | Package to check: purl, `ecosystem:name`, or bare name; repeatable |
 | `--cves` | | CVE / GHSA / GO / RHSA / DSA ids; alone, resolved against the whole target |
 | `--all` | `false` | Check everything each ecosystem can enumerate |
@@ -1202,7 +1350,7 @@ be read, or part of the tree could not be read, `2` the command line was wrong.
 | `--repo-path` | `.` | Subdirectory within `--repo` to scan — the Go module, or the directory holding the lock files |
 | `--version` | *(auto)* | Override the module version (image mode) instead of reading build info |
 | `--go-version` | *(auto)* | Pin the Go toolchain for `--repo`, e.g. `1.24.0` (useful with `golang:stdlib`) |
-| `--osv-ecosystem` | *(auto)* | Override the OSV ecosystem derived from os-release, e.g. `Debian:12` |
+| `--osv-ecosystem` | *(auto)* | Override the OSV ecosystem derived from os-release, or from the `VENDOR`/`DISTRIBUTION` headers under `--rpm`, e.g. `Debian:12` |
 | `--roots` | | Extra entrypoints for the closures — shared libraries and language imports; repeatable |
 | `--vexhub` | | VEX Repository to check findings against, e.g. `https://github.com/rancher/vexhub` (also a raw base URL or a local directory); repeatable, earliest wins — see [VEX hubs](#vex-hubs---vexhub) |
 | `--severity` | *(all)* | Only report findings at these severities: `CRITICAL`, `HIGH`, `UNKNOWN`, `MEDIUM`, `LOW`, `NONE`; comma-separated or repeatable. `UNKNOWN` must be named to be shown — see [Filtering by severity](#filtering-by-severity---severity) |
@@ -1331,6 +1479,11 @@ docker run --rm -e VEXSCAN_LLM_ENDPOINT -e VEXSCAN_LLM_TOKEN \
   is not a clean tree.** Both are reported rather than assumed away — the first
   as taints, the second as `unreadable` plus exit 1. See
   [`--rootfs`](#scanning-a-filesystem-instead-of-an-image---rootfs).
+- **`--rpm` runs no reachability test at all, and it says so on every report.**
+  A package file has no filesystem behind it, so nothing is ever `linked` and
+  nothing is ever ruled out as unreachable — only a package that ships no ELF
+  object can be ruled out. See [`--rpm`](#scanning-package-files---rpm) for what
+  that costs, measured.
 - **Repo mode for Python and npm resolves no import graph at all.** A lock file
   answers "is this declared" and, where the format says so, "is it
   development-only". Nothing there speaks to reachability, and a `linked`

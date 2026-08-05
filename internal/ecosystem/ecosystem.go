@@ -382,6 +382,16 @@ type Finding struct {
 	Packages    []string `json:"packages,omitempty"`
 	Granularity string   `json:"granularity,omitempty"` // package | module
 
+	// Upstream is the CVEs this advisory says its patch fixes, when it is a
+	// bundle of more than one. Distro advisories routinely are: SUSE-SU-2026
+	// :0312-1 addresses eight, RHSA-2024:2447 seven, and neither id names a
+	// CVE anywhere.
+	//
+	// Plugins do not set it; the orchestrator fills it from the OSV record.
+	// Empty is the ordinary case and means the advisory is about one thing,
+	// which the row already names.
+	Upstream []string `json:"upstream,omitempty"`
+
 	// Stripped is a pointer because it is a Go-only fact with three states: a
 	// binary with symbols, a binary without, and an OS package that is not a
 	// binary at all. A plain bool would report every deb in the image as

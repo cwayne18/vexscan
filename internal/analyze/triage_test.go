@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 
 	"github.com/cwayne18/vexscan/internal/triage"
@@ -20,6 +21,9 @@ const (
 	goCVE     = "CVE-2024-7598"
 	debianID  = "DEBIAN-CVE-2026-54369"
 	debianCVE = "CVE-2026-54369"
+	// A real SUSE advisory id: no CVE in it, no aliases on the record, and
+	// eight CVEs in its upstream list.
+	suseID = "SUSE-SU-2026:0312-1"
 )
 
 func triageServer(t *testing.T) *triage.Loader {
@@ -188,31 +192,125 @@ func TestAnUnreachableFeedIsRecordedRatherThanSilent(t *testing.T) {
 	}
 }
 
-func TestFindingCVEPrefersTheFirstUsableID(t *testing.T) {
+func TestFindingCVEsCollectsEveryReachableID(t *testing.T) {
 	tests := []struct {
 		name    string
 		finding Finding
-		aliases map[string][]string
-		want    string
+		sets    map[string][]string
+		want    []string
 	}{
-		{"a bare CVE", Finding{ID: "CVE-2020-8559", CVE: "CVE-2020-8559"}, nil, "CVE-2020-8559"},
-		{"a distro prefix", Finding{ID: debianID, CVE: debianID}, nil, debianCVE},
-		{"an Ubuntu prefix", Finding{ID: "UBUNTU-CVE-2023-45853"}, nil, "CVE-2023-45853"},
-		{"a GHSA with no CVE anywhere", Finding{ID: "GHSA-gcjh-h69q-9w9g"}, nil, ""},
+		{"a bare CVE", Finding{ID: "CVE-2020-8559", CVE: "CVE-2020-8559"}, nil, []string{"CVE-2020-8559"}},
+		{"a distro prefix", Finding{ID: debianID, CVE: debianID}, nil, []string{debianCVE}},
+		{"an Ubuntu prefix", Finding{ID: "UBUNTU-CVE-2023-45853"}, nil, []string{"CVE-2023-45853"}},
+		{"a GHSA with no CVE anywhere", Finding{ID: "GHSA-gcjh-h69q-9w9g"}, nil, nil},
 		{
 			"a GHSA whose alias is a CVE",
 			Finding{ID: "GHSA-82hx-w2r5-c2wq"},
 			map[string][]string{"GHSA-82hx-w2r5-c2wq": {"GHSA-82hx-w2r5-c2wq", "CVE-2020-8552"}},
-			"CVE-2020-8552",
+			[]string{"CVE-2020-8552"},
 		},
 		// A GO id is not a CVE and its digits must not be mistaken for one.
-		{"a GO id alone", Finding{ID: "GO-2022-0965", GoID: "GO-2022-0965"}, nil, ""},
+		{"a GO id alone", Finding{ID: "GO-2022-0965", GoID: "GO-2022-0965"}, nil, nil},
+		// The case the whole change exists for: a SUSE advisory names no CVE in
+		// its own id and carries no aliases, only the CVEs its patch fixes.
+		{
+			"a SUSE bundle",
+			Finding{ID: suseID, CVE: suseID},
+			map[string][]string{suseID: {suseID, "CVE-2024-2511", "CVE-2024-4603", "CVE-2024-5535"}},
+			[]string{"CVE-2024-2511", "CVE-2024-4603", "CVE-2024-5535"},
+		},
+		// The same CVE reached twice -- once bare, once through the set -- is
+		// one CVE, and must not make a one-CVE advisory look like a bundle.
+		{
+			"a CVE reachable by two routes",
+			Finding{ID: debianID, CVE: debianCVE},
+			map[string][]string{debianID: {debianID, debianCVE}, debianCVE: {debianID, debianCVE}},
+			[]string{debianCVE},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := findingCVE(tt.finding, tt.aliases); got != tt.want {
-				t.Errorf("findingCVE() = %q, want %q", got, tt.want)
+			got := findingCVEs(tt.finding, tt.sets)
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("findingCVEs() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// A SUSE-SU advisory addresses several CVEs at once and names none of them.
+// Before this it scored nothing at all: SUSE files under "upstream", vexscan
+// read only "aliases", and no SUSE id contains a CVE to fall back on.
+func TestASUSEBundleIsScoredByItsWorstMember(t *testing.T) {
+	findings := []Finding{{ID: suseID, CVE: suseID, Module: "openssl-3"}}
+	sets := map[string][]string{suseID: {suseID, goCVE, debianCVE, "CVE-2026-53613"}}
+
+	res := triageOverlay(context.Background(), triageServer(t), findings, sets, quiet)
+
+	p := findings[0].Priority
+	if p == nil || !p.Scored {
+		t.Fatalf("the bundle was not scored: %+v", p)
+	}
+	// goCVE is the 31st percentile, debianCVE the 90th, and the third is not in
+	// the feed at all. Taking the first would have reported the 31st.
+	if p.CVE != debianCVE || p.Percentile != 0.90 {
+		t.Errorf("scored as %s at %v, want %s at 0.90 -- the worst member did not win", p.CVE, p.Percentile, debianCVE)
+	}
+	if p.OfSet != 3 {
+		t.Errorf("OfSet = %d, want 3 -- the reader cannot tell this row stands for three CVEs", p.OfSet)
+	}
+	if res.Scored != 1 || res.Unscored() != 0 {
+		t.Errorf("counts: scored=%d unscored=%d, want 1 and 0 -- a bundle is one finding", res.Scored, res.Unscored())
+	}
+}
+
+// KEV outranks a higher percentile inside a bundle for the same reason it does
+// between rows: an observed exploit ends the argument.
+func TestAKnownExploitedMemberWinsTheBundle(t *testing.T) {
+	findings := []Finding{{ID: suseID, CVE: suseID}}
+	sets := map[string][]string{suseID: {suseID, debianCVE, "CVE-2017-5638"}}
+
+	triageOverlay(context.Background(), triageServer(t), findings, sets, quiet)
+
+	p := findings[0].Priority
+	if p.KEV == nil {
+		t.Fatal("a bundle containing a known-exploited CVE was not marked")
+	}
+	if p.CVE != "CVE-2017-5638" {
+		t.Errorf("reported %s; the row's rank comes from CVE-2017-5638 and must say so", p.CVE)
+	}
+}
+
+// An ordinary single-CVE advisory must look exactly as it did before bundles
+// existed, or every Debian row grows a "highest of 1".
+func TestASingleCVEAdvisoryHasNoSetSize(t *testing.T) {
+	findings := []Finding{{ID: debianID, CVE: debianID}}
+	triageOverlay(context.Background(), triageServer(t), findings, nil, quiet)
+
+	if got := findings[0].Priority.OfSet; got != 0 {
+		t.Errorf("OfSet = %d, want 0", got)
+	}
+}
+
+func TestUpstreamOverlayOnlyMarksRealBundles(t *testing.T) {
+	findings := []Finding{
+		{ID: suseID, CVE: suseID},
+		{ID: debianID, CVE: debianID},
+		{ID: "CVE-2020-8559", CVE: "CVE-2020-8559"},
+	}
+	upstreamOverlay(findings, map[string][]string{
+		suseID: {"CVE-2024-2511", "CVE-2024-5535"},
+		// Debian's record addresses the one CVE its own id already spells.
+		debianID:        {debianCVE},
+		"CVE-2020-8559": {"CVE-2020-8559"},
+	})
+
+	if len(findings[0].Upstream) != 2 {
+		t.Errorf("the SUSE bundle got Upstream = %v, want both CVEs", findings[0].Upstream)
+	}
+	for _, f := range findings[1:] {
+		if len(f.Upstream) != 0 {
+			t.Errorf("%s got Upstream = %v; repeating a row's own CVE back at it is noise", f.ID, f.Upstream)
+		}
 	}
 }
