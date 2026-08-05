@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/glebarez/go-sqlite v1.22.0
 	github.com/knqyf263/go-rpmdb v0.1.1
+	golang.org/x/mod v0.38.0
 )
 
 require (
