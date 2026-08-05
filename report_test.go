@@ -919,10 +919,18 @@ func TestALongReportRepeatsTheSummaryAtTheBottom(t *testing.T) {
 func TestTheFooterIsLast(t *testing.T) {
 	out := longReport(t, 60, nil)
 	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
-	last := strings.Join(lines[len(lines)-3:], "\n")
+	// The section index is the footer's final line: nothing prints beneath it.
+	if last := lines[len(lines)-1]; !strings.Contains(last, "findings in") {
+		t.Errorf("last line is %q, want the section index", last)
+	}
+	// The whole summary repeats in the footer above that line -- the ecosystem
+	// header, the severity spread and the index. The block is sized from the
+	// summary rather than a fixed count so an added summary line (the
+	// remediation line, say) does not read as rows escaping below the footer.
+	footer := strings.Join(lines[len(lines)-5:], "\n")
 	for _, want := range []string{"88 components", "affected by severity", "findings in"} {
-		if !strings.Contains(last, want) {
-			t.Errorf("last lines are missing %q:\n%s", want, last)
+		if !strings.Contains(footer, want) {
+			t.Errorf("footer is missing %q:\n%s", want, footer)
 		}
 	}
 }
