@@ -587,6 +587,7 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	productOverlay(result.Findings, opts.Image)
 	sets := run.resolver.cveSets()
 	upstreamOverlay(result.Findings, sets.Upstream)
+	fixedOverlay(result.Findings, run.resolver.fixedVersions())
 	result.VEXHubs = vexOverlay(ctx, opts.VEXHubs, result.Findings, run.resolver.aliases(), logf)
 	result.Triage = triageOverlay(ctx, opts.Triage, result.Findings, sets.All, logf)
 	llmOverlay(ctx, llmClient, result.Findings, "", logf)
@@ -795,6 +796,7 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 	// checkout is is its own module, which the Go plugin already recorded.
 	sets := run.resolver.cveSets()
 	upstreamOverlay(result.Findings, sets.Upstream)
+	fixedOverlay(result.Findings, run.resolver.fixedVersions())
 	result.VEXHubs = vexOverlay(ctx, opts.VEXHubs, result.Findings, run.resolver.aliases(), logf)
 	result.Triage = triageOverlay(ctx, opts.Triage, result.Findings, sets.All, logf)
 	llmOverlay(ctx, llmClient, result.Findings, "source tree", logf)
@@ -1015,9 +1017,43 @@ func (r *advisoryResolver) severities() map[string]severity {
 	return out
 }
 
-// aliases maps every id an advisory is known by onto that advisory's whole set
-// of ids.
+// fixedVersions flattens the fixed versions the resolver fetched into a lookup
+// from advisory id to a per-package map of the version its patch lands in.
 //
+// It is a nested map because a fixed version is a claim about a package, not
+// about an advisory: one CVE fixed in gcc-12 says nothing about the version
+// that clears it in an unrelated package it also touches. severities() can
+// flatten to one value per advisory because a rating is the same wherever the
+// row sits; a fix cannot, so the package name is kept as a second key and the
+// overlay joins on it.
+//
+// Like severities() this costs no network traffic: every affected range was in
+// the records already fetched to decide the findings existed.
+func (r *advisoryResolver) fixedVersions() map[string]map[string]string {
+	out := map[string]map[string]string{}
+	for _, set := range r.cache {
+		for _, adv := range set {
+			if adv == nil || len(adv.Fixed) == 0 {
+				continue
+			}
+			for _, key := range append([]string{adv.ID}, adv.Aliases...) {
+				if key == "" {
+					continue
+				}
+				byPkg, ok := out[key]
+				if !ok {
+					byPkg = map[string]string{}
+					out[key] = byPkg
+				}
+				for pkg, fixed := range adv.Fixed {
+					byPkg[pkg] = fixed
+				}
+			}
+		}
+	}
+	return out
+}
+
 // It exists for the VEX overlay. A finding names its advisory by whichever id
 // its plugin was working from -- the Go plugin reports GO-2025-3547 -- while a
 // hub files under whichever its own scanner used, which for every hub seen so
@@ -1159,6 +1195,40 @@ func severityOverlay(findings []Finding, sev map[string]severity) {
 			if s, ok := sev[key]; ok {
 				f.Severity = s.label
 				f.CVSS = s.vector
+				break
+			}
+		}
+	}
+}
+
+// fixedOverlay labels each finding with the version its advisory's patch lands
+// in, in place. It runs beside severityOverlay for the same reason: a plugin
+// answers a presence question and never sees the affected ranges the fix lives
+// in, so the join has to happen where the advisories are.
+//
+// The join is on advisory id and then on package name. The package key is the
+// finding's Package -- the source name OSV files its affected entry against,
+// which is why two binaries built from one source (libgcc-s1, libstdc++6 from
+// gcc-12) both resolve to the same fixed source version. A finding whose
+// advisory published no fix for its package keeps an empty FixedVersion, which
+// the renderer shows as "no fix" rather than a blank.
+func fixedOverlay(findings []Finding, fixed map[string]map[string]string) {
+	for i := range findings {
+		f := &findings[i]
+		for _, key := range []string{f.CVE, f.ID, f.GoID} {
+			if key == "" {
+				continue
+			}
+			byPkg, ok := fixed[key]
+			if !ok {
+				continue
+			}
+			if v, ok := byPkg[f.Package]; ok {
+				f.FixedVersion = v
+				break
+			}
+			if v, ok := byPkg[f.Component()]; ok {
+				f.FixedVersion = v
 				break
 			}
 		}

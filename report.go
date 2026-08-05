@@ -36,27 +36,7 @@ func renderText(res *analyze.Result, details bool) string {
 	writeHeader(&b, res)
 
 	if len(res.Findings) == 0 {
-		// Three ways to be empty, and only one of them is good news. Nothing
-		// was wrong; nothing was read; or something was found and the reader's
-		// own filter hid all of it.
-		switch {
-		case res.Failed():
-			b.WriteString("No findings, but the scan was incomplete: see above.\n")
-			b.WriteString("This is not a clean result.\n")
-		case res.Withheld != nil:
-			// The --repo case: govulncheck publishes no severity, so every Go
-			// finding is UNKNOWN and a --severity that does not name UNKNOWN
-			// empties the report. Printing the bare "no findings" line there
-			// would be this tool telling its worst available lie.
-			b.WriteString("No findings at these severities.\n")
-			fmt.Fprintf(&b, "--severity %s withheld all %d finding(s): %s.\n",
-				strings.Join(res.Withheld.Severities, ","), res.Withheld.Count,
-				withheldSpread(res.Withheld))
-			b.WriteString("This is a filtered view, not a clean result.\n")
-		default:
-			b.WriteString("No findings: nothing selected was found in this target,\n")
-			b.WriteString("or no matching advisories were published for it.\n")
-		}
+		writeNoFindings(&b, res)
 		return b.String()
 	}
 
@@ -72,6 +52,32 @@ func renderText(res *analyze.Result, details bool) string {
 		writeFooter(&b, res)
 	}
 	return b.String()
+}
+
+// writeNoFindings explains an empty report. Three ways to be empty, and only
+// one of them is good news: nothing was wrong; nothing was read; or something
+// was found and the reader's own filter hid all of it. Shared by every
+// human-readable format so an empty --format fixplan cannot claim a clean
+// result that --format text would have called incomplete.
+func writeNoFindings(b *strings.Builder, res *analyze.Result) {
+	switch {
+	case res.Failed():
+		b.WriteString("No findings, but the scan was incomplete: see above.\n")
+		b.WriteString("This is not a clean result.\n")
+	case res.Withheld != nil:
+		// The --repo case: govulncheck publishes no severity, so every Go
+		// finding is UNKNOWN and a --severity that does not name UNKNOWN
+		// empties the report. Printing the bare "no findings" line there
+		// would be this tool telling its worst available lie.
+		b.WriteString("No findings at these severities.\n")
+		fmt.Fprintf(b, "--severity %s withheld all %d finding(s): %s.\n",
+			strings.Join(res.Withheld.Severities, ","), res.Withheld.Count,
+			withheldSpread(res.Withheld))
+		b.WriteString("This is a filtered view, not a clean result.\n")
+	default:
+		b.WriteString("No findings: nothing selected was found in this target,\n")
+		b.WriteString("or no matching advisories were published for it.\n")
+	}
 }
 
 // writeHeader prints what was scanned, and anything that makes the answer
@@ -316,6 +322,7 @@ func writeSummary(b *strings.Builder, res *analyze.Result, index bool) {
 	if spread := severitySpread(counts, false); spread != "" {
 		fmt.Fprintf(b, "  affected by severity: %s\n", spread)
 	}
+	writeRemediation(b, res)
 	if vexed > 0 {
 		fmt.Fprintf(b, "  already vexed: %d by %s\n", vexed, vexAuthors(res))
 	}
@@ -332,7 +339,50 @@ func writeSummary(b *strings.Builder, res *analyze.Result, index bool) {
 // out of a hundred and fifty-four.
 const highPercentile = 0.90
 
-// writePriority summarises the exploitation evidence, over exactly the rows the
+// writeRemediation summarises what the affected rows cost to fix, over the same
+// population the severity spread counts: everything affected that a vendor has
+// not already answered.
+//
+// Two facts, both of which a wall of 150 rows hides. How many of the rows are
+// the same advisory seen on more than one package -- CVE-2022-27943 is one
+// advisory and three rows -- so "154 findings" is not "154 things to chase.
+// And how many have a published fix, because a report that cannot say which of
+// its findings are actionable leaves the reader to open all of them. The fix
+// clause is skipped when nothing has one, so an ecosystem that publishes no
+// fixed versions does not get a line reading "0 fixable".
+func writeRemediation(b *strings.Builder, res *analyze.Result) {
+	total, fixable := 0, 0
+	advisories := map[string]bool{}
+	for _, f := range res.Findings {
+		if !f.Affected() || alreadyVexed(f) {
+			continue
+		}
+		total++
+		advisories[shortAdvisory(f)] = true
+		if f.FixedVersion != "" {
+			fixable++
+		}
+	}
+	if total == 0 {
+		return
+	}
+	var parts []string
+	if len(advisories) != total {
+		// Only worth saying when the two disagree: on a report where every row
+		// is its own advisory, "N affected = N unique" is a tautology.
+		parts = append(parts, fmt.Sprintf("%d unique advisories", len(advisories)))
+	}
+	if fixable > 0 {
+		parts = append(parts, fmt.Sprintf("%d fixable, %d with no fix yet", fixable, total-fixable))
+	} else {
+		parts = append(parts, fmt.Sprintf("%d with no fix yet", total))
+	}
+	if len(parts) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "  %d affected: %s\n", total, strings.Join(parts, ", "))
+}
+
 // severity spread above it counts.
 //
 // Same population on purpose. Two summary lines describing different subsets of
@@ -591,7 +641,15 @@ func writeSection(b *strings.Builder, s section, details bool) {
 	// column of blanks would be a daily reminder of a rare event.
 	showEPSS, showKEV := triageColumns(rows)
 
+	// FIXED IN earns its place the same way: it appears only when the section
+	// holds at least one row with a published fix, so a scan of an ecosystem
+	// that publishes none (or a --repo run) does not get a column of dashes.
+	showFixed := fixedColumn(rows)
+
 	header := []string{"SEVERITY", "ADVISORY", "PACKAGE", "VERSION"}
+	if showFixed {
+		header = append(header, "FIXED IN")
+	}
 	if showEPSS {
 		header = append(header, "EPSS")
 	}
@@ -617,6 +675,9 @@ func writeSection(b *strings.Builder, s section, details bool) {
 			shortAdvisory(f),
 			truncate(f.Component(), 40),
 			truncate(f.Version, 28),
+		}
+		if showFixed {
+			cells = append(cells, displayFixed(f))
 		}
 		if showEPSS {
 			cells = append(cells, displayEPSS(f))
@@ -749,6 +810,30 @@ func triageColumns(rows []analyze.Finding) (epss, kev bool) {
 		}
 	}
 	return epss, kev
+}
+
+// fixedColumn reports whether any row in the section has a published fix, which
+// is what earns the FIXED IN column its place. A section where nothing has a
+// fix -- or an ecosystem that publishes no fixed versions at all -- gets no
+// column rather than one reading "no fix" on every row.
+func fixedColumn(rows []analyze.Finding) bool {
+	for _, f := range rows {
+		if f.FixedVersion != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// displayFixed is the version to upgrade to, or "no fix" when the advisory
+// published none. The two are deliberately distinct: a blank cell reads as
+// missing data, while "no fix" is data -- the flaw is acknowledged and no patch
+// has shipped.
+func displayFixed(f analyze.Finding) string {
+	if f.FixedVersion == "" {
+		return "no fix"
+	}
+	return truncate(f.FixedVersion, 28)
 }
 
 // displayEPSS is the percentile as a percentage, which is the form a human can
@@ -938,6 +1023,9 @@ func writeDetail(b *strings.Builder, f analyze.Finding) {
 			}
 		}
 		fmt.Fprintf(b, "  severity: %s\n", line)
+	}
+	if f.FixedVersion != "" {
+		fmt.Fprintf(b, "  fixed in: %s\n", f.FixedVersion)
 	}
 	writePriorityDetail(b, f)
 	if f.Component() != f.Package && f.Package != "" {
