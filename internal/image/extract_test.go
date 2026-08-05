@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -75,8 +76,11 @@ func writeLayer(t *testing.T, entries []entry) string {
 func extractLayers(t *testing.T, layers ...[]entry) string {
 	t.Helper()
 	dest := t.TempDir()
+	// A budget far larger than any test layer, so ordinary tests exercise the
+	// happy path unaffected by the size cap.
+	budget := int64(maxImageBytes)
 	for i, l := range layers {
-		if err := untar(writeLayer(t, l), dest); err != nil {
+		if err := untar(writeLayer(t, l), dest, &budget); err != nil {
 			t.Fatalf("layer %d: %v", i, err)
 		}
 	}
@@ -328,6 +332,119 @@ func TestUntarReadOnlyFileCanBeReplaced(t *testing.T) {
 	if got := mustReadFile(t, filepath.Join(dest, "ro")); got != "v2" {
 		t.Errorf("read-only file blocked replacement: %q", got)
 	}
+}
+
+// writeRawTar builds an uncompressed tar of entries and returns its bytes, so a
+// test can truncate the stream at a byte offset a tar.Writer would never let it
+// produce.
+func writeRawTar(t *testing.T, entries []entry) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for _, e := range entries {
+		hdr := &tar.Header{Name: e.name, Typeflag: e.typeflag, Mode: e.mode, Size: int64(len(e.body))}
+		if e.typeflag != tar.TypeReg {
+			hdr.Size = 0
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("write header %s: %v", e.name, err)
+		}
+		if e.typeflag == tar.TypeReg {
+			if _, err := tw.Write([]byte(e.body)); err != nil {
+				t.Fatalf("write body %s: %v", e.name, err)
+			}
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestUntarTruncatedStreamIsReported(t *testing.T) {
+	// A corrupt or truncated layer must fail the run, not be treated like clean
+	// trailing padding: everything past the break is a real package, and
+	// dropping it silently would under-report what the image ships.
+	raw := writeRawTar(t, []entry{
+		reg("usr/bin/one", "first"),
+		reg("usr/bin/two", "second"),
+	})
+	// Cut inside the second entry so the reader errors when it advances to it,
+	// after the first entry has already been consumed.
+	truncated := raw[:len(raw)-600]
+	blob := filepath.Join(t.TempDir(), "layer.tar")
+	if err := os.WriteFile(blob, truncated, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	budget := int64(maxImageBytes)
+	if err := untar(blob, t.TempDir(), &budget); err == nil {
+		t.Fatal("truncated tar was accepted silently; a real read error must be surfaced")
+	}
+}
+
+func TestUntarBudgetExceededIsReported(t *testing.T) {
+	// A decompression bomb -- or any file bigger than the remaining budget --
+	// must stop extraction with an error rather than write a truncated file and
+	// carry on, which would under-report the file's contents.
+	dest := t.TempDir()
+	budget := int64(8)
+	err := untar(writeLayer(t, []entry{reg("big", "way more than eight bytes")}), dest, &budget)
+	if !errors.Is(err, errImageTooLarge) {
+		t.Fatalf("err = %v, want errImageTooLarge", err)
+	}
+}
+
+func TestUntarBudgetIsCumulativeAcrossLayers(t *testing.T) {
+	// The budget is shared across layers, so a bomb split into many small files
+	// over several layers is caught just like one fat file.
+	dest := t.TempDir()
+	budget := int64(20)
+	l1 := writeLayer(t, []entry{reg("a", "0123456789")}) // 10 bytes, leaves 10
+	l2 := writeLayer(t, []entry{reg("b", "0123456789")}) // 10 bytes, leaves 0
+	l3 := writeLayer(t, []entry{reg("c", "x")})          // 1 byte, overruns
+	if err := untar(l1, dest, &budget); err != nil {
+		t.Fatalf("layer 1: %v", err)
+	}
+	if err := untar(l2, dest, &budget); err != nil {
+		t.Fatalf("layer 2: %v", err)
+	}
+	if err := untar(l3, dest, &budget); !errors.Is(err, errImageTooLarge) {
+		t.Fatalf("layer 3 err = %v, want errImageTooLarge", err)
+	}
+}
+
+func TestCopyFileIsChargedAgainstBudget(t *testing.T) {
+	// The hardlink copy fallback duplicates a file's bytes, so it must draw on
+	// the same image budget as writeFile. Otherwise a layer with one large file
+	// plus many hardlink entries to it could duplicate those bytes unaccounted
+	// whenever os.Link fails and every entry copies instead.
+	src := filepath.Join(t.TempDir(), "src")
+	if err := os.WriteFile(src, []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("overrun is reported", func(t *testing.T) {
+		budget := int64(4)
+		dst := filepath.Join(t.TempDir(), "dst")
+		if err := copyFile(src, dst, &budget); !errors.Is(err, errImageTooLarge) {
+			t.Fatalf("err = %v, want errImageTooLarge", err)
+		}
+	})
+
+	t.Run("within budget decrements it", func(t *testing.T) {
+		budget := int64(100)
+		dst := filepath.Join(t.TempDir(), "dst")
+		if err := copyFile(src, dst, &budget); err != nil {
+			t.Fatalf("copyFile: %v", err)
+		}
+		if budget != 90 {
+			t.Errorf("budget = %d, want 90 (100 - 10 bytes copied)", budget)
+		}
+		if got := mustReadFile(t, dst); got != "0123456789" {
+			t.Errorf("dst = %q, want the full source contents", got)
+		}
+	})
 }
 
 func TestReadConfig(t *testing.T) {
