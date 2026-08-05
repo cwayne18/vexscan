@@ -36,6 +36,13 @@ type Plugin struct {
 	// ("1.24.0"). It matters for stdlib findings, which are toolchain-specific.
 	GoVersion string
 
+	// Image is the reference of the image being scanned, in image mode ("" for
+	// rootfs or source mode). It is the only place a version can be recovered
+	// for a main module whose build info reports "(devel)": `go build` from a
+	// checkout stamps no comparable version, so the image tag is the fallback.
+	// See mainModuleVersion for the safeguards that keep this from guessing.
+	Image string
+
 	// Logf receives progress messages. Never nil after New.
 	Logf func(format string, args ...any)
 }
@@ -44,6 +51,7 @@ type Plugin struct {
 type Options struct {
 	VersionOverride string
 	GoVersion       string
+	Image           string
 	Logf            func(format string, args ...any)
 }
 
@@ -56,6 +64,7 @@ func New(opts Options) *Plugin {
 	return &Plugin{
 		VersionOverride: opts.VersionOverride,
 		GoVersion:       opts.GoVersion,
+		Image:           opts.Image,
 		Logf:            logf,
 	}
 }
@@ -103,6 +112,48 @@ func mainModulePath(bin binscan.Binary) string {
 // binary's build info parsed exactly once per run.
 type state struct {
 	binaries []binary
+
+	// inferredNote, when non-empty, records that this component's Version was
+	// derived from the image tag rather than read from build info. The analysis
+	// phase attaches it as evidence to every finding so a reader can never
+	// mistake an inferred version for one read from the artifact.
+	inferredNote string
+}
+
+// mainModuleVersion resolves the version to report for a binary's own main
+// module, and a provenance note when that version was not the one build info
+// reported.
+//
+// Go stamps no comparable version on a main module built from a checkout: build
+// info reports "(devel)" (see isDevelVersion), which OSV cannot range-match, so
+// it returns advisories already fixed in the running version and every one of
+// them lands as a false positive against the module's own always-present code.
+//
+// The fallback is the image tag, but it is applied with the single hard rule
+// this tool never bends: it must not silently under-report. So it fires only for
+// the main module here, only when build info gave nothing comparable, and only
+// when the tag normalizes to real semver (moduleVersionFromImageTag refuses
+// "latest", digests and date-stamps). When it cannot infer, it returns the
+// original version unchanged -- which keeps today's behavior of querying OSV
+// with "(devel)" and over-reporting, the safe direction, rather than guessing a
+// version that could hide a real vulnerability.
+func (p *Plugin) mainModuleVersion(rawVersion string) (version, note string) {
+	if !isDevelVersion(rawVersion) {
+		return rawVersion, ""
+	}
+	if p.Image == "" {
+		return rawVersion, ""
+	}
+	inferred, tag, ok := moduleVersionFromImageTag(p.Image)
+	if !ok {
+		return rawVersion, ""
+	}
+	reported := rawVersion
+	if reported == "" {
+		reported = "(empty)"
+	}
+	note = fmt.Sprintf("version inferred from image tag %q; build info main-module version was %s", tag, reported)
+	return inferred, note
 }
 
 // DetectImage implements ecosystem.ImageAnalyzer.
@@ -162,8 +213,19 @@ func (p *Plugin) groupAll(root string, bins []binscan.Binary) []ecosystem.Compon
 		// enumeration that left it out would miss the CVEs most likely to
 		// apply to all of them at once.
 		g.add(StdlibModule, binscan.NormalizeGoVersion(bin.Info.GoVersion), rel, bin.Path, main)
-		if m := bin.Info.Main; m.Path != "" && m.Version != "" {
-			g.add(m.Path, m.Version, rel, bin.Path, main)
+		if m := bin.Info.Main; m.Path != "" {
+			// The main module's build-info version can be "(devel)" for a
+			// binary built from a checkout, which OSV cannot match; recover a
+			// comparable version from the image tag when it is safe to. Only
+			// the main module is treated this way -- dependencies carry real
+			// versions -- and a note is kept so the inference is visible.
+			ver, note := p.mainModuleVersion(m.Version)
+			if ver != "" {
+				g.add(m.Path, ver, rel, bin.Path, main)
+				if note != "" {
+					g.markInferred(m.Path, ver, note)
+				}
+			}
 		}
 		for _, dep := range bin.Info.Deps {
 			m := dep
@@ -186,13 +248,24 @@ func (p *Plugin) group(root string, bins []binscan.Binary, modules []string) []e
 		rel := target.Rel(root, bin.Path)
 		for _, module := range modules {
 			version := p.VersionOverride
+			var note string
 			if version == "" {
 				version = bin.ModuleVersion(module)
+				// The requested module can be this binary's own main module,
+				// which has the same "(devel)" defect groupAll works around;
+				// give it the same image-tag fallback so a targeted scan is not
+				// stuck with a version OSV cannot match.
+				if mainModulePath(bin) == module {
+					version, note = p.mainModuleVersion(version)
+				}
 			}
 			if version == "" {
 				continue // module not linked into this binary
 			}
 			g.add(module, version, rel, bin.Path, mainModulePath(bin))
+			if note != "" {
+				g.markInferred(module, version, note)
+			}
 		}
 	}
 	return g.components()
@@ -243,6 +316,16 @@ func (g *grouper) components() []ecosystem.Component {
 		out = append(out, *g.byKey[key])
 	}
 	return out
+}
+
+// markInferred records on an already-added component that its version was
+// derived from the image tag rather than read from build info. The note travels
+// into the analysis phase through Component.Extra so every finding for the
+// component can carry the provenance as evidence.
+func (g *grouper) markInferred(module, version, note string) {
+	if c, ok := g.byKey[module+"@"+version]; ok {
+		c.Extra.(*state).inferredNote = note
+	}
 }
 
 // wantedModules resolves subjects to the module paths to look for, and reports
@@ -321,7 +404,19 @@ func (p *Plugin) AnalyzeImage(ctx context.Context, img *target.Image, items []ec
 				logf:      p.Logf,
 			}
 			for _, req := range requests {
-				out = append(out, evaluate(ctx, ec, req.ID, req.Advisory))
+				f := evaluate(ctx, ec, req.ID, req.Advisory)
+				if st.inferredNote != "" {
+					// The version this finding was decided against was recovered
+					// from the image tag, not read from the binary. Recording it
+					// as evidence keeps the heuristic honest: a reader sees the
+					// inference and its source rather than trusting a version
+					// that was never in the artifact.
+					f.Evidence = append(f.Evidence, ecosystem.Evidence{
+						Origin: "image-tag-version",
+						Detail: st.inferredNote,
+					})
+				}
+				out = append(out, f)
 			}
 		}
 	}

@@ -289,6 +289,7 @@ func registryFor(opts Options) *ecosystem.Registry {
 		golang.New(golang.Options{
 			VersionOverride: opts.Version,
 			GoVersion:       opts.GoVersion,
+			Image:           opts.Image,
 			Logf:            opts.Logf,
 		}),
 		ospkg.New(ospkg.Options{

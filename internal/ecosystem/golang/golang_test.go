@@ -143,6 +143,90 @@ func fakeBinary(path string, deps map[string]string) binscan.Binary {
 	return binscan.Binary{Path: path, Info: info}
 }
 
+// mainVersionBinary is a binary whose own main module carries the given path and
+// version, used to exercise the "(devel)" main-module fallback.
+func mainVersionBinary(path, mainPath, mainVersion string) binscan.Binary {
+	return binscan.Binary{Path: path, Info: &buildinfo.BuildInfo{
+		Main:      debug.Module{Path: mainPath, Version: mainVersion},
+		GoVersion: "go1.24.0",
+	}}
+}
+
+// mainComponent returns the component for module out of an inventory, or nil.
+func mainComponent(comps []ecosystem.Component, module string) *ecosystem.Component {
+	for i := range comps {
+		if comps[i].Name == module {
+			return &comps[i]
+		}
+	}
+	return nil
+}
+
+func TestGroupAllInfersMainVersionFromImageTag(t *testing.T) {
+	const root = "/tmp/extract"
+	const mod = "github.com/k3s-io/k3s"
+	bins := []binscan.Binary{mainVersionBinary(root+"/bin/k3s", mod, "(devel)")}
+
+	p := New(Options{Image: "docker.io/rancher/k3s:v1.36.3-k3s1"})
+	comps := p.groupAll(root, bins)
+
+	c := mainComponent(comps, mod)
+	if c == nil {
+		t.Fatalf("main module %s missing from inventory", mod)
+	}
+	if c.Version != "v1.36.3+k3s1" {
+		t.Errorf("version = %q, want v1.36.3+k3s1 (inferred from image tag)", c.Version)
+	}
+	note := c.Extra.(*state).inferredNote
+	if note == "" || !strings.Contains(note, "v1.36.3-k3s1") {
+		t.Errorf("inferredNote = %q, want a provenance note citing the image tag", note)
+	}
+}
+
+func TestGroupAllKeepsDevelWhenTagNotUsable(t *testing.T) {
+	const root = "/tmp/extract"
+	const mod = "github.com/k3s-io/k3s"
+	bins := []binscan.Binary{mainVersionBinary(root+"/bin/k3s", mod, "(devel)")}
+
+	// A floating tag is not a version: inference is refused and the original
+	// "(devel)" is kept, which over-reports rather than guessing.
+	p := New(Options{Image: "docker.io/rancher/k3s:latest"})
+	comps := p.groupAll(root, bins)
+
+	c := mainComponent(comps, mod)
+	if c == nil {
+		t.Fatalf("main module %s missing from inventory", mod)
+	}
+	if c.Version != "(devel)" {
+		t.Errorf("version = %q, want (devel) unchanged", c.Version)
+	}
+	if note := c.Extra.(*state).inferredNote; note != "" {
+		t.Errorf("inferredNote = %q, want empty (nothing was inferred)", note)
+	}
+}
+
+func TestGroupAllRealMainVersionIsUntouched(t *testing.T) {
+	const root = "/tmp/extract"
+	const mod = "example.com/app"
+	bins := []binscan.Binary{mainVersionBinary(root+"/bin/app", mod, "v1.0.0")}
+
+	// Even with an image tag present, a main module that already has a real
+	// version must not be overwritten by the tag.
+	p := New(Options{Image: "example.com/app:v9.9.9"})
+	comps := p.groupAll(root, bins)
+
+	c := mainComponent(comps, mod)
+	if c == nil {
+		t.Fatalf("main module %s missing from inventory", mod)
+	}
+	if c.Version != "v1.0.0" {
+		t.Errorf("version = %q, want v1.0.0 (build-info version preserved)", c.Version)
+	}
+	if note := c.Extra.(*state).inferredNote; note != "" {
+		t.Errorf("inferredNote = %q, want empty", note)
+	}
+}
+
 func TestGroupComponents(t *testing.T) {
 	const root = "/tmp/extract"
 	bins := []binscan.Binary{
@@ -236,6 +320,47 @@ func TestGroupAllEnumeratesEveryLinkedModule(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestAnalyzeImageAttachesInferredVersionEvidence(t *testing.T) {
+	dir := t.TempDir()
+	binPath := filepath.Join(dir, "k3s")
+	if err := os.WriteFile(binPath, []byte("not a real elf, just needs to be readable"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	const mod = "github.com/k3s-io/k3s"
+	const note = "version inferred from image tag \"v1.36.3-k3s1\"; build info main-module version was (devel)"
+	comp := ecosystem.Component{
+		Ecosystem: "Go",
+		Name:      mod,
+		Version:   "v1.36.3+k3s1",
+		PURL:      purl(mod, "v1.36.3+k3s1"),
+		Extra: &state{
+			binaries:     []binary{{path: binPath, rel: "/bin/k3s", main: mod}},
+			inferredNote: note,
+		},
+	}
+	// A requested id with no advisory: evaluate returns undetermined without
+	// needing a real Go binary, and we only care that provenance is attached.
+	item := ecosystem.WorkItem{Component: comp, Requested: []string{"CVE-2024-0001"}, Targeted: true}
+
+	findings, err := New(Options{}).AnalyzeImage(context.Background(), &target.Image{}, []ecosystem.WorkItem{item})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings, want 1", len(findings))
+	}
+	var found bool
+	for _, e := range findings[0].Evidence {
+		if e.Origin == "image-tag-version" && e.Detail == note {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("finding is missing image-tag-version provenance evidence: %+v", findings[0].Evidence)
 	}
 }
 
