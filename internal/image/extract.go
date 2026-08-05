@@ -15,6 +15,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -32,6 +33,23 @@ const (
 	whiteoutPrefix = ".wh."
 	whiteoutOpaque = ".wh..wh..opq"
 )
+
+// maxImageBytes caps the total uncompressed bytes written while flattening one
+// image. Real images legitimately ship large layers -- a multi-GB base image
+// with a language runtime and toolchain is unremarkable -- so the ceiling is
+// deliberately high; no honest image comes close. Like maxBody in
+// triage/cache.go it is a backstop against hostile input, here a decompression
+// bomb: a crafted layer whose entries claim to inflate to far more than any
+// real image, which io.Copy would otherwise write until the disk is exhausted.
+// The budget is cumulative across every layer, because a flood of small files
+// fills a disk just as well as one enormous one.
+const maxImageBytes = 32 << 30
+
+// errImageTooLarge means extraction hit maxImageBytes. It is a hard stop, not a
+// skippable per-entry problem: silently truncating the file, or dropping the
+// rest of the layer, would under-report what the image ships, which this tool
+// must never do. The caller turns it into a failed run instead.
+var errImageTooLarge = errors.New("image exceeds extraction size limit")
 
 // Extractor flattens container images.
 type Extractor struct {
@@ -107,6 +125,9 @@ func (e *Extractor) Extract(ctx context.Context, ref, dest string) (*target.Imag
 		return nil, err
 	}
 
+	// One byte budget for the whole image, shared across layers, so a bomb
+	// split over many layers is caught just like a single fat one.
+	remaining := int64(maxImageBytes)
 	for _, layer := range m.Layers {
 		blob := blobPath(raw, layer.Digest)
 		if blob == "" {
@@ -115,7 +136,7 @@ func (e *Extractor) Extract(ctx context.Context, ref, dest string) (*target.Imag
 		if _, err := os.Stat(blob); err != nil {
 			continue
 		}
-		if err := untar(blob, destAbs); err != nil {
+		if err := untar(blob, destAbs, &remaining); err != nil {
 			return nil, fmt.Errorf("extract layer %s: %w", layer.Digest, err)
 		}
 	}
@@ -165,10 +186,13 @@ func readConfig(blob string) target.ImageConfig {
 	}
 }
 
-// untar extracts a (possibly gzip/bzip2-compressed) tar blob into destAbs. It
-// is intentionally tolerant: individual bad entries are skipped rather than
-// aborting the whole layer.
-func untar(blob, destAbs string) error {
+// untar extracts a (possibly gzip/bzip2-compressed) tar blob into destAbs,
+// charging bytes written against budget. It tolerates individual unusable
+// entries -- a single file it cannot place is skipped -- but a genuine
+// mid-stream read error is fatal: the remaining entries are real packages, and
+// abandoning them silently would under-report the image, so the error is
+// returned for the caller to fail the run on.
+func untar(blob, destAbs string, budget *int64) error {
 	f, err := os.Open(blob)
 	if err != nil {
 		return err
@@ -187,8 +211,10 @@ func untar(blob, destAbs string) error {
 			break
 		}
 		if err != nil {
-			// Corrupt trailing data: stop but don't fail the whole run.
-			break
+			// A truncated or corrupt stream. Everything past this point is
+			// unreadable, and pretending it was clean padding would hide real
+			// entries, so surface it rather than break out silently.
+			return fmt.Errorf("read tar: %w", err)
 		}
 
 		name := path.Clean("/" + hdr.Name)
@@ -226,7 +252,13 @@ func untar(blob, destAbs string) error {
 				continue
 			}
 		case tar.TypeReg:
-			if err := writeFile(tr, dst, os.FileMode(hdr.Mode)); err != nil {
+			if err := writeFile(tr, dst, os.FileMode(hdr.Mode), budget); err != nil {
+				// A blown budget is a decompression bomb, not a merely awkward
+				// file: stop the whole extraction instead of skipping ahead and
+				// under-reporting the rest of the layer.
+				if errors.Is(err, errImageTooLarge) {
+					return err
+				}
 				continue
 			}
 		case tar.TypeSymlink:
@@ -301,7 +333,7 @@ func replaceExisting(dst string) error {
 	return nil
 }
 
-func writeFile(r io.Reader, dst string, mode os.FileMode) error {
+func writeFile(r io.Reader, dst string, mode os.FileMode, budget *int64) error {
 	if err := replaceExisting(dst); err != nil {
 		return err
 	}
@@ -312,8 +344,19 @@ func writeFile(r io.Reader, dst string, mode os.FileMode) error {
 		return err
 	}
 	defer out.Close()
-	_, err = io.Copy(out, r)
-	return err
+	// Read one byte past the remaining budget: if the copy actually delivers
+	// it, the file alone would overrun the ceiling. The partially written file
+	// is left for the caller to discard along with the whole extraction; we do
+	// not truncate it and carry on, which would silently under-report contents.
+	n, err := io.Copy(out, io.LimitReader(r, *budget+1))
+	if err != nil {
+		return err
+	}
+	if n > *budget {
+		return errImageTooLarge
+	}
+	*budget -= n
+	return nil
 }
 
 // writeSymlink recreates a symlink verbatim. The raw link target is preserved
