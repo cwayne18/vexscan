@@ -40,9 +40,19 @@ type TriageResult struct {
 	// feed did not know -- almost always a CVE published in the last day or
 	// two. They are counted apart because the report has to explain the two
 	// differently, and because neither of them means "low risk".
-	Scored         int `json:"scored"`
-	NoCVE          int `json:"no_cve,omitempty"`
-	NotInFeed      int `json:"not_in_feed,omitempty"`
+	Scored    int `json:"scored"`
+	NoCVE     int `json:"no_cve,omitempty"`
+	NotInFeed int `json:"not_in_feed,omitempty"`
+
+	// KnownExploited counts every finding in the catalog, whatever this scan
+	// decided about it -- including the ones it ruled out and the ones a vendor
+	// already answered. All four counters here have that population, because
+	// they describe the lookup and not the verdict.
+	//
+	// The text report's priority line counts the affected rows instead, since
+	// that is the part a reader has to act on, and says so in words when the
+	// two differ. They are allowed to differ. They are not allowed to differ
+	// silently: see writePriority.
 	KnownExploited int `json:"known_exploited"`
 	CatalogSize    int `json:"catalog_size,omitempty"`
 }

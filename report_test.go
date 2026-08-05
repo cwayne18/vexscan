@@ -1356,3 +1356,102 @@ func TestThePriorityLineIsNotPrintedOverAnEmptyPopulation(t *testing.T) {
 		t.Errorf("the feed date went with it:\n%s", out)
 	}
 }
+
+// ruledOutKEV is a known-exploited finding this scan ruled out: the package is
+// installed, it is in the catalog, and no object it ships is reachable. It is
+// the shape that made the summary and the log line disagree.
+func ruledOutKEV(cve string) analyze.Finding {
+	f := kevFinding(cve, false)
+	f.Status = analyze.StatusNotInPath
+	f.Justification = "vulnerable_code_not_in_execute_path"
+	return f
+}
+
+// The defect this pair of tests exists for: --triage logs "3 finding(s) are in
+// CISA's known-exploited catalog" and writes known_exploited:3 to the JSON,
+// counting every finding, while the summary counted only the affected ones --
+// so a report could print "none in CISA's known-exploited catalog" over a run
+// whose own log said three. Whichever number a reader believes, one of them was
+// lying to them.
+func TestTheSummaryDoesNotSayNoneWhenTheCatalogFired(t *testing.T) {
+	out := triaged(t, &analyze.TriageResult{Scored: 2, KnownExploited: 1, KEVDate: "2026.08.03"}, false,
+		scored("CVE-2011-3389", "HIGH", 0.994),
+		ruledOutKEV("CVE-2017-5638"),
+	)
+	p := lineWith(t, out, "  priority: ")
+	if strings.Contains(p, "none in CISA's known-exploited catalog") {
+		t.Errorf("the summary denied a catalog hit the log and the JSON both report: %q", p)
+	}
+	if !strings.Contains(p, "1 other row is") {
+		t.Errorf("the hit is not mentioned at all: %q", p)
+	}
+	// It is outside the population on purpose, so it must not be counted into
+	// the numbers that mean work to do.
+	if !strings.Contains(p, "1 scored") {
+		t.Errorf("the ruled-out row leaked into the affected counts: %q", p)
+	}
+}
+
+// A hit inside the population and a hit outside it are different claims, and
+// the line has to carry both rather than picking one.
+func TestTheSummarySeparatesExploitedRowsFromRuledOutOnes(t *testing.T) {
+	out := triaged(t, &analyze.TriageResult{Scored: 3, KnownExploited: 3}, false,
+		kevFinding("CVE-2021-44228", false),
+		ruledOutKEV("CVE-2017-5638"),
+		ruledOutKEV("CVE-2014-0160"),
+	)
+	p := lineWith(t, out, "  priority: ")
+	if !strings.Contains(p, "1 known exploited (CISA KEV), 2 more outside the affected rows") {
+		t.Errorf("priority line = %q", p)
+	}
+	// 1 + 2 is the number the log line and the JSON print. A reader adding the
+	// summary up has to arrive there.
+	if !strings.Contains(p, "1 scored") {
+		t.Errorf("the two ruled-out rows leaked into the affected counts: %q", p)
+	}
+}
+
+// A vendor's not_affected is somebody else's conclusion, not this scan's, and
+// it does not remove the row from the catalog.
+func TestAVexedRowStillCountsAsACatalogHit(t *testing.T) {
+	f := kevFinding("CVE-2017-5638", false)
+	f.VEX = &ecosystem.VEXStatement{Status: "not_affected", Author: "SUSE"}
+
+	out := triaged(t, &analyze.TriageResult{Scored: 1, KnownExploited: 1}, false, f)
+	p := lineWith(t, out, "  priority: ")
+	if !strings.Contains(p, "1 other row is") {
+		t.Errorf("a vexed catalog hit went unmentioned: %q", p)
+	}
+}
+
+// The empty-population suppression must not swallow the one clause that is not
+// about the population. A metadata-only scan decides nothing, so every row is
+// outside the affected set -- which is exactly when a catalog hit is easiest to
+// lose and worst to lose.
+func TestACatalogHitSurvivesAnEmptyPopulation(t *testing.T) {
+	f := undecided("SUSE-SU-2024:3106-1")
+	f.Priority = &triage.Priority{CVE: "CVE-2017-5638", Scored: true, Percentile: 0.992, OfSet: 1}
+	f.Priority.KEV = &triage.KEVEntry{DateAdded: "2021-11-03", DueDate: "2022-05-03"}
+
+	out := rpmReport(t, &analyze.TriageResult{EPSSDate: "2026-08-04", KnownExploited: 1}, f)
+	p := lineWith(t, out, "  priority: ")
+	if !strings.Contains(p, "1 other row is") {
+		t.Errorf("the catalog hit was suppressed with the empty population: %q", p)
+	}
+	if strings.Contains(p, "0 scored") {
+		t.Errorf("the population counts came back with it: %q", p)
+	}
+}
+
+// Nothing anywhere in the catalog is still worth printing, and the wording for
+// that case must not have been disturbed by the wording for the others.
+func TestTheQuietCaseIsUnchanged(t *testing.T) {
+	out := triaged(t, &analyze.TriageResult{Scored: 1}, false, scored("CVE-2011-3389", "HIGH", 0.994))
+	p := lineWith(t, out, "  priority: ")
+	if !strings.Contains(p, "none in CISA's known-exploited catalog") {
+		t.Errorf("priority line = %q", p)
+	}
+	if strings.Contains(p, "outside the affected rows") || strings.Contains(p, "other row") {
+		t.Errorf("a remainder clause was printed with no remainder: %q", p)
+	}
+}

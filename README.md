@@ -1124,7 +1124,7 @@ negligible until you know it is the 87th percentile of all 355,094 scored CVEs.
   epss:     0.03249 (87.1th percentile), as CVE-2019-1010022
 ```
 
-Five things are worth knowing before you rely on it:
+Six things are worth knowing before you rely on it:
 
 - **A distro advisory is a bundle, and it is scored at its worst member.**
   `SUSE-SU-2026:0312-1` fixes eight CVEs and `RHSA-2024:2447` seven; one Red Hat
@@ -1163,6 +1163,25 @@ Five things are worth knowing before you rely on it:
   both images here. It is worth carrying because when it does fire it ends the
   argument, but a report with no KEV rows is the normal case and not a clean bill
   of health.
+- **A catalog hit is reported even on a row this scan ruled out.** Every other
+  number on the `priority:` line counts the affected rows only, because those are
+  the work to do — but "is this in the catalog" is a question about the scan, and
+  it is answered in two other places (the `--triage` log line, and
+  `known_exploited` in the JSON) that count *every* finding. So a hit outside the
+  affected rows is still named, and named as being outside them:
+
+  ```console
+  $ vexscan --image debian:12 --ecosystem os --cves CVE-2021-3156 --triage
+    priority: no affected row is in CISA's known-exploited catalog, but 1 other row is
+
+  UNDETERMINED (1) - not enough evidence to decide either way
+  SEVERITY  ADVISORY       PACKAGE  VERSION  EPSS   KEV  BASIS
+  UNKNOWN   CVE-2021-3156                    99.9%  yes
+  ```
+
+  Before v0.6.1 that line was absent and the summary said nothing, while the log
+  said `Triage: 1 finding(s) are in CISA's known-exploited catalog`. Two counts of
+  the same scan are allowed to differ; they are not allowed to differ silently.
 - **EPSS predicts observed exploitation activity anywhere in the next 30 days**,
   not risk to you. A high percentile on a library your entrypoint never loads is
   still a finding vexscan has already told you is `not_present`.
@@ -1278,7 +1297,8 @@ The JSON is `schema_version: 2`:
     "epss_error": "...", "kev_error": "...", // a feed failed; set instead of failing the run
     "not_in_feed": 16, "no_cve": 3,          // unscored, and why; each omitted when zero
     "catalog_size": 1660,                    // how many CVEs the KEV catalog held
-    "scored": 145, "known_exploited": 0      // always present: "0 known exploited" is a finding
+    "scored": 145, "known_exploited": 0      // always present: "0 known exploited" is a finding.
+                                             // counts every finding, not just the affected ones
   },
   "withheld": {  // only when --severity hid something; findings[] is already the kept set
     "severities": ["CRITICAL", "HIGH"],

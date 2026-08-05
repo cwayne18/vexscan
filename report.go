@@ -338,17 +338,32 @@ const highPercentile = 0.90
 // Same population on purpose. Two summary lines describing different subsets of
 // the same report is the kind of small dishonesty a reader only discovers by
 // adding the numbers up and finding they disagree.
+//
+// The KEV clause is the one exception, and it earns it. Everything else here is
+// a count of work to do, which is a question about the affected rows only. "Is
+// this in the catalog" is a question about the scan, and it is asked in two
+// other places -- the --triage log line and TriageResult.KnownExploited in the
+// JSON -- both of which count every finding. Scoping the text summary silently
+// let it print "none in CISA's known-exploited catalog" over a run whose own
+// log line said three. So a hit outside the population is still counted; it is
+// just reported as being outside it.
 func writePriority(b *strings.Builder, res *analyze.Result) {
 	t := res.Triage
 	if t == nil {
 		return
 	}
-	var kev, high, scored, unscored int
+	var kev, elsewhere, high, scored, unscored int
 	for _, f := range res.Findings {
+		p := f.Priority
 		if !f.Affected() || alreadyVexed(f) {
+			// Ruled out, undetermined, or already answered by a vendor. Not
+			// work to do, so not in any of the counts below -- but if the
+			// catalog fired on it, it fired.
+			if p != nil && p.KEV != nil {
+				elsewhere++
+			}
 			continue
 		}
-		p := f.Priority
 		switch {
 		case p == nil || !p.Scored:
 			unscored++
@@ -362,31 +377,43 @@ func writePriority(b *strings.Builder, res *analyze.Result) {
 			kev++
 		}
 	}
+	// Every counted row lands in scored or unscored before kev is considered,
+	// so this is the size of the population and kev > 0 implies it is not zero.
+	//
+	// Nothing in the population is not the same as nothing scored, and a
+	// metadata-only scan makes the difference visible: every row there is
+	// undetermined, so the affected population is empty by construction while
+	// the rows themselves carry percentiles. "0 scored" printed over a table of
+	// EPSS columns is a summary the report contradicts three lines later, so
+	// the clauses that count the population are gated on there being one.
+	population := scored + unscored
 
 	var parts []string
-	if kev > 0 {
+	switch {
+	case kev > 0 && elsewhere > 0:
+		parts = append(parts, fmt.Sprintf("%d known exploited (CISA KEV), %d more outside the affected rows", kev, elsewhere))
+	case kev > 0:
 		parts = append(parts, fmt.Sprintf("%d known exploited (CISA KEV)", kev))
-	} else if t.KEVError == "" {
+	case elsewhere > 0:
+		// Said even over an empty population, and said without softening. The
+		// rows it refers to are ones this scan ruled out or a vendor already
+		// answered, and that is what "outside" carries -- but a catalog hit
+		// this report holds and does not mention is a fact a reader has to
+		// find by reading the JSON.
+		parts = append(parts, fmt.Sprintf("no affected row is in CISA's known-exploited catalog, but %s", otherRows(elsewhere)))
+	case t.KEVError == "" && population > 0:
 		// Worth saying out loud that the catalog was consulted and had nothing.
 		// Not worth reading as reassurance: it holds a few thousand entries and
 		// covers almost nothing a base image ships.
 		parts = append(parts, "none in CISA's known-exploited catalog")
 	}
-	if t.EPSSError == "" {
+	if t.EPSSError == "" && population > 0 {
 		parts = append(parts,
 			fmt.Sprintf("%d at or above the %dth EPSS percentile", high, int(highPercentile*100)),
 			fmt.Sprintf("%d scored", scored))
 		if unscored > 0 {
 			parts = append(parts, fmt.Sprintf("%d unscored", unscored))
 		}
-	}
-	// Nothing in the population is not the same as nothing scored, and a
-	// metadata-only scan makes the difference visible: every row there is
-	// undetermined, so the affected population is empty by construction while
-	// the rows themselves carry percentiles. "0 scored" printed over a table of
-	// EPSS columns is a summary the report contradicts three lines later.
-	if scored+unscored+kev == 0 {
-		parts = nil
 	}
 	if len(parts) > 0 {
 		fmt.Fprintf(b, "  priority: %s\n", strings.Join(parts, ", "))
@@ -404,6 +431,15 @@ func writePriority(b *strings.Builder, res *analyze.Result) {
 	if len(dates) > 0 {
 		fmt.Fprintf(b, "  priority data: %s\n", strings.Join(dates, ", "))
 	}
+}
+
+// otherRows renders the count of catalog hits that fell outside the affected
+// population, agreeing with itself about number.
+func otherRows(n int) string {
+	if n == 1 {
+		return "1 other row is"
+	}
+	return fmt.Sprintf("%d other rows are", n)
 }
 
 func stale(b bool) string {
