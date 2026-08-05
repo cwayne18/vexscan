@@ -374,6 +374,8 @@ func writeRemediation(b *strings.Builder, res *analyze.Result) {
 	}
 	if fixable > 0 {
 		parts = append(parts, fmt.Sprintf("%d fixable, %d with no fix yet", fixable, total-fixable))
+	} else {
+		parts = append(parts, fmt.Sprintf("%d with no fix yet", total))
 	}
 	if len(parts) == 0 {
 		return
