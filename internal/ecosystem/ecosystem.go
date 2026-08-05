@@ -392,6 +392,16 @@ type Finding struct {
 	// which the row already names.
 	Upstream []string `json:"upstream,omitempty"`
 
+	// FixedVersion is the version the advisory's patch lands in for this
+	// finding's package, when the OSV record publishes one. It is the
+	// report's one actionable field: what to upgrade to.
+	//
+	// Plugins do not set it; the orchestrator fills it from the OSV record's
+	// affected ranges, joined on Package. Empty means no fix was published --
+	// a real and common state that the renderer shows as "no fix", not as a
+	// blank cell, because the two mean opposite things.
+	FixedVersion string `json:"fixed_version,omitempty"`
+
 	// Stripped is a pointer because it is a Go-only fact with three states: a
 	// binary with symbols, a binary without, and an OS package that is not a
 	// binary at all. A plain bool would report every deb in the image as

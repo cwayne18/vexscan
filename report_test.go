@@ -352,6 +352,67 @@ func TestDetailsShowsTheSourcePackageOnlyWhenItDiffers(t *testing.T) {
 	}
 }
 
+// The FIXED IN column earns its place only when a section has a fix to show,
+// and a row with none reads "no fix" rather than blank.
+func TestFixedInColumnAppearsOnlyWithData(t *testing.T) {
+	// No finding has a fix: the column must not appear at all.
+	none := report(t, false,
+		analyze.Finding{CVE: "CVE-1", Package: "a", Version: "1.0", Status: analyze.StatusLinked, Severity: "HIGH", Method: "m"},
+	)
+	if strings.Contains(none, "FIXED IN") {
+		t.Errorf("FIXED IN column appeared with nothing to put in it:\n%s", none)
+	}
+
+	// One finding has a fix and one does not: the column appears, and the
+	// unfixed row reads "no fix".
+	some := report(t, false,
+		analyze.Finding{CVE: "CVE-1", Package: "a", Version: "1.0", Status: analyze.StatusLinked, Severity: "HIGH", Method: "m", FixedVersion: "1.1"},
+		analyze.Finding{CVE: "CVE-2", Package: "b", Version: "2.0", Status: analyze.StatusLinked, Severity: "HIGH", Method: "m"},
+	)
+	rows := sectionOf(t, some, "AFFECTED")
+	if !strings.Contains(rows[0], "FIXED IN") {
+		t.Fatalf("FIXED IN header missing:\n%s", some)
+	}
+	if !strings.Contains(lineWith(t, some, "CVE-1"), "1.1") {
+		t.Errorf("fixed version missing from the CVE-1 row:\n%s", some)
+	}
+	if !strings.Contains(lineWith(t, some, "CVE-2"), "no fix") {
+		t.Errorf("an unfixed row should read \"no fix\":\n%s", some)
+	}
+}
+
+// The summary reports how many affected rows are fixable and how many distinct
+// advisories they are, which is what the wall of rows hides.
+func TestRemediationSummary(t *testing.T) {
+	out := report(t, false,
+		// One advisory seen on two packages: two rows, one advisory, both fixable.
+		analyze.Finding{CVE: "CVE-1", Package: "a", Version: "1.0", Status: analyze.StatusLinked, Severity: "HIGH", FixedVersion: "1.1"},
+		analyze.Finding{CVE: "CVE-1", Package: "b", Version: "1.0", Status: analyze.StatusLinked, Severity: "HIGH", FixedVersion: "1.1"},
+		// A third row nobody has patched yet.
+		analyze.Finding{CVE: "CVE-2", Package: "c", Version: "2.0", Status: analyze.StatusLinked, Severity: "HIGH"},
+	)
+	line := lineWith(t, out, "affected:")
+	for _, want := range []string{"3 affected", "2 unique advisories", "2 fixable", "1 with no fix yet"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("summary line %q missing %q", line, want)
+		}
+	}
+}
+
+// With no fix data anywhere, the fix clause is dropped rather than printed as
+// "0 fixable".
+func TestRemediationSummarySkipsFixClauseWithNoData(t *testing.T) {
+	out := report(t, false,
+		analyze.Finding{CVE: "CVE-1", Package: "a", Status: analyze.StatusLinked, Severity: "HIGH"},
+		analyze.Finding{CVE: "CVE-2", Package: "b", Status: analyze.StatusLinked, Severity: "HIGH"},
+	)
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "fixable") {
+			t.Errorf("fix clause printed with no fix data: %q", l)
+		}
+	}
+}
+
 // TestTableRowsAreGreppable: no trailing whitespace, two spaces between
 // columns, and columns that line up. These reports get cut, grepped and diffed.
 func TestTableRowsAreGreppable(t *testing.T) {

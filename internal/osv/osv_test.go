@@ -259,6 +259,84 @@ func TestQueryCarriesAdvisoryProse(t *testing.T) {
 	}
 }
 
+func TestFixedVersionIsExtractedForEveryEcosystem(t *testing.T) {
+	// A distro record with one range and one fixed event -- the common shape.
+	// The affected package name is the source name the join keys on.
+	const body = `{"vulns":[{"id":"DEBIAN-CVE-2025-8941","aliases":["CVE-2025-8941"],
+		"affected":[{"package":{"name":"pam","ecosystem":"Debian:12"},
+		"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1.5.2-6+deb12u2"}]}]}]}]}`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	c := NewClient()
+	c.BaseURL = srv.URL
+	m, err := c.Query(context.Background(), Ref{Ecosystem: "Debian:12", Name: "pam", Version: "1.5.2-6+deb12u1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Reachable under the id and under the CVE alias, since a finding may name
+	// either.
+	for _, key := range []string{"DEBIAN-CVE-2025-8941", "CVE-2025-8941"} {
+		if got := m[key].Fixed["pam"]; got != "1.5.2-6+deb12u2" {
+			t.Errorf("%s: Fixed[pam] = %q, want the patched version", key, got)
+		}
+	}
+}
+
+func TestLatestFixedEventWins(t *testing.T) {
+	// Two ranges patch the same package at different versions. The later one is
+	// the upgrade target for anything still on an older version.
+	const body = `{"vulns":[{"id":"X","affected":[{"package":{"name":"zlib1g","ecosystem":"Debian:12"},
+		"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1.2.11"},
+		{"introduced":"1.2.12"},{"fixed":"1.2.13"}]}]}]}]}`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	c := NewClient()
+	c.BaseURL = srv.URL
+	m, err := c.Query(context.Background(), Ref{Ecosystem: "Debian:12", Name: "zlib1g"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m["X"].Fixed["zlib1g"]; got != "1.2.13" {
+		t.Errorf("Fixed[zlib1g] = %q, want the latest fixed event 1.2.13", got)
+	}
+}
+
+// A record carries an affected entry per release. A fixed version must be read
+// only from the entry that names the release the query was for -- reading a
+// sibling release's fix is how a bookworm scan ends up recommending a sid
+// version bookworm never shipped.
+func TestFixedVersionIsScopedToTheQueriedRelease(t *testing.T) {
+	// zlib is fixed in Debian:13 but has no fix in Debian:12: the bookworm
+	// entry carries only an "introduced" event.
+	const body = `{"vulns":[{"id":"DEBIAN-CVE-2023-45853","affected":[
+		{"package":{"name":"zlib","ecosystem":"Debian:12"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"}]}]},
+		{"package":{"name":"zlib","ecosystem":"Debian:13"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1:1.3.dfsg-2"}]}]}
+	]}]}`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	c := NewClient()
+	c.BaseURL = srv.URL
+	m, err := c.Query(context.Background(), Ref{Ecosystem: "Debian:12", Name: "zlib", Version: "1:1.2.13.dfsg-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := m["DEBIAN-CVE-2023-45853"].Fixed["zlib"]; ok {
+		t.Errorf("read a fix %q from a sibling release; bookworm has none", got)
+	}
+}
+
 // A bad ecosystem name is a bug in our mapping table, and OSV says so in the
 // response body. It must reach the caller on the first try rather than be
 // retried into a bare "unexpected status 400".

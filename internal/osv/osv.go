@@ -97,6 +97,19 @@ type Advisory struct {
 	// and always empty for non-Go ecosystems.
 	Pkgs []string
 
+	// Fixed maps an affected package name to the version its patch lands in,
+	// read from the record's affected ranges. It is the single most actionable
+	// field a report can show -- "this is what to upgrade to" -- and unlike
+	// Pkgs it is populated for every ecosystem.
+	//
+	// A package is absent when the record publishes no fixed version for it,
+	// which is a real and common state: the flaw is acknowledged and no patch
+	// has shipped. Callers must show that as "no fix" rather than as blank,
+	// because the two mean opposite things. When a package has several fixed
+	// events the latest is kept, which is the upgrade target for anything
+	// still on an older version.
+	Fixed map[string]string
+
 	// CVSSVector is the CVSS:3.0 or CVSS:3.1 base vector the record publishes,
 	// empty when it publishes none or publishes only a version this tool does
 	// not score. It is kept as the string rather than only as a number so a
@@ -261,6 +274,17 @@ type vuln struct {
 				Path string `json:"path"`
 			} `json:"imports"`
 		} `json:"ecosystem_specific"`
+		// Ranges carries the version events for this package: an "introduced"
+		// where the flaw begins and a "fixed" where a patch lands. A distro
+		// record almost always has one range with one fixed event, which is
+		// the version to upgrade to.
+		Ranges []struct {
+			Type   string `json:"type"`
+			Events []struct {
+				Introduced string `json:"introduced"`
+				Fixed      string `json:"fixed"`
+			} `json:"events"`
+		} `json:"ranges"`
 	} `json:"affected"`
 }
 
@@ -573,6 +597,24 @@ func appliesToRelease(ref Ref, v vuln) bool {
 	return false
 }
 
+// affectedInScope reports whether an affected entry's ecosystem names the same
+// release the query was for, so a fixed version is read from the bookworm entry
+// and not the sid one.
+//
+// For a distro whose release is carried out-of-band (SUSE's bare "SUSE" family
+// with a Release token) the product spelling is matched loosely, exactly as
+// appliesToRelease does. For every other ecosystem the release is already in
+// the ecosystem string -- "Debian:12", "Go", "PyPI" -- and an exact match is
+// what keeps a Debian:13 entry from answering a Debian:12 query. An empty
+// ecosystem is out of scope: it cannot be shown to name this release, and a
+// wrong upgrade target is worse than none.
+func affectedInScope(ref Ref, ecosystem string) bool {
+	if ref.Release != "" {
+		return MatchesProductRelease(ecosystem, ref.Release)
+	}
+	return ecosystem == ref.Ecosystem
+}
+
 func advisoryFor(ref Ref, v vuln) *Advisory {
 	adv := &Advisory{
 		ID:                v.ID,
@@ -582,6 +624,32 @@ func advisoryFor(ref Ref, v vuln) *Advisory {
 		Details:           v.Details,
 		CVSSVector:        cvssVector(v),
 		PublisherSeverity: v.DatabaseSpecific.Severity,
+	}
+
+	// Fixed versions are read for every ecosystem, before the Go-only import
+	// gating below returns. Only affected entries that name this ref's release
+	// are read: an OSV record carries an entry per release, and zlib's
+	// DEBIAN-CVE-2023-45853 is fixed in Debian:13 but has no fix in Debian:12,
+	// so reading every entry would tell a bookworm user to upgrade to a
+	// version bookworm never shipped. The last fixed event in an in-scope
+	// entry wins: OSV lists events in ascending version order, so for a
+	// package patched more than once the latest is the upgrade target.
+	for _, aff := range v.Affected {
+		name := aff.Package.Name
+		if name == "" || !affectedInScope(ref, aff.Package.Ecosystem) {
+			continue
+		}
+		for _, rng := range aff.Ranges {
+			for _, ev := range rng.Events {
+				if ev.Fixed == "" {
+					continue
+				}
+				if adv.Fixed == nil {
+					adv.Fixed = map[string]string{}
+				}
+				adv.Fixed[name] = ev.Fixed
+			}
+		}
 	}
 
 	// ecosystem_specific.imports is a Go-database field. Reading it for any

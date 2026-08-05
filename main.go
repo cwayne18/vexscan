@@ -57,7 +57,7 @@ func main() {
 		llmURL     = flag.String("llm-endpoint", "", "OpenAI-compatible chat/completions URL for --llm -- an API provider, or a local Ollama (env: VEXSCAN_LLM_ENDPOINT; credential: VEXSCAN_LLM_TOKEN)")
 		llmModel   = flag.String("llm-model", "", "model id for --llm-endpoint (env: VEXSCAN_LLM_MODEL; default gpt-4o)")
 		llmCommand = flag.String("llm-command", "", "for --llm, run this installed CLI instead of calling an endpoint, e.g. 'claude -p'; the prompt arrives on its stdin (env: VEXSCAN_LLM_COMMAND)")
-		format     = flag.String("format", "text", "output format: text, json, or inventory (list the image's OS packages and exit)")
+		format     = flag.String("format", "text", "output format: text, json, fixplan (a remediation-first view of the fixable findings), or inventory (list the image's OS packages and exit)")
 		details    = flag.Bool("details", false, "with --format text, print the full evidence block under each row instead of the table alone")
 		out        = flag.String("out", "", "write output to this file instead of stdout")
 		gistFlag   = flag.Bool("gist", false, "also upload the output to a public GitHub gist and print its URL (needs GITHUB_TOKEN/GH_TOKEN with gist scope)")
@@ -80,9 +80,9 @@ func main() {
 		fail("set exactly one of --image, --rootfs, --repo or --rpm")
 	}
 	switch *format {
-	case "text", "json", "inventory":
+	case "text", "json", "fixplan", "inventory":
 	default:
-		fail("unknown --format %q; want text, json, or inventory", *format)
+		fail("unknown --format %q; want text, json, fixplan, or inventory", *format)
 	}
 	// Canonicalized here, and strictly, so that a typo is a command-line error
 	// before the pull rather than an empty report after it. cvss.Parse rather
@@ -198,6 +198,8 @@ func main() {
 			os.Exit(1)
 		}
 		rendered = string(b) + "\n"
+	case "fixplan":
+		rendered = renderFixPlan(res)
 	default: // --format was validated up front; inventory returned earlier
 		rendered = renderText(res, *details)
 	}
@@ -512,6 +514,9 @@ Examples:
   # List the packages in an image, with the names OSV will be queried by
   vexscan --image debian:12 --format inventory
   vexscan --rootfs /mnt/rootfs --format inventory
+
+  # A remediation-first view: which packages to upgrade, and to what
+  vexscan --image debian:12 --all --format fixplan
 
   # With an exploitability overlay, from a model running locally
   vexscan --image myorg/app:latest --all --llm \

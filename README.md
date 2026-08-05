@@ -889,7 +889,8 @@ is non-fatal either way: the finding is still reported, just without a verdict.
 
 ## Output
 
-`--format text` is for reading; `--format json` is for keeping.
+`--format text` is for reading; `--format json` is for keeping; `--format
+fixplan` is for acting.
 
 ### The text report
 
@@ -942,6 +943,75 @@ JSON and in `--details`.
 plus `purl`, `evidence` and the plugin's own characterization of the
 reachability. That is the pre-table output, and it is verbose on purpose: the
 same scan is 3,990 lines.
+
+### Remediation: `FIXED IN` and `--format fixplan`
+
+When a scan runs against an image that is behind on patches, two more things
+appear. A `FIXED IN` column, and a line in the summary that says how much of the
+report is actionable:
+
+```
+  292 affected: 162 unique advisories, 138 fixable, 154 with no fix yet
+
+AFFECTED (292) - vulnerable code is present and can be loaded
+SEVERITY  ADVISORY          PACKAGE      VERSION          FIXED IN            BASIS
+CRITICAL  CVE-2026-33845    libgnutls30  3.7.9-2          3.7.9-2+deb12u7     elf-needed-closure
+HIGH      CVE-2023-4911     libc6        2.36-9+deb12u1   2.36-9+deb12u3      elf-needed-closure
+CRITICAL  CVE-2019-1010022  libc6        2.36-9+deb12u1   no fix              elf-needed-closure
+```
+
+The target version is read from the OSV record's `fixed` range, scoped to the
+release the scan is for — a bookworm scan reports the bookworm fix, never the
+`sid` one. `FIXED IN` earns its place like every other optional column: it
+appears only when a section holds at least one row with a published fix, so a
+fully-patched image or an ecosystem that ships no fixed versions gets no column
+of blanks. `no fix` and an empty cell are kept distinct on purpose: `no fix` is
+data (the advisory is acknowledged and no patch has shipped), while a blank
+would read as missing data. The summary's `N fixable, M with no fix yet` clause
+is dropped entirely when nothing is fixable, so it never prints `0 fixable`.
+
+`--format fixplan` reorganizes the same affected findings by the action that
+clears them. Instead of one row per advisory, it is one row per **upgrade** —
+the package, the version to move to, and how many advisories that single upgrade
+clears:
+
+```
+$ vexscan --image debian:bookworm-20230919 --all --ecosystem os --format fixplan
+vexscan report (image) for debian:bookworm-20230919
+
+  138 of 292 affected findings have a fix.
+  upgrading 28 packages clears 86 advisories; 154 with no fix yet.
+
+UPGRADE (28) - apply these to clear the fixable findings
+PACKAGE       CURRENT           FIXED IN            CLEARS  SEVERITY
+libgnutls30   3.7.9-2           3.7.9-2+deb12u7     27      CRITICAL
+libc6         2.36-9+deb12u1    2.36-9+deb12u14     24      HIGH
+libsystemd0   252.12-1~deb12u1  252.39-1~deb12u2    9       HIGH
+...
+
+NO FIX YET (154) - affected, but no patch has shipped
+SEVERITY  ADVISORY          PACKAGE   VERSION
+CRITICAL  CVE-2019-1010022  libc6     2.36-9+deb12u1
+...
+```
+
+A package with a dozen advisories, each fixed in a different point release,
+becomes one row whose target is the **newest** of those versions, because a
+distro point release is cumulative: installing the latest clears every earlier
+one. That collapse needs to order versions, which the rest of the tool never
+does (whether a package is affected is OSV's answer, made server-side), so it is
+scoped to the ecosystems whose versions it can order with confidence — Debian
+and Ubuntu, using dpkg's own algorithm. For any other ecosystem it will not
+guess an order (a semver pre-release sorts the opposite way to a Debian
+revision), and findings stay split by their published fixed version rather than
+risk naming the wrong target as newest. It is a view, not a filter: every
+affected finding with no fix is still listed under `NO FIX YET`, because a
+remediation plan that quietly dropped the un-fixable rows would read as
+complete when it is not.
+
+The rows are sorted worst-first — known-exploited, then severity, then the
+upgrades that clear the most — so the first line is the one to do first.
+
 
 ### Reading a long report
 
@@ -1384,7 +1454,7 @@ be read, or part of the tree could not be read, `2` the command line was wrong.
 | `--llm-model` | `gpt-4o` | Model id for `--llm-endpoint` |
 | `--llm-command` | | Run this installed CLI instead of an endpoint, e.g. `'claude -p'` |
 | `--mine-advisories` | `false` | With `--llm`, mine advisory prose for symbols and module paths to check |
-| `--format` | `text` | `text`, `json`, or `inventory` |
+| `--format` | `text` | `text`, `json`, `fixplan`, or `inventory` |
 | `--details` | `false` | With `--format text`, print the full evidence block under each row instead of the table alone |
 | `--out` | *(stdout)* | Write output to a file |
 | `--gist` | `false` | Also upload the output to a public gist and print its URL (token needs `gist` scope) |
