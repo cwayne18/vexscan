@@ -30,6 +30,15 @@ func TestCompareMatchesDpkg(t *testing.T) {
 		// A missing revision compares as empty and so sorts below any revision.
 		{"1.34", "1.34-1", -1},
 		{"1:4.13+dfsg1-1+b1", "1:4.13+dfsg1-1+deb12u1", -1}, // b < d
+		// Digit-vs-non-digit alignment: dpkg weights a digit as 0, so it sorts
+		// before any letter and after '~'. These are the cases the first cut of
+		// order() got backwards by letting a digit fall through to c+256.
+		{"1.0", "1.a", -1}, // digit 0 sorts before letter a
+		{"a1", "aa", -1},   // digit 1 sorts before letter a
+		{"1.0", "1.~", 1},  // digit 0 sorts after '~'
+		// Decided by the numeric length rule before the 'w' matters: the run
+		// "1" is less than "10", so 1.1.1w < 1.1.10 (validated against dpkg).
+		{"1.1.1w", "1.1.10", -1},
 	}
 	for _, c := range cases {
 		if got := Compare(c.a, c.b); got != c.want {

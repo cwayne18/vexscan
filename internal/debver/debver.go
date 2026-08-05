@@ -106,11 +106,19 @@ func verrevcmp(a, b string) int {
 	return 0
 }
 
-// order assigns each non-digit byte its dpkg sort weight: '~' sorts before
-// everything including the end of string, letters sort by their byte value,
-// and every other punctuation sorts after letters.
+// order assigns each byte its dpkg sort weight. A digit weighs 0, the same as
+// the end of the string, so that in a non-digit run compared against a shorter
+// side a digit sorts before any letter; '~' sorts before everything including
+// the end of string; letters sort by their byte value; and every other
+// punctuation sorts after letters. The digit case is reached only when the two
+// versions' runs are misaligned -- one side still in a non-digit run while the
+// other has reached a digit -- but omitting it inverts exactly those
+// comparisons (a digit would otherwise fall through to c+256 and sort after
+// letters instead of before them).
 func order(c byte) int {
 	switch {
+	case isDigit(c):
+		return 0
 	case isAlpha(c):
 		return int(c)
 	case c == '~':
