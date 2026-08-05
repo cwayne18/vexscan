@@ -266,7 +266,12 @@ func untar(blob, destAbs string, budget *int64) error {
 				continue
 			}
 		case tar.TypeLink:
-			if err := writeHardlink(destAbs, hdr.Linkname, dst); err != nil {
+			if err := writeHardlink(destAbs, hdr.Linkname, dst, budget); err != nil {
+				// The copy fallback charges bytes like a regular file, so a
+				// blown budget here is the same hard stop, not a skippable entry.
+				if errors.Is(err, errImageTooLarge) {
+					return err
+				}
 				continue
 			}
 		default:
@@ -371,8 +376,12 @@ func writeSymlink(linkname, dst string) error {
 
 // writeHardlink materializes a hardlink. It prefers a real link to avoid
 // duplicating large binaries, and falls back to a copy when the filesystem
-// refuses.
-func writeHardlink(root, linkname, dst string) error {
+// refuses. The real link duplicates no bytes so it is not charged; the copy
+// fallback duplicates the file's contents and is charged against budget exactly
+// like writeFile, so a layer full of hardlinks to one large file cannot exhaust
+// the disk when os.Link fails (cross-device dest, or the per-inode link-count
+// limit exceeded) and every entry falls back to a copy.
+func writeHardlink(root, linkname, dst string, budget *int64) error {
 	src, err := target.ResolveParent(root, linkname)
 	if err != nil {
 		return err
@@ -386,10 +395,10 @@ func writeHardlink(root, linkname, dst string) error {
 	if err := os.Link(src, dst); err == nil {
 		return nil
 	}
-	return copyFile(src, dst)
+	return copyFile(src, dst, budget)
 }
 
-func copyFile(src, dst string) error {
+func copyFile(src, dst string, budget *int64) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -404,6 +413,15 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	defer out.Close()
-	_, err = io.Copy(out, in)
-	return err
+	// Charge the copy against the image budget, one byte past the remainder so
+	// an overrun is detectable. See writeFile: never silently truncate.
+	n, err := io.Copy(out, io.LimitReader(in, *budget+1))
+	if err != nil {
+		return err
+	}
+	if n > *budget {
+		return errImageTooLarge
+	}
+	*budget -= n
+	return nil
 }

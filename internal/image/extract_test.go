@@ -414,6 +414,39 @@ func TestUntarBudgetIsCumulativeAcrossLayers(t *testing.T) {
 	}
 }
 
+func TestCopyFileIsChargedAgainstBudget(t *testing.T) {
+	// The hardlink copy fallback duplicates a file's bytes, so it must draw on
+	// the same image budget as writeFile. Otherwise a layer with one large file
+	// plus many hardlink entries to it could duplicate those bytes unaccounted
+	// whenever os.Link fails and every entry copies instead.
+	src := filepath.Join(t.TempDir(), "src")
+	if err := os.WriteFile(src, []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("overrun is reported", func(t *testing.T) {
+		budget := int64(4)
+		dst := filepath.Join(t.TempDir(), "dst")
+		if err := copyFile(src, dst, &budget); !errors.Is(err, errImageTooLarge) {
+			t.Fatalf("err = %v, want errImageTooLarge", err)
+		}
+	})
+
+	t.Run("within budget decrements it", func(t *testing.T) {
+		budget := int64(100)
+		dst := filepath.Join(t.TempDir(), "dst")
+		if err := copyFile(src, dst, &budget); err != nil {
+			t.Fatalf("copyFile: %v", err)
+		}
+		if budget != 90 {
+			t.Errorf("budget = %d, want 90 (100 - 10 bytes copied)", budget)
+		}
+		if got := mustReadFile(t, dst); got != "0123456789" {
+			t.Errorf("dst = %q, want the full source contents", got)
+		}
+	})
+}
+
 func TestReadConfig(t *testing.T) {
 	t.Run("parses entrypoint cmd and env", func(t *testing.T) {
 		blob := filepath.Join(t.TempDir(), "config")
