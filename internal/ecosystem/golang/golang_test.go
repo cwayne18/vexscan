@@ -205,6 +205,51 @@ func TestGroupAllKeepsDevelWhenTagNotUsable(t *testing.T) {
 	}
 }
 
+// A Go binary that merely happens to live in somebody else's image must not
+// take that image's version. python:3.12.1 is a real, clean semver tag, and
+// v3.12.1 is wildly higher than anything this module has released -- so OSV
+// would range it past every advisory and report the binary as clean. That is
+// the under-report direction, so the tag is refused and "(devel)" is kept.
+func TestGroupAllRefusesAnUnrelatedImageTag(t *testing.T) {
+	const root = "/tmp/extract"
+	const mod = "github.com/some/tool"
+	bins := []binscan.Binary{mainVersionBinary(root+"/bin/tool", mod, "(devel)")}
+
+	p := New(Options{Image: "python:3.12.1"})
+	comps := p.groupAll(root, bins)
+
+	c := mainComponent(comps, mod)
+	if c == nil {
+		t.Fatalf("main module %s missing from inventory", mod)
+	}
+	if c.Version != "(devel)" {
+		t.Errorf("version = %q, want (devel): python's version is not this module's", c.Version)
+	}
+	if note := c.Extra.(*state).inferredNote; note != "" {
+		t.Errorf("inferredNote = %q, want empty (nothing was inferred)", note)
+	}
+}
+
+// The note has to say why the tag was believed, not just that it was. An
+// inference a reader cannot audit is barely better than a silent one.
+func TestTheInferredNoteNamesItsAuthority(t *testing.T) {
+	const root = "/tmp/extract"
+	const mod = "github.com/k3s-io/k3s"
+	bins := []binscan.Binary{mainVersionBinary(root+"/bin/k3s", mod, "(devel)")}
+
+	p := New(Options{Image: "docker.io/rancher/k3s:v1.36.3-k3s1"})
+	c := mainComponent(p.groupAll(root, bins), mod)
+	if c == nil {
+		t.Fatalf("main module %s missing from inventory", mod)
+	}
+	note := c.Extra.(*state).inferredNote
+	for _, want := range []string{"version not in build info", "v1.36.3-k3s1", "build suffix"} {
+		if !strings.Contains(note, want) {
+			t.Errorf("inferredNote = %q, missing %q", note, want)
+		}
+	}
+}
+
 func TestGroupAllRealMainVersionIsUntouched(t *testing.T) {
 	const root = "/tmp/extract"
 	const mod = "example.com/app"

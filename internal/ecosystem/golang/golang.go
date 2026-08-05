@@ -131,31 +131,33 @@ type state struct {
 //
 // The fallback is the image tag, but it is applied with the single hard rule
 // this tool never bends: it must not silently under-report. So it fires only for
-// the main module here, only when build info gave nothing comparable, and only
-// when the tag normalizes to real semver (moduleVersionFromImageTag refuses
-// "latest", digests and date-stamps). When it cannot infer, it returns the
-// original version unchanged -- which keeps today's behavior of querying OSV
-// with "(devel)" and over-reporting, the safe direction, rather than guessing a
-// version that could hide a real vulnerability.
-func (p *Plugin) mainModuleVersion(rawVersion string) (version, note string) {
+// the main module here, only when build info gave nothing comparable, only when
+// the tag normalizes to real semver, and only when something connects that tag
+// to this module -- see tagAuthority, which is what stops a Go binary inside
+// python:3.12.1 being reported as version 3.12.1 of itself. When it cannot
+// infer, it returns the original version unchanged, which keeps the behavior of
+// querying OSV with "(devel)" and over-reporting: the safe direction, rather
+// than guessing a version that could hide a real vulnerability.
+func (p *Plugin) mainModuleVersion(modulePath, rawVersion string) (version, note string) {
 	if !isDevelVersion(rawVersion) {
 		return rawVersion, ""
 	}
 	if p.Image == "" {
 		return rawVersion, ""
 	}
-	inferred, tag, ok := moduleVersionFromImageTag(p.Image)
-	if !ok {
+	inferred, tag, why := moduleVersionFromImageTag(modulePath, p.Image)
+	if why == "" {
 		return rawVersion, ""
 	}
 	reported := rawVersion
 	if reported == "" {
 		reported = "(empty)"
 	}
-	// Lead with the fact that this version is not from the artifact. For a
-	// generic image a clean-semver tag is a genuine guess that could read too
-	// high, and this label is the only thing that keeps such a finding honest.
-	note = fmt.Sprintf("version not in build info (reported %s); inferred from image tag %q", reported, tag)
+	// Lead with the fact that this version is not from the artifact, and end
+	// with why the tag was believed. An inference a reader cannot audit is not
+	// much better than a silent one: naming the tag says where the number came
+	// from, and naming the authority says why it was allowed to.
+	note = fmt.Sprintf("version not in build info (reported %s); inferred from image tag %q -- %s", reported, tag, why)
 	return inferred, note
 }
 
@@ -222,7 +224,7 @@ func (p *Plugin) groupAll(root string, bins []binscan.Binary) []ecosystem.Compon
 			// comparable version from the image tag when it is safe to. Only
 			// the main module is treated this way -- dependencies carry real
 			// versions -- and a note is kept so the inference is visible.
-			ver, note := p.mainModuleVersion(m.Version)
+			ver, note := p.mainModuleVersion(m.Path, m.Version)
 			if ver != "" {
 				g.add(m.Path, ver, rel, bin.Path, main)
 				if note != "" {
@@ -259,7 +261,7 @@ func (p *Plugin) group(root string, bins []binscan.Binary, modules []string) []e
 				// give it the same image-tag fallback so a targeted scan is not
 				// stuck with a version OSV cannot match.
 				if mainModulePath(bin) == module {
-					version, note = p.mainModuleVersion(version)
+					version, note = p.mainModuleVersion(module, version)
 				}
 			}
 			if version == "" {
