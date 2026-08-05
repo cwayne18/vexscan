@@ -205,6 +205,7 @@ func untar(blob, destAbs string, budget *int64) error {
 	}
 
 	tr := tar.NewReader(r)
+	entries := 0
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -214,8 +215,16 @@ func untar(blob, destAbs string, budget *int64) error {
 			// A truncated or corrupt stream. Everything past this point is
 			// unreadable, and pretending it was clean padding would hide real
 			// entries, so surface it rather than break out silently.
-			return fmt.Errorf("read tar: %w", err)
+			//
+			// The entry count goes in the message because "this layer is
+			// corrupt" and "this layer is corrupt and we got nothing out of it"
+			// are different operational problems, and the number is the only
+			// thing that tells them apart. A failure at entry 4 of a base layer
+			// means the pull is broken; one at entry 40,000 of the last layer
+			// means a truncated push, and the operator's next move differs.
+			return fmt.Errorf("read tar after %d entries: %w", entries, err)
 		}
+		entries++
 
 		name := path.Clean("/" + hdr.Name)
 		if name == "/" {

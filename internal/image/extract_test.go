@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -378,8 +379,17 @@ func TestUntarTruncatedStreamIsReported(t *testing.T) {
 	}
 
 	budget := int64(maxImageBytes)
-	if err := untar(blob, t.TempDir(), &budget); err == nil {
+	err := untar(blob, t.TempDir(), &budget)
+	if err == nil {
 		t.Fatal("truncated tar was accepted silently; a real read error must be surfaced")
+	}
+	// How much was read before the break is the difference between "the pull is
+	// broken" and "the last layer was truncated", and it is the operator's next
+	// move, so the error has to carry it. Two, not one: the count is of headers
+	// successfully parsed, and the second entry's header is intact -- the cut is
+	// in its payload, so the reader only fails advancing past it.
+	if !strings.Contains(err.Error(), "after 2 entries") {
+		t.Errorf("err = %v, want the count of entries read before the failure", err)
 	}
 }
 
