@@ -381,6 +381,34 @@ func TestFixedInColumnAppearsOnlyWithData(t *testing.T) {
 	}
 }
 
+// An advisory that patched three maintained branches offers three upgrades,
+// and only one of them is the small one. The table still names a single target
+// -- a cell holding three versions is not scannable -- so --details is where
+// the alternatives have to be said, or the pick reads as the only option.
+func TestDetailsDiscloseTheFixesNotChosen(t *testing.T) {
+	f := analyze.Finding{
+		CVE: "CVE-1", ID: "CVE-1", Package: "github.com/hashicorp/vault",
+		Version: "1.5.4", Status: analyze.StatusLinked, Severity: "HIGH", Method: "m",
+		FixedVersion:  "1.5.9",
+		FixedVersions: []string{"1.5.9", "1.6.5", "1.7.2"},
+	}
+	out := report(t, true, f)
+	line := lineWith(t, out, "fixed in:")
+	if !strings.Contains(line, "1.5.9 (also fixed in 1.6.5, 1.7.2)") {
+		t.Errorf("the branches not chosen were not disclosed:\n%s", line)
+	}
+	// The table is unchanged: one target per row.
+	if row := lineWith(t, out, "CVE-1  "); strings.Contains(row, "1.6.5") {
+		t.Errorf("the alternatives leaked into the table:\n%s", row)
+	}
+
+	// The ordinary single-fix row says nothing extra.
+	f.FixedVersions = nil
+	if line := lineWith(t, report(t, true, f), "fixed in:"); strings.Contains(line, "also fixed in") {
+		t.Errorf("a lone fix was presented as a choice:\n%s", line)
+	}
+}
+
 // The summary reports how many affected rows are fixable and how many distinct
 // advisories they are, which is what the wall of rows hides.
 func TestRemediationSummary(t *testing.T) {
@@ -399,17 +427,20 @@ func TestRemediationSummary(t *testing.T) {
 	}
 }
 
-// With no fix data anywhere, the fix clause is dropped rather than printed as
-// "0 fixable".
-func TestRemediationSummarySkipsFixClauseWithNoData(t *testing.T) {
+// With no fix data anywhere the clause is still printed, because "nothing here
+// is fixable" is the measurement a reader most wants confirmed and a silent
+// summary reads as a missing one. It just never phrases it as "0 fixable".
+func TestRemediationSummaryStatesTheZeroWithoutSayingZeroFixable(t *testing.T) {
 	out := report(t, false,
 		analyze.Finding{CVE: "CVE-1", Package: "a", Status: analyze.StatusLinked, Severity: "HIGH"},
 		analyze.Finding{CVE: "CVE-2", Package: "b", Status: analyze.StatusLinked, Severity: "HIGH"},
 	)
-	for _, l := range strings.Split(out, "\n") {
-		if strings.Contains(l, "fixable") {
-			t.Errorf("fix clause printed with no fix data: %q", l)
-		}
+	line := lineWith(t, out, "affected:")
+	if !strings.Contains(line, "2 with no fix yet") {
+		t.Errorf("the measured zero went unsaid: %q", line)
+	}
+	if strings.Contains(line, "fixable") {
+		t.Errorf("phrased as a count of fixables: %q", line)
 	}
 }
 

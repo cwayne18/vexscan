@@ -217,7 +217,11 @@ func TestFindingJSONShape(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := `{"ecosystem":"golang","id":"CVE-2023-39325","package":"golang.org/x/net","location":"/usr/bin/app","purl":"pkg:golang/golang.org%2Fx%2Fnet@v0.17.0","binary":"/usr/bin/app","module":"golang.org/x/net","version":"v0.17.0","cve":"CVE-2023-39325","go_id":"GO-2023-2102","packages":["golang.org/x/net/http2"],"granularity":"package","stripped":false,"status":"linked","llm":{"exploitable":"likely","confidence":"high","rationale":"why"}}`
+		// fixed_version is present and empty. It is one of the two fields here
+		// with no omitempty, because "" is its "no patch has shipped" answer
+		// and dropping it would leave that indistinguishable from a scan run
+		// before the field existed.
+		want := `{"ecosystem":"golang","id":"CVE-2023-39325","package":"golang.org/x/net","location":"/usr/bin/app","purl":"pkg:golang/golang.org%2Fx%2Fnet@v0.17.0","binary":"/usr/bin/app","module":"golang.org/x/net","version":"v0.17.0","cve":"CVE-2023-39325","go_id":"GO-2023-2102","packages":["golang.org/x/net/http2"],"granularity":"package","fixed_version":"","stripped":false,"status":"linked","llm":{"exploitable":"likely","confidence":"high","rationale":"why"}}`
 		if string(b) != want {
 			t.Errorf("\n got: %s\nwant: %s", b, want)
 		}
@@ -234,7 +238,7 @@ func TestFindingJSONShape(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := `{"ecosystem":"os","id":"c","package":"m","module":"m","version":"v","cve":"c","status":"not_present"}`
+		want := `{"ecosystem":"os","id":"c","package":"m","module":"m","version":"v","cve":"c","fixed_version":"","status":"not_present"}`
 		if string(b) != want {
 			t.Errorf("\n got: %s\nwant: %s", b, want)
 		}
@@ -249,7 +253,7 @@ func TestFindingJSONShape(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := `{"id":"c","package":"m","module":"m","version":"v","cve":"c","status":"linked","evidence":[{"origin":"elf-needed-closure","detail":"reachable from /usr/bin/app"},{"origin":"elf-needed-closure","detail":"dlopen present","blocking":true}]}`
+		want := `{"id":"c","package":"m","module":"m","version":"v","cve":"c","fixed_version":"","status":"linked","evidence":[{"origin":"elf-needed-closure","detail":"reachable from /usr/bin/app"},{"origin":"elf-needed-closure","detail":"dlopen present","blocking":true}]}`
 		if string(b) != want {
 			t.Errorf("\n got: %s\nwant: %s", b, want)
 		}

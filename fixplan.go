@@ -38,15 +38,16 @@ func renderFixPlan(res *analyze.Result) string {
 	// by whether a fix exists so the actionable rows lead and the rest are
 	// still accounted for.
 	var fixable, noFix []analyze.Finding
-	undetermined := 0
+	var s fixSummary
 	for _, f := range res.Findings {
 		if !f.Affected() {
 			if f.Status != analyze.StatusNotPresent && f.Status != analyze.StatusNotInPath {
-				undetermined++
+				s.undetermined++
 			}
 			continue
 		}
 		if alreadyVexed(f) {
+			s.vexed++
 			continue
 		}
 		if f.FixedVersion != "" {
@@ -56,33 +57,13 @@ func renderFixPlan(res *analyze.Result) string {
 		}
 	}
 
-	total := len(fixable) + len(noFix)
-	if total == 0 {
-		b.WriteString("No affected findings to fix.\n")
-		if undetermined > 0 {
-			fmt.Fprintf(&b, "%d undetermined finding(s) are not shown here; run the default report to review them.\n", undetermined)
-		}
-		return b.String()
-	}
-
 	plan := groupUpgrades(fixable, dpkgPlugins(res))
-	cleared := uniqueAdvisories(fixable)
+	s.fixable, s.noFix = len(fixable), len(noFix)
+	s.upgrades, s.cleared = len(plan), uniqueAdvisories(fixable)
 
-	fmt.Fprintf(&b, "  %d of %d affected findings have a fix.\n", len(fixable), total)
-	switch {
-	case len(plan) > 0:
-		line := fmt.Sprintf("  upgrading %d %s clears %d %s",
-			len(plan), plural(len(plan), "package", "packages"),
-			cleared, plural(cleared, "advisory", "advisories"))
-		if len(noFix) > 0 {
-			line += fmt.Sprintf("; %d with no fix yet", len(noFix))
-		}
-		b.WriteString(line + ".\n")
-	case len(noFix) > 0:
-		fmt.Fprintf(&b, "  no published fixes yet for any of the %d affected findings.\n", len(noFix))
-	}
-	if undetermined > 0 {
-		fmt.Fprintf(&b, "  (%d undetermined finding(s) not shown; run the default report to review them.)\n", undetermined)
+	writeFixSummary(&b, s)
+	if s.fixable+s.noFix == 0 {
+		return b.String()
 	}
 	b.WriteString("\n")
 
@@ -93,10 +74,66 @@ func renderFixPlan(res *analyze.Result) string {
 		writeNoFix(&b, noFix)
 	}
 
+	// The footer is the fix plan's own, not renderText's. writeFooter repeats
+	// the main report's summary and its section index, which here would name
+	// AFFECTED and RULED OUT under a document whose only headings are UPGRADE
+	// and NO FIX YET -- an index of sections the reader cannot find. The
+	// caveats still repeat verbatim, because that promise is about the scan
+	// and not about the view.
 	if strings.Count(b.String(), "\n") > footerThreshold {
-		writeFooter(&b, res)
+		writeCaveats(&b, res)
+		writeFixSummary(&b, s)
 	}
 	return b.String()
+}
+
+// fixSummary is the fix plan's count of itself, computed once and printed at
+// both ends of the report so the header and the footer cannot disagree.
+type fixSummary struct {
+	fixable      int // affected findings with a published fix
+	noFix        int // affected findings without one
+	upgrades     int // rows in the UPGRADE table
+	cleared      int // distinct advisories those upgrades clear
+	vexed        int // affected, but already answered by a vendor
+	undetermined int // neither affected nor ruled out
+}
+
+// writeFixSummary prints what the plan covers and, as importantly, what it does
+// not.
+//
+// Every count names its unit. An earlier cut read "clears 86 advisories; 154
+// with no fix yet", where the first number is advisories and the second is
+// findings -- two units in one sentence, presented as if they were comparable.
+// The vexed and undetermined lines are here for the same reason the NO FIX YET
+// table is: a remediation view that silently omits rows is the one kind of
+// report whose shortness reads as good news.
+func writeFixSummary(b *strings.Builder, s fixSummary) {
+	total := s.fixable + s.noFix
+	switch {
+	case total == 0:
+		b.WriteString("  no affected findings to fix.\n")
+	default:
+		fmt.Fprintf(b, "  %d of %d affected findings have a fix.\n", s.fixable, total)
+	}
+	switch {
+	case s.upgrades > 0:
+		line := fmt.Sprintf("  upgrading %d %s clears %d %s",
+			s.upgrades, plural(s.upgrades, "package", "packages"),
+			s.cleared, plural(s.cleared, "advisory", "advisories"))
+		if s.noFix > 0 {
+			line += fmt.Sprintf("; %d %s no fix yet",
+				s.noFix, plural(s.noFix, "finding has", "findings have"))
+		}
+		b.WriteString(line + ".\n")
+	case s.noFix > 0:
+		fmt.Fprintf(b, "  no published fixes yet for any of the %d affected findings.\n", s.noFix)
+	}
+	if s.vexed > 0 {
+		fmt.Fprintf(b, "  (%d already answered by a vendor VEX statement, so not planned for.)\n", s.vexed)
+	}
+	if s.undetermined > 0 {
+		fmt.Fprintf(b, "  (%d undetermined finding(s) not shown; run the default report to review them.)\n", s.undetermined)
+	}
 }
 
 // upgrade is one action: move a package from its installed version to the

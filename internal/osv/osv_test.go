@@ -280,15 +280,23 @@ func TestFixedVersionIsExtractedForEveryEcosystem(t *testing.T) {
 	// Reachable under the id and under the CVE alias, since a finding may name
 	// either.
 	for _, key := range []string{"DEBIAN-CVE-2025-8941", "CVE-2025-8941"} {
-		if got := m[key].Fixed["pam"]; got != "1.5.2-6+deb12u2" {
+		if got := m[key].Fixed["pam"]; len(got) != 1 || got[0] != "1.5.2-6+deb12u2" {
 			t.Errorf("%s: Fixed[pam] = %q, want the patched version", key, got)
+		}
+		// The ecosystem travels with the fix, because it is what says which
+		// comparator can order several of them.
+		if got := m[key].Ecosystem; got != "Debian:12" {
+			t.Errorf("%s: Ecosystem = %q, want the queried ecosystem", key, got)
 		}
 	}
 }
 
-func TestLatestFixedEventWins(t *testing.T) {
-	// Two ranges patch the same package at different versions. The later one is
-	// the upgrade target for anything still on an older version.
+// Every fixed event is kept, in publication order. An earlier cut let the last
+// one win, which reads as "the newest is the upgrade target" -- true only when
+// the events are a progression. Where they are separate maintained branches the
+// newest is the biggest upgrade, not the right one, and the choice needs the
+// installed version this layer does not have.
+func TestEveryFixedEventIsKept(t *testing.T) {
 	const body = `{"vulns":[{"id":"X","affected":[{"package":{"name":"zlib1g","ecosystem":"Debian:12"},
 		"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1.2.11"},
 		{"introduced":"1.2.12"},{"fixed":"1.2.13"}]}]}]}]}`
@@ -304,8 +312,33 @@ func TestLatestFixedEventWins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := m["X"].Fixed["zlib1g"]; got != "1.2.13" {
-		t.Errorf("Fixed[zlib1g] = %q, want the latest fixed event 1.2.13", got)
+	got := m["X"].Fixed["zlib1g"]
+	if len(got) != 2 || got[0] != "1.2.11" || got[1] != "1.2.13" {
+		t.Errorf("Fixed[zlib1g] = %q, want both events in order", got)
+	}
+}
+
+// One package listed in two ranges with the same fix is one answer, not a
+// choice between two identical ones -- otherwise --details would disclose
+// "also fixed in 1.2.13" alongside a target of 1.2.13.
+func TestDuplicateFixedEventsCollapse(t *testing.T) {
+	const body = `{"vulns":[{"id":"X","affected":[{"package":{"name":"zlib1g","ecosystem":"Debian:12"},
+		"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1.2.13"}]},
+		{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1.2.13"}]}]}]}]}`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	c := NewClient()
+	c.BaseURL = srv.URL
+	m, err := c.Query(context.Background(), Ref{Ecosystem: "Debian:12", Name: "zlib1g"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m["X"].Fixed["zlib1g"]; len(got) != 1 {
+		t.Errorf("Fixed[zlib1g] = %q, want the repeat dropped", got)
 	}
 }
 

@@ -345,11 +345,16 @@ const highPercentile = 0.90
 //
 // Two facts, both of which a wall of 150 rows hides. How many of the rows are
 // the same advisory seen on more than one package -- CVE-2022-27943 is one
-// advisory and three rows -- so "154 findings" is not "154 things to chase.
+// advisory and three rows -- so "154 findings" is not "154 things to chase".
 // And how many have a published fix, because a report that cannot say which of
-// its findings are actionable leaves the reader to open all of them. The fix
-// clause is skipped when nothing has one, so an ecosystem that publishes no
-// fixed versions does not get a line reading "0 fixable".
+// its findings are actionable leaves the reader to open all of them.
+//
+// The fix clause is printed even when nothing is fixable, where it reads "154
+// with no fix yet". An earlier cut dropped it there to avoid a line saying "0
+// fixable", which was the wrong instinct: a fully-patched image is the case a
+// reader most wants confirmed, and silence in a summary reads as a missing
+// measurement rather than as a measured zero. The clause never phrases it as a
+// zero, so both facts get said.
 func writeRemediation(b *strings.Builder, res *analyze.Result) {
 	total, fixable := 0, 0
 	advisories := map[string]bool{}
@@ -377,12 +382,10 @@ func writeRemediation(b *strings.Builder, res *analyze.Result) {
 	} else {
 		parts = append(parts, fmt.Sprintf("%d with no fix yet", total))
 	}
-	if len(parts) == 0 {
-		return
-	}
 	fmt.Fprintf(b, "  %d affected: %s\n", total, strings.Join(parts, ", "))
 }
 
+// writePriority summarises the exploitation evidence, over exactly the rows the
 // severity spread above it counts.
 //
 // Same population on purpose. Two summary lines describing different subsets of
@@ -836,6 +839,24 @@ func displayFixed(f analyze.Finding) string {
 	return truncate(f.FixedVersion, 28)
 }
 
+// otherFixes is the published fixes the row is not recommending: the branches
+// the advisory also patched, minus the one FixedVersion names.
+//
+// It stays out of the table on purpose. The FIXED IN column is one target per
+// row because the table is a scan and a cell holding three versions is not
+// scannable; the alternatives belong in --details, where there is room to say
+// what they are. Empty in the ordinary case, where the advisory fixed one
+// branch and there is nothing withheld.
+func otherFixes(f analyze.Finding) []string {
+	var out []string
+	for _, v := range f.FixedVersions {
+		if v != f.FixedVersion {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
 // displayEPSS is the percentile as a percentage, which is the form a human can
 // reason about. The raw score is in --details and in the JSON: 0.03 reads as
 // "negligible" and is in fact the 87th percentile of every scored CVE there is,
@@ -1025,7 +1046,16 @@ func writeDetail(b *strings.Builder, f analyze.Finding) {
 		fmt.Fprintf(b, "  severity: %s\n", line)
 	}
 	if f.FixedVersion != "" {
-		fmt.Fprintf(b, "  fixed in: %s\n", f.FixedVersion)
+		// The versions not chosen are named on the same line, because an
+		// advisory that fixed three maintained branches offers three upgrades
+		// and only one of them is the small one. Showing the target alone would
+		// present a pick as the only option -- and where the ecosystem cannot be
+		// ordered the pick is the highest, which is the expensive option.
+		line := f.FixedVersion
+		if others := otherFixes(f); len(others) > 0 {
+			line += fmt.Sprintf(" (also fixed in %s)", strings.Join(others, ", "))
+		}
+		fmt.Fprintf(b, "  fixed in: %s\n", line)
 	}
 	writePriorityDetail(b, f)
 	if f.Component() != f.Package && f.Package != "" {

@@ -400,7 +400,27 @@ type Finding struct {
 	// affected ranges, joined on Package. Empty means no fix was published --
 	// a real and common state that the renderer shows as "no fix", not as a
 	// blank cell, because the two mean opposite things.
-	FixedVersion string `json:"fixed_version,omitempty"`
+	//
+	// Emitted even when empty, and that is the whole point. "" is the "no fix"
+	// answer, so omitting it would drop the fact a JSON consumer most needs --
+	// the flaw is acknowledged and no patch has shipped -- and leave it
+	// indistinguishable from a scan run before this field existed. The text
+	// report goes to the trouble of printing "no fix" rather than a blank for
+	// exactly this reason; omitempty would have undone that for every
+	// non-human reader. Same rule as known_exploited.
+	FixedVersion string `json:"fixed_version"`
+
+	// FixedVersions is every version the advisory published a fix in, set only
+	// when there is more than one and FixedVersion is therefore a choice rather
+	// than the only answer.
+	//
+	// A vendor maintaining several branches fixes them all: GO-2022-0623 names
+	// Vault 1.5.9, 1.6.5 and 1.7.2. Those are alternatives, and the one to
+	// install depends on the branch you are on, so the report shows the target
+	// it picked and the ones it did not. Omitted in the ordinary single-fix
+	// case, where it would only repeat FixedVersion -- unlike that field, an
+	// absence here has no second meaning to lose.
+	FixedVersions []string `json:"fixed_versions,omitempty"`
 
 	// Stripped is a pointer because it is a Go-only fact with three states: a
 	// binary with symbols, a binary without, and an OS package that is not a

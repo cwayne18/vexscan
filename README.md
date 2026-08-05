@@ -967,8 +967,38 @@ appears only when a section holds at least one row with a published fix, so a
 fully-patched image or an ecosystem that ships no fixed versions gets no column
 of blanks. `no fix` and an empty cell are kept distinct on purpose: `no fix` is
 data (the advisory is acknowledged and no patch has shipped), while a blank
-would read as missing data. The summary's `N fixable, M with no fix yet` clause
-is dropped entirely when nothing is fixable, so it never prints `0 fixable`.
+would read as missing data — and for the same reason `fixed_version` is one of
+the few JSON fields with no `omitempty`. The summary's `N fixable, M with no fix
+yet` clause is printed even when nothing is fixable, where it reads `154 with no
+fix yet`: a fully-patched image is the case a reader most wants confirmed, and
+silence in a summary reads as a missing measurement rather than a measured zero.
+It never phrases it as `0 fixable`.
+
+One advisory often publishes more than one fix. A vendor maintaining several
+branches patches them all: `GO-2022-0623` fixed Vault in `1.5.9`, `1.6.5` **and**
+`1.7.2`, and 22 of the 110 records for that module read the same way. Those are
+alternatives, not a progression, so the target depends on the branch you are on
+— for a `1.5.4` install the answer is `1.5.9`, and naming `1.7.2` would prescribe
+two major versions of unrelated change to close one advisory. vexscan keeps every
+published fix, picks the lowest one that is actually an upgrade, and shows the
+rest under `--details`:
+
+```
+  fixed in: 1.5.9 (also fixed in 1.6.5, 1.7.2)
+```
+
+Picking needs a version order, and where the tool has none it keeps the newest
+fix — the behaviour it had before it kept the list — and still discloses the
+alternatives, so an overshoot is visible rather than silent. The ordered
+ecosystems are Debian and Ubuntu (dpkg's own algorithm, `internal/debver`) and Go
+and npm (semver, which both databases publish by definition). PyPI is
+deliberately absent: PEP 440 sorts `1.0rc1` before `1.0` and semver sorts it
+after, so ordering Python fixes with semver would silently invert the pair. So
+are the RPM distros, because `rpmvercmp` is not dpkg's `verrevcmp` however
+similar they look. The asymmetry is the reason for the caution — too high a
+target is a bigger upgrade than necessary, while too low is a version that does
+not contain the fix, reported as the version that does. Distro records are
+single-branch, so on Debian and Ubuntu this almost never comes up.
 
 `--format fixplan` reorganizes the same affected findings by the action that
 clears them. Instead of one row per advisory, it is one row per **upgrade** —
@@ -980,7 +1010,7 @@ $ vexscan --image debian:bookworm-20230919 --all --ecosystem os --format fixplan
 vexscan report (image) for debian:bookworm-20230919
 
   138 of 292 affected findings have a fix.
-  upgrading 28 packages clears 86 advisories; 154 with no fix yet.
+  upgrading 28 packages clears 86 advisories; 154 findings have no fix yet.
 
 UPGRADE (28) - apply these to clear the fixable findings
 PACKAGE       CURRENT           FIXED IN            CLEARS  SEVERITY
@@ -1007,7 +1037,9 @@ revision), and findings stay split by their published fixed version rather than
 risk naming the wrong target as newest. It is a view, not a filter: every
 affected finding with no fix is still listed under `NO FIX YET`, because a
 remediation plan that quietly dropped the un-fixable rows would read as
-complete when it is not.
+complete when it is not. The rows it genuinely has nothing to plan for — the
+ones a vendor VEX statement already answered, and the undetermined ones — are
+counted in the summary rather than left out of the arithmetic.
 
 The rows are sorted worst-first — known-exploited, then severity, then the
 upgrades that clear the most — so the first line is the one to do first.
@@ -1358,6 +1390,11 @@ The JSON is `schema_version: 2`:
   "schema_version": 2,
   "target": "...", "mode": "image",          // or "rootfs", or "repo"
   "findings": [ /* flat, sorted — jq '.findings[]' still works */ ],
+  // every finding carries "fixed_version", always present: "" is the "no patch
+  // has shipped" answer, so omitting it would hide the thing worth acting on
+  // "fixed_versions" joins it only when the advisory patched several branches,
+  // listing all of them so a consumer can pick differently than the report did
+
   "ecosystems": [ { "id": "os", "components": 65, "error": "" } ],
   "unreadable": { "count": 3, "paths": ["/opt/vendor"] },  // omitted when nothing was skipped
   "vex_hubs": [ { "url": "...", "author": "...", "products": 1082, "matched": 3 } ],  // only with --vexhub

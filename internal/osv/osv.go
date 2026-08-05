@@ -20,6 +20,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -97,18 +98,33 @@ type Advisory struct {
 	// and always empty for non-Go ecosystems.
 	Pkgs []string
 
-	// Fixed maps an affected package name to the version its patch lands in,
-	// read from the record's affected ranges. It is the single most actionable
-	// field a report can show -- "this is what to upgrade to" -- and unlike
-	// Pkgs it is populated for every ecosystem.
+	// Fixed maps an affected package name to every version the record says its
+	// patch landed in, read from the affected ranges in the order OSV published
+	// them. It is the single most actionable field a report can show -- "this is
+	// what to upgrade to" -- and unlike Pkgs it is populated for every
+	// ecosystem.
 	//
 	// A package is absent when the record publishes no fixed version for it,
 	// which is a real and common state: the flaw is acknowledged and no patch
 	// has shipped. Callers must show that as "no fix" rather than as blank,
-	// because the two mean opposite things. When a package has several fixed
-	// events the latest is kept, which is the upgrade target for anything
-	// still on an older version.
-	Fixed map[string]string
+	// because the two mean opposite things.
+	//
+	// The list is a list because one affected entry routinely carries several
+	// fixed events, one per branch the vendor still maintains: 22 of the 110
+	// records for github.com/hashicorp/vault do, and GO-2022-0623 names 1.5.9,
+	// 1.6.5 and 1.7.2 together. Those are alternatives, not a progression, so
+	// there is no "latest" to collapse to without knowing what is installed --
+	// telling a 1.5.x user to jump to 1.7.2 is a major upgrade they did not need
+	// and did not ask for. Picking among them is the caller's job, because only
+	// the caller knows the installed version. Distro records are single-branch,
+	// so on Debian and Ubuntu the list is almost always one element.
+	Fixed map[string][]string
+
+	// Ecosystem is the OSV ecosystem this advisory was resolved for, copied from
+	// the query ref. It is what tells a caller which comparator orders the Fixed
+	// versions -- dpkg rules for "Debian:12", semver for "Go" -- and picking the
+	// wrong one is worse than declining to order them at all.
+	Ecosystem string
 
 	// CVSSVector is the CVSS:3.0 or CVSS:3.1 base vector the record publishes,
 	// empty when it publishes none or publishes only a version this tool does
@@ -620,6 +636,7 @@ func advisoryFor(ref Ref, v vuln) *Advisory {
 		ID:                v.ID,
 		Aliases:           v.Aliases,
 		Upstream:          v.Upstream,
+		Ecosystem:         ref.Ecosystem,
 		Summary:           v.Summary,
 		Details:           v.Details,
 		CVSSVector:        cvssVector(v),
@@ -631,9 +648,14 @@ func advisoryFor(ref Ref, v vuln) *Advisory {
 	// are read: an OSV record carries an entry per release, and zlib's
 	// DEBIAN-CVE-2023-45853 is fixed in Debian:13 but has no fix in Debian:12,
 	// so reading every entry would tell a bookworm user to upgrade to a
-	// version bookworm never shipped. The last fixed event in an in-scope
-	// entry wins: OSV lists events in ascending version order, so for a
-	// package patched more than once the latest is the upgrade target.
+	// version bookworm never shipped.
+	//
+	// Every in-scope fixed event is kept, in publication order. An earlier cut
+	// let the last one win, on the reading that OSV lists events ascending so
+	// the last is the newest -- true, but the newest of several maintained
+	// branches is not the upgrade target for someone on the oldest of them. See
+	// Advisory.Fixed. Duplicates are dropped so a package listed in two ranges
+	// with the same fix does not read as a choice.
 	for _, aff := range v.Affected {
 		name := aff.Package.Name
 		if name == "" || !affectedInScope(ref, aff.Package.Ecosystem) {
@@ -641,13 +663,13 @@ func advisoryFor(ref Ref, v vuln) *Advisory {
 		}
 		for _, rng := range aff.Ranges {
 			for _, ev := range rng.Events {
-				if ev.Fixed == "" {
+				if ev.Fixed == "" || slices.Contains(adv.Fixed[name], ev.Fixed) {
 					continue
 				}
 				if adv.Fixed == nil {
-					adv.Fixed = map[string]string{}
+					adv.Fixed = map[string][]string{}
 				}
-				adv.Fixed[name] = ev.Fixed
+				adv.Fixed[name] = append(adv.Fixed[name], ev.Fixed)
 			}
 		}
 	}

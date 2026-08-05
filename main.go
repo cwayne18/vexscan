@@ -516,7 +516,8 @@ Examples:
   vexscan --rootfs /mnt/rootfs --format inventory
 
   # A remediation-first view: which packages to upgrade, and to what
-  vexscan --image debian:12 --all --format fixplan
+  # (a current debian:12 is fully patched, so pick a tag that is behind)
+  vexscan --image debian:bookworm-20230919 --all --format fixplan
 
   # With an exploitability overlay, from a model running locally
   vexscan --image myorg/app:latest --all --llm \
