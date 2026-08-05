@@ -1,6 +1,22 @@
 package golang
 
-import "testing"
+import (
+	"testing"
+
+	"golang.org/x/mod/semver"
+)
+
+// TestSemverAcceptsK3sBuildMetadata guards the gate that the whole fix depends
+// on: the normalized k3s/rke2 form carries '+k3sN' build metadata, and if
+// semver.IsValid rejected it moduleVersionFromImageTag would refuse the very
+// case it exists to enable.
+func TestSemverAcceptsK3sBuildMetadata(t *testing.T) {
+	for _, v := range []string{"v1.36.3+k3s1", "v1.31.5+rke2r1"} {
+		if !semver.IsValid(v) {
+			t.Errorf("semver.IsValid(%q) = false; the image-tag fallback cannot work", v)
+		}
+	}
+}
 
 func TestIsDevelVersion(t *testing.T) {
 	devel := []string{"", "(devel)", "devel", " (devel) ", "v0.0.0", "0.0.0", "garbage"}

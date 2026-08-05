@@ -152,7 +152,10 @@ func (p *Plugin) mainModuleVersion(rawVersion string) (version, note string) {
 	if reported == "" {
 		reported = "(empty)"
 	}
-	note = fmt.Sprintf("version inferred from image tag %q; build info main-module version was %s", tag, reported)
+	// Lead with the fact that this version is not from the artifact. For a
+	// generic image a clean-semver tag is a genuine guess that could read too
+	// high, and this label is the only thing that keeps such a finding honest.
+	note = fmt.Sprintf("version not in build info (reported %s); inferred from image tag %q", reported, tag)
 	return inferred, note
 }
 

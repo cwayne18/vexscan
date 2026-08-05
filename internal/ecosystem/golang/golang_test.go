@@ -331,7 +331,7 @@ func TestAnalyzeImageAttachesInferredVersionEvidence(t *testing.T) {
 	}
 
 	const mod = "github.com/k3s-io/k3s"
-	const note = "version inferred from image tag \"v1.36.3-k3s1\"; build info main-module version was (devel)"
+	const note = "version not in build info (reported (devel)); inferred from image tag \"v1.36.3-k3s1\""
 	comp := ecosystem.Component{
 		Ecosystem: "Go",
 		Name:      mod,
