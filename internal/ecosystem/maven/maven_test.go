@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/cwayne18/vexscan/internal/ecosystem"
+	"github.com/cwayne18/vexscan/internal/langdb"
 	"github.com/cwayne18/vexscan/internal/osv"
 	"github.com/cwayne18/vexscan/internal/target"
 )
@@ -371,5 +372,65 @@ func TestPluginDoesNotApplyWithoutArchives(t *testing.T) {
 	}
 	if ok {
 		t.Error("DetectImage said maven applies to an image with no archives")
+	}
+}
+
+// sbomArtifact is one Maven component out of a bill of materials: coordinates
+// and nothing else. No archive, so no entry list to test a class against.
+func sbomArtifact(name, version string) langdb.Package {
+	return langdb.Package{Format: langdb.FormatMaven, Name: name, Version: version, Dir: "bom.json"}
+}
+
+// only returns the single finding, and fails if there is not exactly one.
+func only(t *testing.T, findings []ecosystem.Finding) ecosystem.Finding {
+	t.Helper()
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+	}
+	return findings[0]
+}
+
+// A handed-in inventory decides nothing. Both of this plugin's tests read the
+// archive's entry list, and a component out of a bill of materials has no
+// archive -- which the code below the metadata branch would report as an
+// archive that could not be listed, and call linked.
+func TestSBOMComponentsAreNeverLinked(t *testing.T) {
+	img := javaImage(t, nil) // the empty tree --sbom stands up
+	opts := Options{Packages: []langdb.Package{sbomArtifact("org.apache.logging.log4j:log4j-core", "2.14.1")}}
+
+	f := only(t, findingsFor(t, img, all, opts, anyAdvisory))
+	if f.Status != ecosystem.StatusUndetermined {
+		t.Errorf("status = %q, want %q", f.Status, ecosystem.StatusUndetermined)
+	}
+	if f.Method == MethodNoCode {
+		t.Errorf("method = %q: an SBOM lists no entries, so it cannot rule a class out", f.Method)
+	}
+	if f.Reason != ecosystem.ReasonNoReachabilityTest {
+		t.Errorf("reason = %q, want %q -- the report sizes its caveat by counting this",
+			f.Reason, ecosystem.ReasonNoReachabilityTest)
+	}
+	if len(f.Evidence) != 1 || f.Evidence[0].Origin != ecosystem.OriginSBOM {
+		t.Fatalf("evidence = %+v, want one row from %q", f.Evidence, ecosystem.OriginSBOM)
+	}
+	if !strings.Contains(f.Evidence[0].Detail, "bill of materials") {
+		t.Errorf("evidence does not say where it came from: %q", f.Evidence[0].Detail)
+	}
+}
+
+// An absent component says what was consulted, and it was not an image.
+func TestSBOMAbsenceDoesNotClaimAnImage(t *testing.T) {
+	img := javaImage(t, nil)
+	opts := Options{Packages: []langdb.Package{sbomArtifact("org.apache.logging.log4j:log4j-core", "2.14.1")}}
+	subjects := []ecosystem.Subject{{Ecosystem: "maven", Name: "com.fasterxml.jackson.core:jackson-databind", Raw: "maven:com.fasterxml.jackson.core:jackson-databind"}}
+
+	f := only(t, findingsFor(t, img, subjects, opts, anyAdvisory))
+	if f.Status != ecosystem.StatusNotPresent {
+		t.Errorf("status = %q, want %q", f.Status, ecosystem.StatusNotPresent)
+	}
+	if len(f.Evidence) != 1 {
+		t.Fatalf("evidence = %+v, want one row", f.Evidence)
+	}
+	if got := f.Evidence[0].Detail; !strings.Contains(got, "bill of materials") || strings.Contains(got, "image") {
+		t.Errorf("evidence talks about the wrong thing: %q", got)
 	}
 }

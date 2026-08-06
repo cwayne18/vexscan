@@ -19,6 +19,11 @@ const (
 // evaluator holds what every finding for one component needs.
 type evaluator struct {
 	st *state
+
+	// meta is set when the inventory was handed in rather than read out of a
+	// tree, so no archive was ever opened. Both of this plugin's tests read an
+	// entry list, and there is not one. See ecosystem.SBOMFinding.
+	meta bool
 }
 
 // evaluate decides one advisory against one artifact.
@@ -38,6 +43,9 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 	// a record for this id makes no difference to the fact that the image does
 	// not contain the artifact the id was asked about.
 	if e.st.absent {
+		if e.meta {
+			return ecosystem.SBOMAbsent(f, c.Name, MethodInventory)
+		}
 		return e.absent(f, c)
 	}
 
@@ -47,6 +55,14 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 		f.Status = ecosystem.StatusUndetermined
 		f.Reason = "no_osv_package_mapping"
 		return f
+	}
+
+	// Before the entry list, because there is not one. Everything below reads
+	// an empty list as an archive that could not be opened, which is a
+	// different fact and carries a different verdict: a component out of a
+	// bill of materials has no archive to open in the first place.
+	if e.meta {
+		return ecosystem.SBOMFinding(f, c.Name)
 	}
 
 	entries := e.st.entries()

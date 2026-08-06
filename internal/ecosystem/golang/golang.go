@@ -43,8 +43,25 @@ type Plugin struct {
 	// See mainModuleVersion for the safeguards that keep this from guessing.
 	Image string
 
+	// Modules is an inventory handed in from outside rather than read out of
+	// binaries -- today, the Go components of the bill of materials --sbom
+	// named.
+	//
+	// It is a type of this package's own rather than the langdb.Package the
+	// other language plugins take, because Go's inventory is not an installed
+	// tree: this plugin reads build info out of executables, and a module path
+	// and a version is the whole of what survives into a purl. See
+	// ecosystem.SBOMFinding for why nothing it produces can be concluded on.
+	Modules []Module
+
 	// Logf receives progress messages. Never nil after New.
 	Logf func(format string, args ...any)
+}
+
+// Module is one Go module an outside inventory named.
+type Module struct {
+	Path    string
+	Version string
 }
 
 // Options configure a Plugin.
@@ -52,6 +69,7 @@ type Options struct {
 	VersionOverride string
 	GoVersion       string
 	Image           string
+	Modules         []Module
 	Logf            func(format string, args ...any)
 }
 
@@ -65,6 +83,7 @@ func New(opts Options) *Plugin {
 		VersionOverride: opts.VersionOverride,
 		GoVersion:       opts.GoVersion,
 		Image:           opts.Image,
+		Modules:         opts.Modules,
 		Logf:            logf,
 	}
 }
@@ -112,6 +131,11 @@ func mainModulePath(bin binscan.Binary) string {
 // binary's build info parsed exactly once per run.
 type state struct {
 	binaries []binary
+
+	// meta marks a component that came from an inventory handed in rather than
+	// read out of a binary. There is no binary to open, so no symbol table to
+	// test and no govulncheck to run: the two things this plugin decides with.
+	meta bool
 
 	// inferredNote, when non-empty, records that this component's Version was
 	// derived from the image tag rather than read from build info. The analysis
@@ -176,12 +200,21 @@ func (p *Plugin) DetectImage(context.Context, *target.Image) (bool, error) { ret
 // historical per-binary output shape — one finding per (binary, advisory) —
 // without the orchestrator knowing anything about binaries.
 func (p *Plugin) InventoryImage(ctx context.Context, img *target.Image, subjects []ecosystem.Subject) ([]ecosystem.Component, error) {
+	modules, all := p.wantedModules(subjects)
+
+	// A handed-in inventory replaces the walk rather than adding to it. There
+	// are no binaries in the empty tree --sbom stands up, and walking it would
+	// only produce a second, empty answer to a question the document already
+	// answered.
+	if len(p.Modules) > 0 {
+		return p.supplied(modules, all), nil
+	}
+
 	root := img.FS.Root()
 	p.Logf("Scanning for Go binaries...")
 	bins := binscan.FindGoBinaries(img.FS)
 	p.Logf("Found %d Go binaries.", len(bins))
 
-	modules, all := p.wantedModules(subjects)
 	if all {
 		// Every module every binary links, read straight out of build info.
 		// An image with no Go code in it produces nothing, which is the honest
@@ -192,6 +225,46 @@ func (p *Plugin) InventoryImage(ctx context.Context, img *target.Image, subjects
 		return nil, nil // nothing was aimed at this plugin
 	}
 	return p.group(root, bins, modules), nil
+}
+
+// supplied inventories the modules an outside inventory named.
+//
+// It has no counterpart of groupAll and group both, because there is nothing
+// to interrogate: the document lists the modules outright, so the two questions
+// those functions answer differently -- which modules does this binary link,
+// and does this binary link that module -- are the same filter here.
+func (p *Plugin) supplied(modules []string, all bool) []ecosystem.Component {
+	if !all && len(modules) == 0 {
+		return nil // nothing was aimed at this plugin
+	}
+	want := make(map[string]bool, len(modules))
+	for _, m := range modules {
+		want[m] = true
+	}
+
+	out := make([]ecosystem.Component, 0, len(p.Modules))
+	seen := map[string]bool{}
+	for _, m := range p.Modules {
+		if m.Path == "" || (!all && !want[m.Path]) {
+			continue
+		}
+		// One component per module@version, the same key grouper uses: a
+		// document that lists the same module twice is one thing to say.
+		key := m.Path + "@" + m.Version
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, ecosystem.Component{
+			Ecosystem: "Go",
+			Name:      m.Path,
+			Version:   m.Version,
+			PURL:      purl(m.Path, m.Version),
+			Extra:     &state{meta: true},
+		})
+	}
+	p.Logf("Found %d Go modules to check (Go).", len(out))
+	return out
 }
 
 // groupAll inventories every module linked into every binary.
@@ -375,6 +448,29 @@ func (p *Plugin) AnalyzeImage(ctx context.Context, img *target.Image, items []ec
 			return nil, fmt.Errorf("golang: component %s was not produced by this plugin", item.Component.Key())
 		}
 		requests := item.Requests()
+
+		// No binary to open. Every test below reads one, and the loop over an
+		// empty list would report nothing at all for a module the document
+		// plainly names -- which reads as a module with no advisories against
+		// it rather than one nothing was able to examine.
+		if st.meta {
+			for _, req := range requests {
+				f := ecosystem.Finding{
+					Module:  item.Component.Name,
+					Version: item.Component.Version,
+					PURL:    item.Component.PURL,
+					CVE:     req.ID,
+				}
+				if req.Advisory == nil {
+					f.Status = ecosystem.StatusUndetermined
+					f.Reason = "no_osv_package_mapping"
+					out = append(out, f)
+					continue
+				}
+				out = append(out, ecosystem.SBOMFinding(f, item.Component.Name))
+			}
+			continue
+		}
 
 		for _, bin := range st.binaries {
 			syms, err := binscan.LoadSymbols(bin.path)

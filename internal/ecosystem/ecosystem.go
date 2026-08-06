@@ -10,6 +10,7 @@ package ecosystem
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"sort"
 	"strings"
@@ -35,6 +36,70 @@ const (
 	StatusReachable    Status = "reachable"           // genuinely called (source mode)
 	StatusUndetermined Status = "undetermined"        // no mapping could be resolved
 )
+
+// OriginSBOM is the evidence origin on every finding produced from a bill of
+// materials, and ReasonNoReachabilityTest is the reason those findings carry.
+//
+// They live here rather than in one plugin because five plugins write them and
+// the report reads them: --sbom hands an inventory to all of os, golang, npm,
+// pypi and maven at once, and the report's caveat sizes itself by counting the
+// reason. A per-plugin spelling would make that count silently short by
+// whichever plugins spelled it differently, and a caveat that undercounts the
+// rows it explains is worse than no caveat.
+//
+// OriginSBOM is an evidence origin rather than a method. It names the absence
+// of a test and not a test: a bill of materials says a package is there, which
+// no plugin here can turn into a statement about whether its code would run.
+const (
+	OriginSBOM               = "sbom-metadata"
+	ReasonNoReachabilityTest = "no_reachability_test_possible"
+)
+
+// SBOMFinding is the verdict for a component that a bill of materials named.
+//
+// There is only one, and it is undetermined. Every plugin here decides a status
+// in two steps -- does the package ship code, and would that code be loaded --
+// and a CycloneDX component takes both away at once: it lists no files, so
+// nothing rules the code out, and it comes with no tree, so nothing rules the
+// reachability out. Anything more confident than this would be a conclusion
+// drawn from an input that does not contain it.
+//
+// A function rather than the same literal written into each plugin, because the
+// report's caveat sizes itself by counting these rows and five spellings would
+// make the count short.
+func SBOMFinding(f Finding, name string) Finding {
+	f.Status = StatusUndetermined
+	f.Reason = ReasonNoReachabilityTest
+	f.Evidence = []Evidence{{
+		Origin: OriginSBOM,
+		Detail: fmt.Sprintf("%s was listed in a bill of materials, which gives its name and version "+
+			"and says nothing about what it installs or whether anything would load it", name),
+	}}
+	return f
+}
+
+// SBOMAbsent is the verdict for a package the user named that the bill of
+// materials does not list.
+//
+// Still not_present, and for the same reason a package database's silence is:
+// the document is put forward as the complete inventory of what is there, so a
+// name missing from it is a name that is not there. What changes is only the
+// prose -- every plugin's own wording says "in this image", and there is no
+// image, which in a report whose whole subject is what was and was not examined
+// is not a detail to leave wrong.
+//
+// method is the caller's own inventory method, because that is what was
+// consulted; only the document behind it differs.
+func SBOMAbsent(f Finding, name, method string) Finding {
+	f.Status = StatusNotPresent
+	f.Justification = "component_not_present"
+	f.Method = method
+	f.Evidence = []Evidence{{
+		Origin: method,
+		Detail: fmt.Sprintf("no component in the bill of materials is named %s", name),
+	}}
+	return f
+}
 
 // Plugin is what every ecosystem implements. Capability is expressed by also
 // implementing ImageAnalyzer, SourceAnalyzer, or both.

@@ -11,17 +11,35 @@ import (
 	"github.com/cwayne18/vexscan/internal/pkgdb"
 )
 
-// Supplied is one package read from somewhere other than an installed tree --
-// today, an rpm file that --rpm named.
+// Supplied is one package read from somewhere other than an installed tree: an
+// rpm file that --rpm named, or a component out of the bill of materials that
+// --sbom named.
 //
-// It pairs the ordinary Package every other reader produces with the header
-// metadata that only a package file carries. Meta is what makes a verdict
-// possible at all without a filesystem: no ELF in the header means no
-// vulnerable code will be installed, which is the same evidence pkgdb-no-code
-// rests on when it is read out of an image.
+// It pairs the ordinary Package every other reader produces with whatever the
+// source could say beyond the package's coordinates. For an rpm file that is
+// Meta, and Meta is what makes a verdict possible at all without a filesystem:
+// no ELF in the header means no vulnerable code will be installed, which is the
+// same evidence pkgdb-no-code rests on when it is read out of an image. For an
+// SBOM component it is nothing -- Meta.FilesKnown stays false and every verdict
+// is undetermined, which is the honest answer and not a degraded one.
 type Supplied struct {
 	Package pkgdb.Package
 	Meta    pkgdb.Meta
+
+	// Release is the distribution this package belongs to, when the source
+	// stated it outright.
+	//
+	// It exists because releaseFromHeader is a synthesis from VENDOR and
+	// DISTRIBUTION, and an SBOM has neither -- what it has is a purl carrying
+	// "distro=debian-12", which is the answer those two tags are being
+	// squeezed for. When it is set it is preferred, because a stated identity
+	// beats an inferred one.
+	Release osv.Release
+
+	// Origin names where this package was described, and becomes the evidence
+	// origin on every finding it produces. Empty means MethodRPMFile, which is
+	// what --rpm built this path for.
+	Origin string
 }
 
 // prepareSupplied fills in a prepared from Plugin.Packages instead of from a
@@ -40,6 +58,7 @@ func (p *Plugin) prepareSupplied(pr *prepared) error {
 		pr.meta[metaKey(s.Package)] = s.Meta
 	}
 	pr.dbs = SuppliedResults(p.Packages)
+	pr.metaOrigin = suppliedOrigin(p.Packages)
 
 	eco, distro, err := SuppliedIdentity(p.Packages, p.Ecosystem)
 	if err != nil {
@@ -53,6 +72,23 @@ func (p *Plugin) prepareSupplied(pr *prepared) error {
 	// under-reports, and every one of those findings is undetermined anyway.
 	pr.ecosystem, pr.release, pr.distro = eco, "", distro
 	return nil
+}
+
+// suppliedOrigin names where a handed-in inventory was described, for the
+// evidence origin on every finding it produces.
+//
+// One answer for the whole run rather than one per package, because a run has
+// one target: everything here came out of the same --rpm directory or the same
+// --sbom document. The first stated origin wins and an unstated one means
+// MethodRPMFile, which is the caller this path was built for and the only one
+// that predates the field.
+func suppliedOrigin(pkgs []Supplied) string {
+	for _, s := range pkgs {
+		if s.Origin != "" {
+			return s.Origin
+		}
+	}
+	return MethodRPMFile
 }
 
 // SuppliedResults groups a handed-in inventory the way a database reader
@@ -81,10 +117,10 @@ func SuppliedResults(pkgs []Supplied) []pkgdb.Result {
 // to, and which distro id its purls should carry.
 //
 // --osv-ecosystem always wins, and it is the documented way out of everything
-// below. Otherwise the identity comes from the VENDOR and DISTRIBUTION tags in
-// the headers, which is the only thing a package file knows about the system
-// it was built for -- there is no /etc/os-release to read, because there is no
-// system.
+// below. Otherwise a stated identity is preferred over an inferred one: an
+// SBOM component names its distribution outright in a purl qualifier, while a
+// package file has only VENDOR and DISTRIBUTION to be squeezed for it -- there
+// is no /etc/os-release to read, because there is no system.
 //
 // The packages must agree. A directory holding both Rocky and SUSE rpms has no
 // single right answer, and picking one would file half the inventory under an
@@ -95,7 +131,10 @@ func SuppliedIdentity(pkgs []Supplied, override string) (eco, distro string, err
 	var rels []osv.Release
 	var unknown []string
 	for _, s := range pkgs {
-		rel, ok := releaseFromHeader(s.Package, s.Meta)
+		rel, ok := s.Release, s.Release.ID != ""
+		if !ok {
+			rel, ok = releaseFromHeader(s.Package, s.Meta)
+		}
 		if !ok {
 			unknown = append(unknown, describe(s))
 			continue
@@ -117,19 +156,25 @@ func SuppliedIdentity(pkgs []Supplied, override string) (eco, distro string, err
 		return override, distro, nil
 	}
 
+	subject, missing := "these package files", "no usable VENDOR or DISTRIBUTION header in"
+	if suppliedOrigin(pkgs) == MethodSBOM {
+		subject, missing = "these SBOM components", "no distro qualifier on"
+	}
 	switch {
 	case len(rels) == 0:
-		return "", "", fmt.Errorf("these package files do not say which distribution they are for "+
-			"(no usable VENDOR or DISTRIBUTION header in %s), so their advisories cannot be looked up; "+
-			"name the ecosystem with --osv-ecosystem", strings.Join(trim(unknown, 3), ", "))
+		return "", "", fmt.Errorf("%s do not say which distribution they are for "+
+			"(%s %s), so their advisories cannot be looked up; "+
+			"name the ecosystem with --osv-ecosystem",
+			subject, missing, strings.Join(trim(unknown, 3), ", "))
 	case len(rels) > 1:
 		names := make([]string, 0, len(rels))
 		for _, r := range rels {
 			names = append(names, r.ID)
 		}
 		sort.Strings(names)
-		return "", "", fmt.Errorf("these package files are for more than one distribution (%s); "+
-			"scan them separately, or name one ecosystem with --osv-ecosystem", strings.Join(names, ", "))
+		return "", "", fmt.Errorf("%s are for more than one distribution (%s); "+
+			"scan them separately, or name one ecosystem with --osv-ecosystem",
+			subject, strings.Join(names, ", "))
 	}
 
 	eco, err = rels[0].Ecosystem()

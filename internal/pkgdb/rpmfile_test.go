@@ -312,8 +312,8 @@ func TestSourceRPMName(t *testing.T) {
 		{"nodashes.src.rpm", ""},
 	}
 	for _, tt := range tests {
-		if got := sourceRPMName(tt.in); got != tt.want {
-			t.Errorf("sourceRPMName(%q) = %q, want %q", tt.in, got, tt.want)
+		if got := SourceRPMName(tt.in); got != tt.want {
+			t.Errorf("SourceRPMName(%q) = %q, want %q", tt.in, got, tt.want)
 		}
 	}
 }

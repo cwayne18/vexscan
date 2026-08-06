@@ -17,6 +17,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/cwayne18/vexscan/internal/cvss"
 	"github.com/cwayne18/vexscan/internal/ecosystem"
@@ -27,10 +28,13 @@ import (
 	"github.com/cwayne18/vexscan/internal/ecosystem/pypi"
 	"github.com/cwayne18/vexscan/internal/elfgraph"
 	"github.com/cwayne18/vexscan/internal/image"
+	"github.com/cwayne18/vexscan/internal/langdb"
 	"github.com/cwayne18/vexscan/internal/llm"
 	"github.com/cwayne18/vexscan/internal/modgraph"
 	"github.com/cwayne18/vexscan/internal/osv"
+	"github.com/cwayne18/vexscan/internal/pkgdb"
 	"github.com/cwayne18/vexscan/internal/rpmsrc"
+	"github.com/cwayne18/vexscan/internal/sbomsrc"
 	"github.com/cwayne18/vexscan/internal/source"
 	"github.com/cwayne18/vexscan/internal/target"
 	"github.com/cwayne18/vexscan/internal/triage"
@@ -79,6 +83,30 @@ type Options struct {
 	// promises to do none: a scan must be able to fail on a bad flag before it
 	// fetches anything.
 	rpmPackages []ospkg.Supplied
+
+	// SBOM is a CycloneDX JSON bill of materials to scan (--sbom): a file, or
+	// "-" for standard input. Mutually exclusive with the other four targets.
+	//
+	// It is --rpm's weaker sibling. --rpm has no filesystem either, but an rpm
+	// header still lists the files the package would install, so it can rule a
+	// package out on the grounds that it ships no code. A CycloneDX component
+	// is a name, a version and a purl, so nothing here can be ruled out and
+	// every finding it produces is undetermined. See ecosystem.SBOMFinding.
+	SBOM string
+
+	// sbomOS and the four beside it are what SBOM resolved to, split by the
+	// plugin that will evaluate each component. Unexported and filled in by
+	// runTree, for the same reason rpmPackages is: reading a document is I/O.
+	//
+	// Split at this point rather than handed to the plugins as one list,
+	// because the split is already made -- sbomsrc tags every component with
+	// its plugin when it reads the purl type -- and because each plugin's
+	// inventory type is its own.
+	sbomOS    []ospkg.Supplied
+	sbomGo    []golang.Module
+	sbomNPM   []langdb.Package
+	sbomPyPI  []langdb.Package
+	sbomMaven []langdb.Package
 
 	// Packages are the raw --package selectors: purls, ecosystem:name
 	// shorthand, or bare names resolved against whatever inventory contains
@@ -214,6 +242,41 @@ type Result struct {
 	// Triage records what --triage contributed, and is nil when the flag was
 	// not used. Like VEXHubs it is not part of Failed(): see triageOverlay.
 	Triage *TriageResult `json:"triage,omitempty"`
+
+	// Descriptor records what produced this report. See its doc comment.
+	Descriptor *Descriptor `json:"descriptor,omitempty"`
+}
+
+// Descriptor records what produced a report.
+//
+// A report outlives the run that made it. Six months on, the two questions a
+// reader has are which build of the tool wrote it and how stale the advisories
+// behind it are, and neither is recoverable from the findings: an empty report
+// from a scan run this morning and an empty report from a build that predates
+// the CVE are the same bytes.
+//
+// The fields split by who can honestly answer them. AdvisorySource and
+// AdvisoriesAsOf are set here, because only the resolver knows which database
+// answered and when. Tool, Version, Started and Duration are left to the
+// caller: the timing of a command is the command's fact, and reading a wall
+// clock for it inside this package would make every test of it depend on one.
+type Descriptor struct {
+	Tool     string    `json:"tool,omitempty"`     // "vexscan"
+	Version  string    `json:"version,omitempty"`  // "v0.6.2"
+	Started  time.Time `json:"started,omitempty"`  // when the command began
+	Duration string    `json:"duration,omitempty"` // "12.4s"
+
+	// AdvisorySource is where the advisories were read from -- today always
+	// the live OSV API, and the one field an offline or cached database would
+	// change. It is recorded even when nothing was queried, because "which
+	// database said nothing" is the question an empty report raises.
+	AdvisorySource string `json:"advisory_source,omitempty"`
+
+	// AdvisoriesAsOf is when that source answered, which for a live API is how
+	// fresh the report is. Zero when the scan resolved no advisories at all --
+	// itself worth telling apart from a scan that resolved some and found
+	// nothing.
+	AdvisoriesAsOf time.Time `json:"advisories_as_of,omitempty"`
 }
 
 // Failed reports whether the findings are an incomplete account of the target
@@ -268,6 +331,7 @@ func (o Options) checkTarget() error {
 	}{
 		{"--image", o.Image != ""}, {"--rootfs", o.RootFS != ""},
 		{"--repo", o.Repo != ""}, {"--rpm", len(o.RPM) > 0},
+		{"--sbom", o.SBOM != ""},
 	} {
 		if t.set {
 			named = append(named, t.flag)
@@ -277,7 +341,7 @@ func (o Options) checkTarget() error {
 	case 1:
 		return nil
 	case 0:
-		return fmt.Errorf("one of --image, --rootfs, --repo or --rpm is required")
+		return fmt.Errorf("one of --image, --rootfs, --repo, --rpm or --sbom is required")
 	default:
 		return fmt.Errorf("set only one of %s", strings.Join(named, ", "))
 	}
@@ -290,13 +354,14 @@ func registryFor(opts Options) *ecosystem.Registry {
 			VersionOverride: opts.Version,
 			GoVersion:       opts.GoVersion,
 			Image:           opts.Image,
+			Modules:         opts.sbomGo,
 			Logf:            opts.Logf,
 		}),
 		ospkg.New(ospkg.Options{
 			Roots:              opts.Roots,
 			DlopenPolicy:       opts.DlopenPolicy,
 			Ecosystem:          opts.OSVEcosystem,
-			Packages:           opts.rpmPackages,
+			Packages:           append(opts.rpmPackages, opts.sbomOS...),
 			Mine:               opts.MineAdvisories && opts.UseLLM,
 			TrustImportAbsence: opts.TrustImportAbsence,
 			Logf:               opts.Logf,
@@ -304,6 +369,7 @@ func registryFor(opts Options) *ecosystem.Registry {
 		pypi.New(pypi.Options{
 			Roots:              opts.Roots,
 			DynamicPolicy:      opts.DynamicPolicy,
+			Packages:           opts.sbomPyPI,
 			Mine:               opts.MineAdvisories && opts.UseLLM,
 			TrustImportAbsence: opts.TrustImportAbsence,
 			Logf:               opts.Logf,
@@ -311,6 +377,7 @@ func registryFor(opts Options) *ecosystem.Registry {
 		npm.New(npm.Options{
 			Roots:              opts.Roots,
 			DynamicPolicy:      opts.DynamicPolicy,
+			Packages:           opts.sbomNPM,
 			Mine:               opts.MineAdvisories && opts.UseLLM,
 			TrustImportAbsence: opts.TrustImportAbsence,
 			Logf:               opts.Logf,
@@ -319,8 +386,9 @@ func registryFor(opts Options) *ecosystem.Registry {
 		// to root or to taint, so the only question this plugin answers below
 		// the artifact is whether the class is in the archive at all.
 		maven.New(maven.Options{
-			Mine: opts.MineAdvisories && opts.UseLLM,
-			Logf: opts.Logf,
+			Mine:     opts.MineAdvisories && opts.UseLLM,
+			Packages: opts.sbomMaven,
+			Logf:     opts.Logf,
 		}),
 	)
 }
@@ -385,6 +453,8 @@ func (o Options) mode() string {
 	switch {
 	case len(o.RPM) > 0:
 		return "rpm"
+	case o.SBOM != "":
+		return "sbom"
 	case o.RootFS != "":
 		return "rootfs"
 	default:
@@ -404,6 +474,9 @@ func (o Options) mode() string {
 func openTree(ctx context.Context, opts *Options) (*target.Image, func(), error) {
 	if len(opts.RPM) > 0 {
 		return openRPMTree(opts)
+	}
+	if opts.SBOM != "" {
+		return openSBOMTree(opts)
 	}
 
 	if opts.RootFS != "" {
@@ -456,6 +529,26 @@ func openRPMTree(opts *Options) (*target.Image, func(), error) {
 	}, func() { os.RemoveAll(dest) }, nil
 }
 
+// openSBOMTree gives --sbom the same empty tree openRPMTree gives --rpm, and
+// for the same reason: every plugin's walk, every Unreadable check and every
+// "does this apply" question runs over it unchanged and gets the truthful
+// answer, which is that there is no filesystem here.
+//
+// The two are not folded into one function taking a Ref, because the reason
+// they are separate is the thing worth keeping visible: they arrive at the same
+// empty directory from different amounts of evidence, and only one of them can
+// still rule a package out on it.
+func openSBOMTree(opts *Options) (*target.Image, func(), error) {
+	dest, err := os.MkdirTemp("", "vexscan-sbom-")
+	if err != nil {
+		return nil, nil, err
+	}
+	return &target.Image{
+		Ref: opts.SBOM,
+		FS:  target.NewDirFS(dest),
+	}, func() { os.RemoveAll(dest) }, nil
+}
+
 // openRootFS points a target at a directory the user already has.
 //
 // The result carries no ImageConfig, because a directory does not have one.
@@ -504,6 +597,10 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	// here rather than in Validate, which promises to touch neither disk nor
 	// network.
 	rpms, err := readRPMs(ctx, &opts)
+	if err != nil {
+		return nil, err
+	}
+	bom, err := readSBOM(&opts)
 	if err != nil {
 		return nil, err
 	}
@@ -574,6 +671,7 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 		}
 	}
 	result.Unreadable = noteRPMFailures(result.Unreadable, rpms, logf)
+	result.Unreadable = noteSBOMFailures(result.Unreadable, bom, logf)
 
 	severityOverlay(result.Findings, run.resolver.severities())
 	// Filtering here, rather than in the renderer, is what keeps every count
@@ -592,6 +690,7 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	result.Triage = triageOverlay(ctx, opts.Triage, result.Findings, sets.All, logf)
 	llmOverlay(ctx, llmClient, result.Findings, "", logf)
 	sortFindings(result.Findings)
+	result.Descriptor = run.resolver.descriptor()
 	return result, nil
 }
 
@@ -616,6 +715,80 @@ func readRPMs(ctx context.Context, opts *Options) (*rpmsrc.Result, error) {
 		opts.Logf("  not scanned: %s (%s)", n.Src, n.Reason)
 	}
 	return res, nil
+}
+
+// readSBOM resolves --sbom into the inventories the plugins will scan, and
+// records them on opts for registryFor to pick up.
+//
+// Like readRPMs it returns the whole result, because what was not scanned
+// matters as much as what was: a document with 400 components of which 120 were
+// dropped must not read as a scan of 400.
+func readSBOM(opts *Options) (*sbomsrc.Result, error) {
+	if opts.SBOM == "" {
+		return nil, nil
+	}
+	res, err := sbomsrc.Open(opts.SBOM, opts.Logf)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range res.Components {
+		switch c.PluginID {
+		case "os":
+			opts.sbomOS = append(opts.sbomOS, ospkg.Supplied{
+				// No Meta. Its zero value is a package whose file list is
+				// unknown, which is exactly true of a CycloneDX component and
+				// is what stops anything downstream claiming pkgdb-no-code.
+				Package: pkgdb.Package{
+					Format:  c.Format,
+					Name:    c.Name,
+					Version: c.Version,
+					Arch:    c.Arch,
+					Epoch:   c.Epoch,
+					Source:  c.Source,
+					DB:      opts.SBOM,
+				},
+				Release: c.Release,
+				Origin:  ospkg.MethodSBOM,
+			})
+		case "golang":
+			opts.sbomGo = append(opts.sbomGo, golang.Module{Path: c.Name, Version: c.Version})
+		case "npm":
+			opts.sbomNPM = append(opts.sbomNPM, langdbPackage(langdb.FormatNPM, c, opts.SBOM))
+		case "pypi":
+			opts.sbomPyPI = append(opts.sbomPyPI, langdbPackage(langdb.FormatPyPI, c, opts.SBOM))
+		case "maven":
+			opts.sbomMaven = append(opts.sbomMaven, langdbPackage(langdb.FormatMaven, c, opts.SBOM))
+		default:
+			// sbomsrc only ever tags a component with a plugin this switch
+			// knows. Reaching here means the two lists have drifted apart, and
+			// a component silently dropped in that case is the failure mode
+			// this whole path exists to avoid.
+			res.Skipped = append(res.Skipped, sbomsrc.Note{
+				Ref:    c.Ref,
+				Reason: fmt.Sprintf("no plugin for %q", c.PluginID),
+			})
+		}
+	}
+	for _, n := range res.Skipped {
+		opts.Logf("  not scanned: %s (%s)", n.Ref, n.Reason)
+	}
+	return res, nil
+}
+
+// langdbPackage is one SBOM component as a language plugin's inventory entry.
+//
+// Everything a walk would have filled in is left unset, and the two Known flags
+// stay false with it: this is a package nobody listed the files of, which is a
+// different thing from a package with no files. Dir carries what --sbom named
+// so the report's Locations column says where the claim came from.
+func langdbPackage(format langdb.Format, c sbomsrc.Component, spec string) langdb.Package {
+	return langdb.Package{
+		Format:   format,
+		Name:     c.Name,
+		AltNames: c.AltNames,
+		Version:  c.Version,
+		Dir:      spec,
+	}
 }
 
 // noteRPMFailures records the package files that would not parse.
@@ -643,6 +816,30 @@ func noteRPMFailures(u *target.Unreadable, rpms *rpmsrc.Result, logf func(string
 		u.Count++
 		if len(u.Paths) < maxRPMFailureSample {
 			u.Paths = append(u.Paths, fmt.Sprintf("%s: %s", n.Src, n.Reason))
+		}
+	}
+	return u
+}
+
+// noteSBOMFailures records the components whose package URL would not parse.
+//
+// The same accounting noteRPMFailures does, and for the same reason: a
+// component that could not be read must never be indistinguishable from one
+// with nothing wrong in it. Skipped entries are not folded in -- a structural
+// row naming no package is not a loss -- and they are logged by readSBOM.
+func noteSBOMFailures(u *target.Unreadable, bom *sbomsrc.Result, logf func(string, ...any)) *target.Unreadable {
+	if bom == nil || len(bom.Failed) == 0 {
+		return u
+	}
+	if u == nil {
+		u = &target.Unreadable{}
+	}
+	logf("  ! %d SBOM component(s) could not be read; the scan does not account for them", len(bom.Failed))
+	for _, n := range bom.Failed {
+		logf("    ! %s: %s", n.Ref, n.Reason)
+		u.Count++
+		if len(u.Paths) < maxRPMFailureSample {
+			u.Paths = append(u.Paths, fmt.Sprintf("%s: %s", n.Ref, n.Reason))
 		}
 	}
 	return u
@@ -801,6 +998,7 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 	result.Triage = triageOverlay(ctx, opts.Triage, result.Findings, sets.All, logf)
 	llmOverlay(ctx, llmClient, result.Findings, "source tree", logf)
 	sortFindings(result.Findings)
+	result.Descriptor = run.resolver.descriptor()
 	return result, nil
 }
 
@@ -858,6 +1056,13 @@ func (r *sourceRun) analyze(ctx context.Context, a ecosystem.InventorySourceAnal
 type advisoryResolver struct {
 	client *osv.Client
 	cache  map[string]map[string]*osv.Advisory // component key -> advisories
+
+	// asOf is when the advisory database first answered. It is a read of the
+	// wall clock, which nothing else in this package does, and it is here
+	// rather than in the caller for the reason Descriptor gives: the freshness
+	// of a report is a property of the data, not of the command, and only this
+	// type sees the moment the data arrived.
+	asOf time.Time
 }
 
 func newResolver() *advisoryResolver {
@@ -865,6 +1070,25 @@ func newResolver() *advisoryResolver {
 		client: osv.NewClient(),
 		cache:  map[string]map[string]*osv.Advisory{},
 	}
+}
+
+// answered records that the advisory source has now spoken. Only the first
+// answer is kept: it is the earliest point the data can be stale from, which
+// is the conservative end of a freshness claim.
+func (r *advisoryResolver) answered() {
+	if r.asOf.IsZero() {
+		r.asOf = time.Now().UTC()
+	}
+}
+
+// descriptor is the provenance half of Result.Descriptor -- the half only the
+// resolver can fill in.
+func (r *advisoryResolver) descriptor() *Descriptor {
+	base := r.client.BaseURL
+	if base == "" {
+		base = osv.DefaultBaseURL
+	}
+	return &Descriptor{AdvisorySource: base, AdvisoriesAsOf: r.asOf}
 }
 
 // workItems pairs each component with its advisories and the requested ids.
@@ -935,6 +1159,7 @@ func (r *advisoryResolver) prefetch(ctx context.Context, components []ecosystem.
 		logf("  ! OSV batch query failed (%v); falling back to one query per component", err)
 		return
 	}
+	r.answered()
 	for _, s := range spans {
 		r.cache[s.key] = merge(got[s.start:s.end])
 	}
@@ -967,6 +1192,7 @@ func (r *advisoryResolver) advisories(ctx context.Context, c ecosystem.Component
 			logf("  ! OSV query failed for %s: %v", ref, err)
 			continue
 		}
+		r.answered()
 		results = append(results, got)
 	}
 	adv = merge(results)

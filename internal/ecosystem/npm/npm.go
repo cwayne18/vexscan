@@ -52,6 +52,16 @@ type Plugin struct {
 	// inside the same package, where nothing records it.
 	TrustImportAbsence bool
 
+	// Packages is an inventory handed in from outside rather than read out of a
+	// tree -- today, the npm components of the bill of materials --sbom named.
+	//
+	// It is this plugin's counterpart of ospkg.Plugin.Packages, and it is the
+	// weaker one. An rpm header lists the files the package would install, so
+	// that path can still rule out a package that ships no code; a CycloneDX
+	// component lists nothing, so every finding it produces is undetermined.
+	// See ecosystem.SBOMFinding.
+	Packages []langdb.Package
+
 	// Logf receives progress messages. Never nil after New.
 	Logf func(format string, args ...any)
 
@@ -65,6 +75,7 @@ type Options struct {
 	DynamicPolicy      modgraph.DynamicPolicy
 	Mine               bool
 	TrustImportAbsence bool
+	Packages           []langdb.Package
 	Logf               func(format string, args ...any)
 }
 
@@ -79,6 +90,7 @@ func New(opts Options) *Plugin {
 		DynamicPolicy:      opts.DynamicPolicy,
 		Mine:               opts.Mine,
 		TrustImportAbsence: opts.TrustImportAbsence,
+		Packages:           opts.Packages,
 		Logf:               logf,
 	}
 }
@@ -178,6 +190,11 @@ type prepared struct {
 	img *target.Image
 	res langdb.Result
 
+	// metadataOnly means the inventory was handed in rather than read out of a
+	// tree, so there is no code to require and no graph to build. Every verdict
+	// that needs either is gated on this being false.
+	metadataOnly bool
+
 	once     sync.Once
 	graph    *modgraph.Graph
 	graphErr error
@@ -194,6 +211,19 @@ func (p *Plugin) prepare(img *target.Image) (*prepared, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.prep != nil && p.prep.img == img {
+		return p.prep, nil
+	}
+
+	// A handed-in inventory replaces the walk rather than adding to it. There
+	// is no tree behind --sbom to find node_modules in, and walking the empty
+	// one it stands up would only produce a second, empty answer to a question
+	// the document already answered.
+	if len(p.Packages) > 0 {
+		p.prep = &prepared{
+			img:          img,
+			metadataOnly: true,
+			res:          langdb.Result{Format: langdb.FormatNPM, Packages: p.Packages},
+		}
 		return p.prep, nil
 	}
 
@@ -220,7 +250,7 @@ func (p *Plugin) DetectImage(_ context.Context, img *target.Image) (bool, error)
 	if err != nil {
 		return false, err
 	}
-	return len(pr.res.Roots) > 0, nil
+	return pr.metadataOnly || len(pr.res.Roots) > 0, nil
 }
 
 // InventoryImage implements ecosystem.ImageAnalyzer.
@@ -389,7 +419,7 @@ func (p *Plugin) AnalyzeImage(_ context.Context, img *target.Image, items []ecos
 		if !ok {
 			return nil, fmt.Errorf("npm: component %s was not produced by this plugin", item.Component.Key())
 		}
-		if !st.absent {
+		if !st.absent && !pr.metadataOnly {
 			if g, err = p.graph(pr); err != nil {
 				return nil, err
 			}
@@ -404,7 +434,7 @@ func (p *Plugin) AnalyzeImage(_ context.Context, img *target.Image, items []ecos
 	var out []ecosystem.Finding
 	for _, item := range items {
 		st := item.Component.Extra.(*state)
-		ev := evaluator{st: st, g: g, node: nd, trust: p.TrustImportAbsence}
+		ev := evaluator{st: st, g: g, node: nd, meta: pr.metadataOnly, trust: p.TrustImportAbsence}
 		for _, req := range item.Requests() {
 			out = append(out, ev.evaluate(item.Component, req))
 		}

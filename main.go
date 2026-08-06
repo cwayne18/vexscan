@@ -12,8 +12,10 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/cwayne18/vexscan/internal/analyze"
+	"github.com/cwayne18/vexscan/internal/buildinfo"
 	"github.com/cwayne18/vexscan/internal/cvss"
 	"github.com/cwayne18/vexscan/internal/elfgraph"
 	"github.com/cwayne18/vexscan/internal/gist"
@@ -22,6 +24,10 @@ import (
 )
 
 func main() {
+	// --version carries two meanings for one more release; see version.go.
+	var versionArg versionFlag
+	flag.Var(&versionArg, "version", "print vexscan's version and exit (deprecated: --version=VERSION still overrides a module version; use --module-version)")
+
 	var packages, ecosystems, roots, vexhubs, severities, rpms stringList
 	flag.Var(&packages, "package", "package to check: a purl, an ecosystem:name shorthand (deb:openssl, golang:golang.org/x/net), or a bare name resolved against the inventory; repeatable")
 	flag.Var(&ecosystems, "ecosystem", "restrict the scan to these ecosystems (golang, os, pypi, npm, maven, or a distro family like debian); repeatable, default all")
@@ -34,16 +40,19 @@ func main() {
 		"(UNKNOWN means no rating was published, and must be named to be shown -- "+
 		"every --repo finding is UNKNOWN, because govulncheck's OpenVEX carries no severity)")
 	var (
-		image      = flag.String("image", "", "container image reference to inspect (mutually exclusive with --rootfs and --repo)")
-		rootfs     = flag.String("rootfs", "", "filesystem tree already on disk to inspect -- an unpacked image, a mounted volume, a machine's own / (mutually exclusive with --image and --repo)")
-		repo       = flag.String("repo", "", "git source repo to analyze via govulncheck source mode, e.g. github.com/rancher/rancher (mutually exclusive with --image and --rootfs)")
+		image  = flag.String("image", "", "container image reference to inspect (mutually exclusive with --rootfs and --repo)")
+		rootfs = flag.String("rootfs", "", "filesystem tree already on disk to inspect -- an unpacked image, a mounted volume, a machine's own / (mutually exclusive with --image and --repo)")
+		repo   = flag.String("repo", "", "git source repo to analyze via govulncheck source mode, e.g. github.com/rancher/rancher (mutually exclusive with --image and --rootfs)")
+		sbom   = flag.String("sbom", "", "CycloneDX JSON bill of materials to scan -- a path, or '-' for stdin "+
+			"(mutually exclusive with the other targets; a component names a package and nothing else, so every finding is undetermined)")
 		ref        = flag.String("ref", "", "branch, tag, or commit to check out for --repo (default: repo default branch)")
 		repoPath   = flag.String("repo-path", ".", "module subdirectory within --repo to scan")
 		module     = flag.String("module", "", "deprecated alias for --package golang:MODULE")
 		all        = flag.Bool("all", false, "check everything each ecosystem can inventory, instead of named packages")
 		cvesFlag   = flag.String("cves", "", "comma-separated CVE/GHSA/GO ids to check; alone, they are resolved against the whole target")
 		cvesFile   = flag.String("cves-file", "", "path to a file with one CVE/GHSA/GO id per line (merged with --cves)")
-		version    = flag.String("version", "", "override the module version (image mode only; default: read from each binary's build info)")
+		modVersion = flag.String("module-version", "", "override the module version (image mode only; default: read from each binary's build info)")
+		showVer    = flag.Bool("V", false, "print vexscan's version and exit")
 		goVersion  = flag.String("go-version", "", "pin the Go toolchain for --repo analysis, e.g. 1.24.0 (useful with --package golang:stdlib)")
 		goos       = flag.String("os", "linux", "image OS variant to pull (image mode)")
 		arch       = flag.String("arch", "amd64", "image architecture variant to pull (image mode)")
@@ -62,22 +71,49 @@ func main() {
 		out        = flag.String("out", "", "write output to this file instead of stdout")
 		gistFlag   = flag.Bool("gist", false, "also upload the output to a public GitHub gist and print its URL (needs GITHUB_TOKEN/GH_TOKEN with gist scope)")
 		gistSecret = flag.Bool("gist-secret", false, "with --gist, create a secret (unlisted) gist instead of a public one")
-		quiet      = flag.Bool("quiet", false, "suppress progress logging on stderr")
-		noPager    = flag.Bool("no-pager", false, "never page the output, even when stdout is a terminal (VEXSCAN_PAGER picks the pager; setting it empty turns paging off for good)")
+		failOnSev  = flag.String("fail-on", "", "exit 3 if any counted finding is at or above this severity: "+
+			strings.Join(cvss.Labels, ", ")+", or 'any'. Off by default; see --fail-on-status for what counts")
+		failOnStat = flag.String("fail-on-status", "", "which findings --fail-on weighs: a comma-separated list of "+
+			"affected, undetermined, vexed, cleared, or 'all' (default affected -- vulnerable code present and loadable, "+
+			"which is the gate no version-matching scanner can offer)")
+		colorMode = flag.String("color", "auto", "colourise the text report: auto, always, never. "+
+			"auto colours only a terminal, and never a file (--out), a gist (--gist), JSON output, or a run with NO_COLOR set")
+		quiet   = flag.Bool("quiet", false, "suppress progress logging on stderr")
+		noPager = flag.Bool("no-pager", false, "never page the output, even when stdout is a terminal (VEXSCAN_PAGER picks the pager; setting it empty turns paging off for good)")
 	)
 	flag.Usage = usage
 	flag.Parse()
+
+	// Answered before anything else, so it works with no target, no network
+	// and no other flag -- which is the state of whoever is asking.
+	if versionArg.print || *showVer {
+		if rest := flag.Args(); len(rest) == 1 && looksLikeVersion(rest[0]) {
+			fail("--version now prints vexscan's own version; use --module-version=%s to override a module version", rest[0])
+		}
+		fmt.Println(buildinfo.String())
+		return
+	}
+	checkPositional(&versionArg)
+
+	// The old spelling still works, and still says where it went.
+	if versionArg.override != "" {
+		if *modVersion != "" && *modVersion != versionArg.override {
+			fail("--version=%s and --module-version=%s disagree; they are the same setting", versionArg.override, *modVersion)
+		}
+		fmt.Fprintf(os.Stderr, "warning: --version as a module override is deprecated; use --module-version=%s\n", versionArg.override)
+		*modVersion = versionArg.override
+	}
 
 	// --format inventory answers "what is installed in this image", which
 	// needs no subject and no advisory lookup.
 	inventoryMode := *format == "inventory"
 
-	named := countNamed(*image, *rootfs, *repo)
+	named := countNamed(*image, *rootfs, *repo, *sbom)
 	if len(rpms) > 0 {
 		named++
 	}
 	if named != 1 {
-		fail("set exactly one of --image, --rootfs, --repo or --rpm")
+		fail("set exactly one of --image, --rootfs, --repo, --rpm or --sbom")
 	}
 	switch *format {
 	case "text", "json", "fixplan", "inventory":
@@ -98,6 +134,22 @@ func main() {
 		keep = append(keep, label)
 	}
 	cves := parseCVEs(*cvesFlag, *cvesFile)
+	// Parsed before the pull for the same reason --severity is: a gate that
+	// can never fire is worse than one that errors.
+	gate, err := parseFailOn(*failOnSev, *failOnStat)
+	if err != nil {
+		fail("%v", err)
+	}
+	if gate.on && inventoryMode {
+		fail("--fail-on has nothing to gate on with --format inventory, which resolves no advisories")
+	}
+	// Validated up front too: a misspelled --color is a setting the user
+	// believes they changed, and finding out after a five-minute image pull is
+	// finding out too late.
+	colors, err := parseColor(*colorMode)
+	if err != nil {
+		fail("%v", err)
+	}
 
 	if !inventoryMode {
 		// Every other combination has a meaning; this one has none, and the
@@ -138,6 +190,7 @@ func main() {
 			RootFS:       *rootfs,
 			Repo:         *repo,
 			RPM:          rpms,
+			SBOM:         *sbom,
 			OS:           *goos,
 			Arch:         *arch,
 			OSVEcosystem: *osvEco,
@@ -151,6 +204,7 @@ func main() {
 		RootFS:             *rootfs,
 		Repo:               *repo,
 		RPM:                rpms,
+		SBOM:               *sbom,
 		Ref:                *ref,
 		Path:               *repoPath,
 		Packages:           packages,
@@ -159,7 +213,7 @@ func main() {
 		Ecosystems:         ecosystems,
 		Severities:         keep,
 		CVEs:               cves,
-		Version:            *version,
+		Version:            *modVersion,
 		OS:                 *goos,
 		Arch:               *arch,
 		OSVEcosystem:       *osvEco,
@@ -183,11 +237,20 @@ func main() {
 		fail("%v", err)
 	}
 
+	// The command owns the clock; see analyze.Descriptor for why the package
+	// does not read one.
+	started := time.Now().UTC()
 	res, err := analyze.Run(ctx, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+	stampDescriptor(res, started, time.Since(started))
+
+	// Resolved here and not in the writers, because the escapes have to be in
+	// the string before emit decides where it goes -- and where it goes is half
+	// of what decides whether they belong in it.
+	pal := colors.palette(destination{file: *out != "", gist: *gistFlag, json: *format == "json"})
 
 	var rendered string
 	switch *format {
@@ -199,9 +262,9 @@ func main() {
 		}
 		rendered = string(b) + "\n"
 	case "fixplan":
-		rendered = renderFixPlan(res)
+		rendered = renderFixPlan(res, renderOpts{pal: pal})
 	default: // --format was validated up front; inventory returned earlier
-		rendered = renderText(res, *details)
+		rendered = renderText(res, renderOpts{details: *details, pal: pal})
 	}
 
 	emit(rendered, *out, *noPager, logf)
@@ -230,7 +293,30 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: %d path(s) in the target could not be read: %s\n",
 				u.Count, strings.Join(u.Paths, ", "))
 		}
+		// The scan losing an ecosystem outranks the gate, and the gate is not
+		// even consulted: a finding count from a partial scan is not a number
+		// worth deciding a build on, and a clean gate over it would be the
+		// scan's own hole reported as a pass.
+		if gate.on {
+			fmt.Fprintln(os.Stderr, "error: --fail-on was not evaluated, because the scan did not complete")
+		}
 		os.Exit(1)
+	}
+
+	if gate.on {
+		g := gate.evaluate(res)
+		if g.unweighable > 0 {
+			// Not gated on --quiet. A gate that passed because it could not
+			// read a number has to say so whatever the logging setting, or the
+			// silence is indistinguishable from a clean result.
+			fmt.Fprintf(os.Stderr,
+				"note: %d counted finding(s) have no published severity and could not be weighed against %s.\n"+
+					"      Use --fail-on any to gate on their presence.\n", g.unweighable, gate.label)
+		}
+		if g.tripped > 0 {
+			fmt.Fprintln(os.Stderr, gate.describe(g))
+			os.Exit(exitGate)
+		}
 	}
 }
 
@@ -259,6 +345,22 @@ func emit(rendered, out string, noPager bool, logf func(string, ...any)) {
 		return
 	}
 	fmt.Print(rendered)
+}
+
+// stampDescriptor fills in the half of the report's provenance that only the
+// command knows: which build ran, when it started, and how long it took.
+//
+// Run always leaves a descriptor carrying the advisory source, so this adds to
+// it rather than replacing it -- but it tolerates a nil one, because a Result
+// built by anything other than Run is still a Result worth stamping.
+func stampDescriptor(res *analyze.Result, started time.Time, took time.Duration) {
+	if res.Descriptor == nil {
+		res.Descriptor = &analyze.Descriptor{}
+	}
+	res.Descriptor.Tool = buildinfo.Name
+	res.Descriptor.Version = buildinfo.Version()
+	res.Descriptor.Started = started
+	res.Descriptor.Duration = took.Round(100 * time.Millisecond).String()
 }
 
 // countNamed reports how many of the target flags were given a value.
@@ -324,7 +426,20 @@ func renderInventory(inv *analyze.InventoryResult) string {
 		}
 	}
 
+	for _, note := range inv.Notes {
+		// NOTE and not INCOMPLETE: nothing was lost, and a reader who takes
+		// this list for the whole document would be wrong in a way that is
+		// worth one line to prevent.
+		fmt.Fprintf(&b, "NOTE: %s\n", note)
+	}
+
 	switch {
+	case inv.OS == nil && inv.Mode == "sbom":
+		// Not the same statement as the one below. There was no os-release to
+		// fail to read; the document simply named no OS package, and calling
+		// that "unknown" would send someone looking for a file that was never
+		// part of this input.
+		b.WriteString("os:        not described (this document names no OS package)\n")
 	case inv.OS == nil:
 		b.WriteString("os:        unknown (no readable /etc/os-release)\n")
 	default:
@@ -445,11 +560,25 @@ Usage:
   vexscan --image  REF  (--package SPEC... | --cves LIST | --all) [flags]
   vexscan --rootfs DIR  (--package SPEC... | --cves LIST | --all) [flags]
   vexscan --repo   REPO (--package SPEC... | --cves LIST | --all) [flags]
+  vexscan --rpm    FILE (--package SPEC... | --cves LIST | --all) [flags]
+  vexscan --sbom   FILE (--package SPEC... | --cves LIST | --all) [flags]
+  vexscan --version
 
 --rootfs runs the same analysis against a tree already on disk. It arrives with
 no image config, so nothing declares an entrypoint: the language plugins mark
 their conclusions undetermined and the shared-library closure falls back to
 rooting every program it finds. Pass --roots to say what actually runs.
+
+--rpm and --sbom scan packages nobody installed, so there is no filesystem to
+trace and no reachability test can run. --rpm still reads each header's file
+list, which is enough to rule out a package that ships no executable code at
+all; a CycloneDX component carries no file list, so --sbom can rule out nothing
+and every finding it produces is undetermined. The report says so at both ends.
+Use them to triage a build artifact or a bill of materials; scan the image or
+the tree when you want an answer about whether the code can run.
+
+  syft debian:12 -o cyclonedx-json | vexscan --sbom - --all
+  vexscan --sbom bom.json --all --ecosystem golang
 
 --llm has no default provider. Point it at any OpenAI-compatible endpoint, at a
 model running on this machine, or at a CLI you already have logged in:
@@ -511,6 +640,10 @@ Examples:
   vexscan --image myorg/app:latest --package golang:stdlib --cves CVE-2025-22870
   vexscan --repo github.com/rancher/rancher --package golang:stdlib --go-version 1.24.0
 
+  # A bill of materials from a build, with no image to hand
+  vexscan --sbom sbom.cdx.json --all
+  syft myorg/app:latest -o cyclonedx-json | vexscan --sbom - --all
+
   # List the packages in an image, with the names OSV will be queried by
   vexscan --image debian:12 --format inventory
   vexscan --rootfs /mnt/rootfs --format inventory
@@ -538,15 +671,43 @@ nothing about whether the code is present here. Both are keyed by CVE, so an
 advisory that never got one cannot be scored, and the report names those rather
 than filing them as zero. Absence from the KEV catalog means nothing at all.
 
+--version prints vexscan's own version and exits. It used to mean "override the
+module version read from a binary's build info"; that setting is now spelled
+--module-version, and --version=VERSION still works with a warning for one more
+release. vexscan takes no positional arguments, so "--version 1.2.3" is an
+error rather than a scan of the wrong version.
+
 A report longer than one screen is paged through $VEXSCAN_PAGER, $PAGER or
 less, and repeats its summary and any INCOMPLETE notes at the bottom. Piped,
 redirected or written with --out it is never paged, and the bytes are the same
 either way. --no-pager turns it off for one run; VEXSCAN_PAGER= for good.
 
+--color auto (the default) colours the text report on a terminal and nowhere
+else: not into a pipe, not into --out, not into a --gist, not into JSON, and
+not when NO_COLOR is set. --color always overrides all of that except JSON, for
+piping into "less -R". Nothing is said in colour alone -- stripping the escapes
+from a coloured report reproduces the plain one byte for byte.
+
+--fail-on gates a pipeline on the findings. It is off by default, and it counts
+only findings whose vulnerable code is present and loadable, unless
+--fail-on-status widens it:
+
+  vexscan --image myorg/app:latest --all --fail-on high
+  vexscan --image myorg/app:latest --all --fail-on any --fail-on-status affected,undetermined
+
+That default is the difference worth having. "--fail-on high" here means a HIGH
+whose code the closure actually reached, not a HIGH whose version string
+appears in a package database -- so a passing gate is a statement about the
+image rather than about a filter. Severities order as the table orders them, so
+an unrated finding counts from MEDIUM down; above that it cannot be weighed,
+and the run says how many it could not weigh rather than passing quietly.
+
 Exit status:
   0  the scan completed
   1  the scan failed, or an ecosystem could not be read (the report says which)
   2  the command line was wrong
+  3  the scan completed and --fail-on matched (never mixed with 1: a broken
+     scan is not a clean gate, and its findings are not counted at all)
 
 Flags:
 `)

@@ -42,6 +42,13 @@ type evaluator struct {
 	// node resolves a mined subpath to the files it names.
 	node *node
 
+	// meta is set when the inventory was handed in rather than read out of a
+	// tree, and g is nil for that reason rather than for want of a component
+	// that needed it. The two are not interchangeable: a nil graph on its own
+	// still leaves the file list to conclude from, and there is no file list
+	// here. See ecosystem.SBOMFinding.
+	meta bool
+
 	trust bool // --trust-import-absence
 }
 
@@ -63,6 +70,9 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 	// carries a record for this id makes no difference to the fact that the
 	// image does not contain the package the id was asked about.
 	if e.st.absent {
+		if e.meta {
+			return ecosystem.SBOMAbsent(f, c.Name, MethodInventory)
+		}
 		if len(e.st.unreadable) > 0 {
 			// Something under node_modules could not be identified, so "no
 			// package here is named X" is not a claim this scan is entitled to
@@ -92,6 +102,14 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 		f.Status = ecosystem.StatusUndetermined
 		f.Reason = "no_osv_package_mapping"
 		return f
+	}
+
+	// Before the file list, because there is not one. Everything below reads
+	// an empty list as a directory that could not be listed, which is a
+	// different fact and carries a different verdict: a component out of a
+	// bill of materials has no directory to list in the first place.
+	if e.meta {
+		return ecosystem.SBOMFinding(f, c.Name)
 	}
 
 	files := e.st.files()

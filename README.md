@@ -82,6 +82,11 @@ vexscan --rootfs /mnt/rootfs --all --roots /usr/bin/myapp
 vexscan --rpm ./openssl-libs-3.5.5-2.el9_8.x86_64.rpm --all
 vexscan --rpm https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/Packages/o/openssl-libs-3.5.5-2.el9_8.x86_64.rpm --all
 
+# A CycloneDX bill of materials, from a file or a pipe. Every finding is
+# undetermined — a component names a package and nothing else (see below)
+vexscan --sbom sbom.cdx.json --all
+syft debian:12 -o cyclonedx-json | vexscan --sbom - --all
+
 # Source repo (govulncheck source-mode reachability)
 vexscan --repo github.com/rancher/rancher \
   --package golang:golang.org/x/net --cves CVE-2023-39325
@@ -262,8 +267,8 @@ vexscan --rpm https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/Packages/o/
 vexscan --rpm ./repo/x86_64/ --format inventory
 ```
 
-The flag is repeatable and mutually exclusive with `--image`, `--rootfs` and
-`--repo`. A directory is walked for `*.rpm`, sorted, so a repeated scan queries
+The flag is repeatable and mutually exclusive with `--image`, `--rootfs`,
+`--repo` and `--sbom`. A directory is walked for `*.rpm`, sorted, so a repeated scan queries
 in the same order. The report says `"mode": "rpm"`.
 
 ### It reads the header, not the package
@@ -355,6 +360,93 @@ Reading 3 rpm package file(s) from /tmp/rpmdir...
   ! 1 rpm package file(s) could not be read; the scan does not account for them
     ! /tmp/rpmdir/broken.rpm: not an rpm package file (bad lead magic)
 ```
+
+## Scanning a bill of materials (`--sbom`)
+
+`--sbom` scans the components named in a CycloneDX JSON document — the standard
+hand-off between a build system and a scanner, and the one input every other
+scanner accepts. It is for the case where the SBOM is what you have: a build
+published one, a vendor sent one, a policy requires one.
+
+```sh
+vexscan --sbom sbom.cdx.json --all
+syft debian:12 -o cyclonedx-json | vexscan --sbom - --all
+vexscan --sbom sbom.cdx.json --all --ecosystem golang
+vexscan --sbom sbom.cdx.json --format inventory
+```
+
+`-` reads standard input. The flag is mutually exclusive with `--image`,
+`--rootfs`, `--repo` and `--rpm`, and the report says `"mode": "sbom"`.
+
+Components are routed to the plugin that can query them, from the purl type:
+`pkg:golang` → Go, `pkg:npm` → npm, `pkg:pypi` → PyPI, `pkg:maven` → Maven, and
+`pkg:deb` / `pkg:rpm` / `pkg:apk` → the OS plugin. `--ecosystem` and the
+per-ecosystem outcome list behave exactly as they do for an image.
+
+### Read this part before trusting a result
+
+**Every finding is `undetermined`.** Not some — every one. `--rpm` has no
+filesystem either, but an rpm header still lists the files the package installs
+and `file(1)`'s verdict on each, which is enough to rule out a package that
+ships no executable code. A CycloneDX component carries a name, a version and a
+purl. There is nothing in it to rule anything out with, so nothing is ruled out:
+
+```
+NOTE: this read a bill of materials, not an installed system. No ELF
+      reachability test could run -- there is no filesystem to trace -- and a
+      CycloneDX component does not list the files it installs, so unlike a
+      package file it cannot rule a package out for shipping no code either.
+      Every row below is a package the document says is installed, and
+      nothing here can say whether its code would ever run.
+      89 finding(s) below are undetermined for that reason. Scan the image
+      or tree these components came from to get an answer.
+```
+
+That note prints at both ends of the report, and it prints on a clean one too:
+"no findings" out of a bill of materials is a much weaker statement than the
+same words out of an image, and the difference has to be on the page.
+
+So this mode answers *which advisories apply to what this document says is
+installed* — the same question a version-matching scanner answers, and nothing
+more. Point `vexscan` at the image or the tree when you want the answer only it
+can give.
+
+### The source name is why this finds anything
+
+Debian, Alpine and the RPM distributions all file advisories against the
+**source** package, and the binary package in the document is usually named
+something else. Both producers say so, in different places: syft writes
+`upstream=openssl` as a purl qualifier, trivy writes an
+`aquasecurity:trivy:SrcName` property. `vexscan` reads both and queries the
+binary and source names together. Missing it queries a name OSV has no records
+under, which reads exactly like a clean package.
+
+The distribution comes from the `distro=` qualifier — `distro=debian-12`,
+and Alpine's bare `distro=3.19.9` resolved through the purl namespace. A
+document that states no distribution, or states two, is **an error naming
+`--osv-ecosystem`**, on the same reasoning as `--rpm`: an OSV query with no
+ecosystem finds nothing and reads like a clean scan.
+
+### Nothing is dropped quietly
+
+A document with 400 components of which 120 were unusable must not print as a
+scan of 280. Two things can be wrong with an entry, and they are not the same:
+
+- **Skipped** — it named no package to begin with. The `operating-system` row,
+  trivy's `go.mod` marker, a purl type `vexscan` has no ecosystem for, or a
+  component with no version to match a range against. Each is logged with its
+  reason. These are ordinary, and not a loss.
+- **Failed** — it had a package URL and the URL would not parse. That is a
+  component that went unexamined, so it lands in `unreadable` alongside a
+  directory that could not be read, is named with its reason, and the scan
+  **exits 1**.
+
+A document nobody could read at all is an error, never an empty result — and so
+is one where every entry resolved and none of them was a package this tool can
+query. Scanning clean is the one outcome an empty result may never produce.
+
+Only CycloneDX JSON is read today. An SPDX document is told what it is rather
+than scanned as a document with no components in it.
 
 ## How the tests work
 
@@ -1085,6 +1177,42 @@ terminal, and a CI log, a `--out` file and a gist are all read from the end. The
 threshold is 30 lines of report — counted from the report, never from the
 terminal, so the same scan produces the same bytes wherever it goes.
 
+### Colour (`--color`)
+
+The `SEVERITY` column, the verdicts, the section headings and the
+`INCOMPLETE:` / `NOTE:` prefixes are coloured, using the eight basic ANSI
+colours and bold. Nothing else, and nothing at all in 256-colour: a grey that
+reads well on one terminal theme is invisible on another, and the eight are the
+ones every theme remaps to something legible.
+
+**Nothing is said in colour alone.** Every severity and every verdict is
+spelled out in the cell beside it — the colour makes the worst rows findable in
+a 300-row table and carries no information of its own. Stripping the escapes
+from a coloured report reproduces the uncoloured one byte for byte, which is
+asserted by a test rather than intended:
+
+```sh
+diff <(vexscan --image debian:12 --all --no-pager --color never) \
+     <(vexscan --image debian:12 --all --no-pager --color always | sed 's/\x1b\[[0-9;]*m//g')
+```
+
+`auto` (the default) colours only when **all** of these hold: stdout is a
+terminal, `NO_COLOR` is unset or empty, `--out` was not given, `--gist` was not
+given, and the format is not `json`. The last three are not politeness — the
+same rendered string is what gets written to the file and uploaded to the gist,
+so an escape sequence reaching either is stored permanently in a document that
+will be read by something that does not interpret it.
+
+`--color always` overrides all of that except JSON, which is what you want when
+piping to `less -R`. It does not override JSON because escapes there would make
+the output unparseable, which is past the line between looking wrong and being
+wrong.
+
+```sh
+vexscan --image debian:12 --all --color always | less -R
+NO_COLOR=1 vexscan --image debian:12 --all         # off, whatever the value
+```
+
 ### Severity
 
 `SEVERITY` is scored from the CVSS vector OSV already returns with each
@@ -1411,9 +1539,25 @@ The JSON is `schema_version: 2`:
     "severities": ["CRITICAL", "HIGH"],
     "count": 123,
     "by_severity": { "UNKNOWN": 36, "MEDIUM": 78, "LOW": 9 }
+  },
+  "descriptor": {  // what produced this report
+    "tool": "vexscan", "version": "v0.6.2",
+    "started": "2026-08-05T22:56:50Z", "duration": "4.3s",
+    "advisory_source": "https://api.osv.dev/v1",
+    "advisories_as_of": "2026-08-05T22:56:54Z"  // zero when nothing was resolved
   }
 }
 ```
+
+`descriptor` is there because a report outlives the run that made it. An empty
+report raises two questions — which build wrote it, and how old the advisories
+behind it are — and neither is answerable from `findings`. `advisories_as_of`
+is when OSV actually answered, so a report saved six months ago says so rather
+than reading as current. The text output carries the same facts on one
+`scanned by:` line under the header.
+
+Adding it did not bump `schema_version`: the field is additive and omitted when
+empty, so a consumer pinned to 2 is unaffected.
 
 Each finding carries ecosystem-neutral identity (`ecosystem`, `id`, `package`,
 `version`, `location`, `purl`) plus `status`, `method`, `justification` and
@@ -1457,7 +1601,53 @@ count and the names OSV will be queried by. It is the fastest way to check that
 a reader found what you expected before trusting a finding — or an absent one.
 
 Exit status: `0` the scan completed, `1` the scan failed, an ecosystem could not
-be read, or part of the tree could not be read, `2` the command line was wrong.
+be read, or part of the tree could not be read, `2` the command line was wrong,
+`3` the scan completed and `--fail-on` matched.
+
+### Gating a pipeline (`--fail-on`)
+
+`--fail-on` is off by default. Given a severity it exits `3` when a finding
+meets it:
+
+```sh
+vexscan --image myorg/app:latest --all --fail-on high
+```
+
+What counts is the part worth having. By default only findings whose vulnerable
+code is **present and loadable** are weighed — `linked` or `reachable`, and not
+already answered by a VEX statement. So `--fail-on high` here means *a HIGH
+whose code the closure actually reached*, not *a HIGH whose version string
+appears in a package database*. A passing gate is a statement about the image,
+not about a filter. No version-matching scanner can offer that distinction,
+because it never computed the closure.
+
+`--fail-on-status` widens it to any comma-separated set of `affected`,
+`undetermined`, `vexed`, `cleared`, or `all`:
+
+```sh
+# the stricter reading: anything we could not rule out also fails the build
+vexscan --image myorg/app:latest --all --fail-on high --fail-on-status affected,undetermined
+```
+
+Three properties are deliberate:
+
+- **Exit `3`, never `1`.** Exit `1` means the scan did not complete. A caller
+  that cannot tell "found something" from "the package database was
+  unreadable" has lost the distinction the tool is built on.
+- **A failed scan is not gated at all.** If an ecosystem errored, the run exits
+  `1` and says `--fail-on was not evaluated` — a finding count taken from a
+  partial scan is not a number to decide a build on.
+- **Unrated findings are announced, not dropped.** Severities order the way the
+  table orders them, so an unrated finding counts from `MEDIUM` down. Above
+  that it cannot be weighed, and the run says how many it could not weigh:
+
+  ```
+  note: 46 counted finding(s) have no published severity and could not be weighed against HIGH.
+        Use --fail-on any to gate on their presence.
+  ```
+
+  This matters most on SUSE, which publishes no CVSS at all. `--fail-on any`
+  gates on presence rather than rating.
 
 ## Flags
 
@@ -1466,6 +1656,7 @@ be read, or part of the tree could not be read, `2` the command line was wrong.
 | `--image` | | Container image to inspect |
 | `--rootfs` | | Filesystem tree already on disk to inspect — see [`--rootfs`](#scanning-a-filesystem-instead-of-an-image---rootfs) |
 | `--repo` | | Git source repo to analyze: govulncheck source mode for Go, lock file inventory for Python and npm |
+| `--sbom` | | CycloneDX JSON bill of materials to scan — a path, or `-` for stdin. Every finding is `undetermined`; see [`--sbom`](#scanning-a-bill-of-materials---sbom) |
 | `--rpm` | | RPM package file to scan without installing it — a path, a directory of them, or a URL; repeatable. Reads only the header, so a URL costs kilobytes not megabytes — see [`--rpm`](#scanning-package-files---rpm) |
 | `--package` | | Package to check: purl, `ecosystem:name`, or bare name; repeatable |
 | `--cves` | | CVE / GHSA / GO / RHSA / DSA ids; alone, resolved against the whole target |
@@ -1475,9 +1666,10 @@ be read, or part of the tree could not be read, `2` the command line was wrong.
 | `--cves-file` | | File with one id per line (merged with `--cves`; `#` comments allowed) |
 | `--ref` | *(default branch)* | Branch, tag, or commit to check out for `--repo` |
 | `--repo-path` | `.` | Subdirectory within `--repo` to scan — the Go module, or the directory holding the lock files |
-| `--version` | *(auto)* | Override the module version (image mode) instead of reading build info |
+| `--module-version` | *(auto)* | Override the module version (image mode) instead of reading build info |
+| `--version` / `-V` | | Print vexscan's version and exit. `--version=VERSION` is a **deprecated** spelling of `--module-version` and warns |
 | `--go-version` | *(auto)* | Pin the Go toolchain for `--repo`, e.g. `1.24.0` (useful with `golang:stdlib`) |
-| `--osv-ecosystem` | *(auto)* | Override the OSV ecosystem derived from os-release, or from the `VENDOR`/`DISTRIBUTION` headers under `--rpm`, e.g. `Debian:12` |
+| `--osv-ecosystem` | *(auto)* | Override the OSV ecosystem derived from os-release, from the `VENDOR`/`DISTRIBUTION` headers under `--rpm`, or from the `distro=` purl qualifier under `--sbom`, e.g. `Debian:12` |
 | `--roots` | | Extra entrypoints for the closures — shared libraries and language imports; repeatable |
 | `--vexhub` | | VEX Repository to check findings against, e.g. `https://github.com/rancher/vexhub` (also a raw base URL or a local directory); repeatable, earliest wins — see [VEX hubs](#vex-hubs---vexhub) |
 | `--severity` | *(all)* | Only report findings at these severities: `CRITICAL`, `HIGH`, `UNKNOWN`, `MEDIUM`, `LOW`, `NONE`; comma-separated or repeatable. `UNKNOWN` must be named to be shown — see [Filtering by severity](#filtering-by-severity---severity) |
@@ -1496,6 +1688,9 @@ be read, or part of the tree could not be read, `2` the command line was wrong.
 | `--out` | *(stdout)* | Write output to a file |
 | `--gist` | `false` | Also upload the output to a public gist and print its URL (token needs `gist` scope) |
 | `--gist-secret` | `false` | With `--gist`, create a secret (unlisted) gist |
+| `--fail-on` | | Exit `3` if a counted finding is at or above this severity, or `any`. Off by default — see [Gating a pipeline](#gating-a-pipeline---fail-on) |
+| `--fail-on-status` | `affected` | What `--fail-on` weighs: a comma-separated list of `affected`, `undetermined`, `vexed`, `cleared`, or `all` |
+| `--color` | `auto` | `auto`, `always`, or `never`. `auto` colours only a terminal — never a pipe, a `--out` file, a `--gist`, JSON, or a run with `NO_COLOR` set — see [Colour](#colour---color) |
 | `--no-pager` | `false` | Never page the output, even when stdout is a terminal — see [Reading a long report](#reading-a-long-report) |
 | `--quiet` | `false` | Suppress progress logging on stderr |
 
@@ -1611,6 +1806,11 @@ docker run --rm -e VEXSCAN_LLM_ENDPOINT -e VEXSCAN_LLM_TOKEN \
   nothing is ever ruled out as unreachable — only a package that ships no ELF
   object can be ruled out. See [`--rpm`](#scanning-package-files---rpm) for what
   that costs, measured.
+- **`--sbom` runs no test of any kind, and it says so on every report.** A
+  CycloneDX component is a name, a version and a purl: there is no filesystem
+  to trace and no file list to rule anything out on, so **every** finding is
+  `undetermined`. It is a triage input, not an answer. See
+  [`--sbom`](#scanning-a-bill-of-materials---sbom).
 - **Repo mode for Python and npm resolves no import graph at all.** A lock file
   answers "is this declared" and, where the format says so, "is it
   development-only". Nothing there speaks to reachability, and a `linked`

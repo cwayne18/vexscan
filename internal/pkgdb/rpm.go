@@ -82,7 +82,7 @@ func (r *RPM) Read(fsys target.RootFS) ([]Package, error) {
 			Version: rpmEVR(info.EpochNum(), info.Version, info.Release),
 			Epoch:   info.EpochNum(),
 			Arch:    info.Arch,
-			Source:  sourceRPMName(info.SourceRpm),
+			Source:  SourceRPMName(info.SourceRpm),
 			DB:      db,
 		}
 		// A package with no file list is normal (metapackages own nothing),
@@ -102,6 +102,6 @@ func (r *RPM) Read(fsys target.RootFS) ([]Package, error) {
 	return pkgs, nil
 }
 
-// rpmEVR, sourceRPMName and normalizePaths live in rpmfile.go, which carries no
+// rpmEVR, SourceRPMName and normalizePaths live in rpmfile.go, which carries no
 // build tag: the file reader needs them too, and it has to keep working in the
 // norpm build that omits everything above.

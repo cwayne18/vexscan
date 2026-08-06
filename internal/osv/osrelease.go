@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -65,6 +66,52 @@ func ParseOSRelease(r io.Reader) (Release, error) {
 		return rel, errors.New("osv: os-release has no ID field")
 	}
 	return rel, nil
+}
+
+// ReleaseFromDistro builds a Release from a distribution id and version, for
+// callers whose whole account of the operating system is those two strings --
+// an SBOM's "distro=debian-12" qualifier, and nothing else.
+//
+// The gap it has to close is LTS. Ecosystem reads that off VERSION and
+// PRETTY_NAME, which an SBOM does not carry, and the suffix is not cosmetic:
+// "Ubuntu:22.04" and "Ubuntu:22.04:LTS" are different ecosystems, only one of
+// them has any records in it, and the empty one answers HTTP 200. Guessing
+// wrong there reads as a clean image.
+//
+// Both distributions that need the suffix publish on a fixed schedule, so the
+// version alone settles it -- Ubuntu ships LTS every April of an even year,
+// openEuler every March -- and the inference is written into VERSION, where
+// isLTS already looks, rather than bolted onto the mapping table. Every other
+// distribution ignores the field.
+func ReleaseFromDistro(id, version string) Release {
+	rel := Release{ID: strings.ToLower(strings.TrimSpace(id)), VersionID: strings.TrimSpace(version)}
+	if lts(rel.ID, rel.VersionID) {
+		rel.Version = rel.VersionID + " LTS"
+	}
+	return rel
+}
+
+// lts reports whether a release is a long-term-support one, from its version
+// alone. Only the two distributions whose OSV ecosystem carries an LTS suffix
+// are answered; for the rest the question does not arise and false is the
+// truthful answer rather than an unknown one.
+func lts(id, version string) bool {
+	maj, min, ok := strings.Cut(version, ".")
+	if !ok {
+		return false
+	}
+	min, _, _ = strings.Cut(min, ".")
+	switch id {
+	case "ubuntu":
+		// April of an even year: 20.04, 22.04, 24.04. The interim releases are
+		// .04 of an odd year and .10 of any year.
+		n, err := strconv.Atoi(maj)
+		return err == nil && n%2 == 0 && min == "04"
+	case "openeuler":
+		// openEuler's March release is the LTS one; September is not.
+		return min == "03"
+	}
+	return false
 }
 
 // Ecosystem returns the OSV ecosystem string for this release.

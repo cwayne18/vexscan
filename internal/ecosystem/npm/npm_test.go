@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/cwayne18/vexscan/internal/ecosystem"
+	"github.com/cwayne18/vexscan/internal/langdb"
 	"github.com/cwayne18/vexscan/internal/modgraph"
 	"github.com/cwayne18/vexscan/internal/osv"
 	"github.com/cwayne18/vexscan/internal/target"
@@ -674,5 +675,67 @@ func TestParsePURL(t *testing.T) {
 		if name != c.name || typ != c.typ || ok != c.ok {
 			t.Errorf("parsePURL(%q) = %q,%q,%v want %q,%q,%v", c.in, name, typ, ok, c.name, c.typ, c.ok)
 		}
+	}
+}
+
+// sbomPkg is one npm component out of a bill of materials: coordinates and
+// nothing else. No package.json, no directory, no file list.
+func sbomPkg(name, version string) langdb.Package {
+	return langdb.Package{Format: langdb.FormatNPM, Name: name, Version: version, Dir: "bom.json"}
+}
+
+// only returns the single finding, and fails if there is not exactly one.
+func only(t *testing.T, got map[string]ecosystem.Finding) ecosystem.Finding {
+	t.Helper()
+	if len(got) != 1 {
+		t.Fatalf("got %d findings, want 1: %v", len(got), got)
+	}
+	for _, f := range got {
+		return f
+	}
+	return ecosystem.Finding{}
+}
+
+// A handed-in inventory decides nothing. Below the metadata branch an empty
+// file list means a directory that could not be listed, which is a different
+// fact and carries linked -- a component out of a bill of materials has no
+// directory to list in the first place.
+func TestSBOMComponentsAreNeverLinked(t *testing.T) {
+	img := nodeImage(t, nil) // the empty tree --sbom stands up
+	opts := Options{Packages: []langdb.Package{sbomPkg("lodash", "4.17.20")}}
+
+	f := only(t, statusesWith(t, img, []ecosystem.Subject{{Raw: "all"}}, opts))
+	if f.Status != ecosystem.StatusUndetermined {
+		t.Errorf("status = %q, want %q", f.Status, ecosystem.StatusUndetermined)
+	}
+	if f.Method == MethodNoCode {
+		t.Errorf("method = %q: an SBOM lists no files, so it cannot rule code out", f.Method)
+	}
+	if f.Reason != ecosystem.ReasonNoReachabilityTest {
+		t.Errorf("reason = %q, want %q -- the report sizes its caveat by counting this",
+			f.Reason, ecosystem.ReasonNoReachabilityTest)
+	}
+	if len(f.Evidence) != 1 || f.Evidence[0].Origin != ecosystem.OriginSBOM {
+		t.Fatalf("evidence = %+v, want one row from %q", f.Evidence, ecosystem.OriginSBOM)
+	}
+	if !strings.Contains(f.Evidence[0].Detail, "bill of materials") {
+		t.Errorf("evidence does not say where it came from: %q", f.Evidence[0].Detail)
+	}
+}
+
+// An absent component says what was consulted, and it was not an image.
+func TestSBOMAbsenceDoesNotClaimAnImage(t *testing.T) {
+	img := nodeImage(t, nil)
+	opts := Options{Packages: []langdb.Package{sbomPkg("lodash", "4.17.20")}}
+
+	f := only(t, statusesWith(t, img, []ecosystem.Subject{{Ecosystem: "npm", Name: "left-pad", Raw: "npm:left-pad"}}, opts))
+	if f.Status != ecosystem.StatusNotPresent {
+		t.Errorf("status = %q, want %q", f.Status, ecosystem.StatusNotPresent)
+	}
+	if len(f.Evidence) != 1 {
+		t.Fatalf("evidence = %+v, want one row", f.Evidence)
+	}
+	if got := f.Evidence[0].Detail; !strings.Contains(got, "bill of materials") || strings.Contains(got, "image") {
+		t.Errorf("evidence talks about the wrong thing: %q", got)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cwayne18/vexscan/internal/analyze"
 	"github.com/cwayne18/vexscan/internal/ecosystem"
@@ -21,7 +22,7 @@ func report(t *testing.T, details bool, findings ...analyze.Finding) string {
 		Target:        "debian:12",
 		Mode:          "image",
 		Findings:      findings,
-	}, details)
+	}, renderOpts{details: details})
 }
 
 // lineWith returns the single rendered line containing want, failing if there
@@ -239,7 +240,7 @@ func TestIncompleteBannersComeFirst(t *testing.T) {
 		Findings: []analyze.Finding{
 			{CVE: "CVE-1", Package: "a", Status: analyze.StatusLinked, Severity: "CRITICAL"},
 		},
-	}, false)
+	}, renderOpts{})
 
 	banner := strings.Index(out, "INCOMPLETE: ecosystem npm did not run")
 	paths := strings.Index(out, "INCOMPLETE: 12 path(s)")
@@ -273,7 +274,7 @@ func TestEmptyReportDistinguishesCleanFromIncomplete(t *testing.T) {
 	incomplete := renderText(&analyze.Result{
 		SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
 		Ecosystems: []ecosystem.EcosystemResult{{ID: "os", Error: "no package database"}},
-	}, false)
+	}, renderOpts{})
 	if !strings.Contains(incomplete, "This is not a clean result.") {
 		t.Errorf("an incomplete empty report reads as clean:\n%s", incomplete)
 	}
@@ -536,7 +537,7 @@ func TestSummaryCountsAffectedBySeverity(t *testing.T) {
 			// Ruled out, so not part of what has to be acted on.
 			{Ecosystem: "os", CVE: "CVE-4", Package: "d", Status: analyze.StatusNotPresent, Severity: "CRITICAL"},
 		},
-	}, false)
+	}, renderOpts{})
 
 	if !strings.Contains(out, "affected by severity: 2 critical, 1 low") {
 		t.Errorf("severity spread wrong:\n%s", out)
@@ -561,7 +562,7 @@ func TestSummaryDoesNotRepeatTheEcosystemName(t *testing.T) {
 		Findings: []analyze.Finding{
 			{Ecosystem: "npm", CVE: "CVE-1", Package: "a", Status: analyze.StatusLinked},
 		},
-	}, false)
+	}, renderOpts{})
 	if strings.Contains(out, "npm      npm") {
 		t.Errorf("the ecosystem name is repeated:\n%s", out)
 	}
@@ -593,7 +594,7 @@ func vexReport(t *testing.T, details bool, hubs []ecosystem.VEXHubResult, findin
 	return renderText(&analyze.Result{
 		SchemaVersion: analyze.SchemaVersion, Target: "rancher/hardened-kubernetes:v1.30.1", Mode: "image",
 		Findings: findings, VEXHubs: hubs,
-	}, details)
+	}, renderOpts{details: details})
 }
 
 // An exculpatory statement moves the row; the finding's own verdict does not
@@ -754,7 +755,7 @@ func filteredReport(t *testing.T, w *analyze.Withheld, findings ...analyze.Findi
 	return renderText(&analyze.Result{
 		SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
 		Findings: findings, Withheld: w,
-	}, false)
+	}, renderOpts{})
 }
 
 func TestTheBannerSaysWhatTheFilterHid(t *testing.T) {
@@ -814,7 +815,7 @@ func TestFilteringEverythingIsNotACleanResult(t *testing.T) {
 			Count:      12,
 			BySeverity: map[string]int{"UNKNOWN": 12},
 		},
-	}, false)
+	}, renderOpts{})
 
 	for _, want := range []string{
 		"No findings at these severities.",
@@ -838,7 +839,7 @@ func TestFilteringEverythingIsNotACleanResult(t *testing.T) {
 func TestAnEmptyUnfilteredReportIsUnchanged(t *testing.T) {
 	out := renderText(&analyze.Result{
 		SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
-	}, false)
+	}, renderOpts{})
 	if !strings.Contains(out, "No findings: nothing selected was found") {
 		t.Errorf("want the plain empty wording, got:\n%s", out)
 	}
@@ -854,7 +855,7 @@ func TestIncompletenessOutranksTheFilterWhenBothEmptyTheReport(t *testing.T) {
 		SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
 		Ecosystems: []ecosystem.EcosystemResult{{ID: "os", Error: "dpkg status unreadable"}},
 		Withheld:   &analyze.Withheld{Severities: []string{"HIGH"}, Count: 3, BySeverity: map[string]int{"LOW": 3}},
-	}, false)
+	}, renderOpts{})
 	if !strings.Contains(out, "This is not a clean result.") {
 		t.Errorf("want the incomplete-scan wording, got:\n%s", out)
 	}
@@ -907,7 +908,7 @@ func longReport(t *testing.T, n int, mutate func(*analyze.Result)) string {
 	if mutate != nil {
 		mutate(res)
 	}
-	return renderText(res, false)
+	return renderText(res, renderOpts{})
 }
 
 func TestAShortReportHasNoFooter(t *testing.T) {
@@ -1044,7 +1045,7 @@ func triaged(t *testing.T, tr *analyze.TriageResult, details bool, findings ...a
 			{ID: "os", Ecosystems: []string{"Debian:12"}, Components: 88},
 		},
 		Findings: findings, Triage: tr,
-	}, details)
+	}, renderOpts{details: details})
 }
 
 // scored is a linked finding carrying an EPSS percentile.
@@ -1363,7 +1364,7 @@ func rpmReport(t *testing.T, tr *analyze.TriageResult, findings ...analyze.Findi
 			{ID: "os", Ecosystems: []string{"SUSE"}, Components: 1},
 		},
 		Findings: findings, Triage: tr,
-	}, false)
+	}, renderOpts{})
 }
 
 // undecided is what a metadata-only scan produces for a package that ships an
@@ -1398,10 +1399,76 @@ func TestTheMetadataCaveatIsPrintedTwice(t *testing.T) {
 	}
 }
 
-// An image scan must not grow the caveat, whatever its findings look like.
-func TestTheMetadataCaveatIsRPMOnly(t *testing.T) {
+// An image scan must not grow the caveat, whatever its findings look like: it
+// has the filesystem the caveat exists to say is missing.
+func TestTheMetadataCaveatIsForDescribedPackagesOnly(t *testing.T) {
 	if out := report(t, false, gccTrio...); strings.Contains(out, "not an installed system") {
-		t.Errorf("an image report carried the --rpm caveat:\n%s", out)
+		t.Errorf("an image report carried the metadata caveat:\n%s", out)
+	}
+}
+
+// sbomReport renders the shape --sbom produces.
+func sbomReport(t *testing.T, findings ...analyze.Finding) string {
+	t.Helper()
+	return renderText(&analyze.Result{
+		SchemaVersion: analyze.SchemaVersion,
+		Target:        "bom.json",
+		Mode:          "sbom",
+		Ecosystems: []ecosystem.EcosystemResult{
+			{ID: "os", Ecosystems: []string{"Debian:12"}, Components: 1},
+		},
+		Findings: findings,
+	}, renderOpts{})
+}
+
+// --sbom loses more than --rpm does, and the note has to say the extra part.
+// An rpm header still lists the files the package installs, so a reader who
+// knows the --rpm wording would otherwise carry over a rule-out this input
+// cannot support.
+func TestTheSBOMCaveatSaysWhatItCannotRuleOut(t *testing.T) {
+	out := sbomReport(t, undecided("CVE-2024-0001"))
+
+	if !strings.Contains(out, "bill of materials, not an installed system") {
+		t.Errorf("the sbom report does not say what it read:\n%s", out)
+	}
+	if !strings.Contains(out, "does not list the files it installs") {
+		t.Errorf("the sbom caveat does not say it cannot rule anything out:\n%s", out)
+	}
+	// The rpm reference measurement is about the one test rpm mode is missing.
+	// Here every test is missing, so quoting it would understate the loss.
+	if strings.Contains(out, "SUSE 15.6") {
+		t.Errorf("the sbom caveat borrowed the --rpm scale note:\n%s", out)
+	}
+	if strings.Contains(out, "read package metadata") {
+		t.Errorf("the sbom report carried the --rpm wording:\n%s", out)
+	}
+}
+
+// The footer rule, applied to the caveat that changes the most.
+func TestTheSBOMCaveatIsPrintedTwice(t *testing.T) {
+	var findings []analyze.Finding
+	for i := 0; i < 32; i++ {
+		findings = append(findings, undecided(fmt.Sprintf("CVE-2026-%04d", i)))
+	}
+	out := sbomReport(t, findings...)
+
+	if n := strings.Count(out, "bill of materials, not an installed system"); n != 2 {
+		t.Errorf("the caveat appears %d times, want it at both ends of the report", n)
+	}
+	if !strings.Contains(out, "32 finding(s) below are undetermined") {
+		t.Errorf("the caveat does not count the rows it explains:\n%s", out)
+	}
+}
+
+// "No findings" out of a bill of materials is the weakest clean report this
+// tool can produce, and it has to say so.
+func TestTheSBOMCaveatSurvivesAnEmptyReport(t *testing.T) {
+	out := sbomReport(t)
+	if !strings.Contains(out, "No ELF") {
+		t.Errorf("a clean sbom report did not say what it could not test:\n%s", out)
+	}
+	if strings.Contains(out, "finding(s) below") {
+		t.Errorf("a report with no rows counted some:\n%s", out)
 	}
 }
 
@@ -1553,5 +1620,104 @@ func TestTheQuietCaseIsUnchanged(t *testing.T) {
 	}
 	if strings.Contains(p, "outside the affected rows") || strings.Contains(p, "other row") {
 		t.Errorf("a remainder clause was printed with no remainder: %q", p)
+	}
+}
+
+// withDescriptor renders a report of n copies of the gcc trio, stamped with d.
+func withDescriptor(t *testing.T, d *analyze.Descriptor, n int) string {
+	t.Helper()
+	var findings []analyze.Finding
+	for i := 0; i < n; i++ {
+		for _, f := range gccTrio {
+			f.CVE = fmt.Sprintf("%s-%d", f.CVE, i)
+			f.ID = f.CVE
+			findings = append(findings, f)
+		}
+	}
+	return renderText(&analyze.Result{
+		SchemaVersion: analyze.SchemaVersion,
+		Target:        "debian:12",
+		Mode:          "image",
+		Findings:      findings,
+		Descriptor:    d,
+	}, renderOpts{})
+}
+
+var fullDescriptor = &analyze.Descriptor{
+	Tool:           "vexscan",
+	Version:        "v0.6.2",
+	Started:        time.Date(2026, 8, 5, 14, 2, 0, 0, time.UTC),
+	Duration:       "12.4s",
+	AdvisorySource: "https://api.osv.dev/v1",
+	AdvisoriesAsOf: time.Date(2026, 8, 5, 14, 2, 9, 0, time.UTC),
+}
+
+// The provenance line names the build, the clock and the advisory source, so a
+// report read six months from now can still be dated.
+func TestProvenanceNamesWhatProducedTheReport(t *testing.T) {
+	out := withDescriptor(t, fullDescriptor, 1)
+	line := lineWith(t, out, "scanned by:")
+	for _, want := range []string{"vexscan v0.6.2", "2026-08-05 14:02 UTC", "12.4s", "https://api.osv.dev/v1"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("provenance line is missing %q: %q", want, line)
+		}
+	}
+	// The header, above every section -- it is provenance, not a finding.
+	if i, j := strings.Index(out, "scanned by:"), strings.Index(out, "AFFECTED ("); i > j {
+		t.Errorf("the provenance line is below the first section:\n%s", out)
+	}
+}
+
+// Caveats are repeated in the footer of a long report because they change what
+// the reader should conclude. Provenance does not, so it stays in the header --
+// printing it beside the INCOMPLETE banners would dilute exactly those.
+func TestProvenanceIsNotRepeatedInTheFooter(t *testing.T) {
+	out := withDescriptor(t, fullDescriptor, 20)
+	if n := strings.Count(out, "\n"); n <= footerThreshold {
+		t.Fatalf("the report is %d lines, too short to have grown a footer", n)
+	}
+	if n := strings.Count(out, "affected by severity:"); n != 2 {
+		t.Fatalf("the summary appears %d time(s), so the footer did not run:\n%s", n, out)
+	}
+	lineWith(t, out, "scanned by:") // exactly one, footer or no footer
+}
+
+// A report with nothing to say about itself says nothing, rather than printing
+// an empty label.
+func TestProvenanceIsSilentWithoutADescriptor(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		d    *analyze.Descriptor
+	}{
+		{"nil", nil},
+		{"zero", &analyze.Descriptor{}},
+		// Stamped by the resolver but never by the command: not a state main
+		// produces, but the renderer must not print a bare "vexscan" for it.
+		{"tool only", &analyze.Descriptor{Tool: "vexscan"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if out := withDescriptor(t, tc.d, 1); strings.Contains(out, "scanned by:") {
+				t.Errorf("a %s descriptor still printed provenance:\n%s", tc.name, out)
+			}
+		})
+	}
+}
+
+// Each half of the line is optional, and a missing half must not leave the
+// separator behind.
+func TestProvenanceOmitsWhatItDoesNotKnow(t *testing.T) {
+	out := withDescriptor(t, &analyze.Descriptor{Tool: "vexscan", Version: "v0.6.2"}, 1)
+	line := lineWith(t, out, "scanned by:")
+	if line != "scanned by: vexscan v0.6.2" {
+		t.Errorf("provenance line = %q, want no separator and no empty fields", line)
+	}
+
+	// An offline run resolves no advisories, so there is no as-of date to give.
+	out = withDescriptor(t, &analyze.Descriptor{
+		Version: "v0.6.2", Started: fullDescriptor.Started, Duration: "0.2s",
+		AdvisorySource: "https://api.osv.dev/v1",
+	}, 1)
+	if line := lineWith(t, out, "scanned by:"); strings.Contains(line, "advisories from") {
+		t.Errorf("an unanswered advisory source was still dated: %q", line)
 	}
 }

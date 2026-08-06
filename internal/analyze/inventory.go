@@ -21,7 +21,7 @@ import (
 // be used to query OSV before any query is made.
 type InventoryResult struct {
 	Target    string         `json:"target"`
-	Mode      string         `json:"mode"` // "image" | "rootfs"
+	Mode      string         `json:"mode"` // "image" | "rootfs" | "rpm" | "sbom"
 	OS        *OSInfo        `json:"os,omitempty"`
 	Databases []pkgdb.Result `json:"databases"`
 
@@ -37,6 +37,12 @@ type InventoryResult struct {
 	// "pyyaml", and merging the two would hide that both advisory namespaces
 	// apply.
 	Languages []langdb.Result `json:"languages,omitempty"`
+
+	// Notes are things the reader of this list has to know that are not
+	// omissions: packages that were read but have no column here, and the like.
+	// Unreadable is for what could not be read, and conflating the two would
+	// make a complete inventory report as incomplete.
+	Notes []string `json:"notes,omitempty"`
 }
 
 // OSInfo is the distribution identity read from /etc/os-release.
@@ -91,10 +97,13 @@ func Inventory(ctx context.Context, opts Options) (*InventoryResult, error) {
 	}
 	logf := opts.Logf
 
-	// --rpm has no tree, and opening the empty one would only lead every
-	// reader below to correctly report that it found nothing.
+	// --rpm and --sbom have no tree, and opening the empty one would only lead
+	// every reader below to correctly report that it found nothing.
 	if len(opts.RPM) > 0 {
 		return rpmInventory(ctx, opts)
+	}
+	if opts.SBOM != "" {
+		return sbomInventory(opts)
 	}
 
 	img, cleanup, err := openTree(ctx, &opts)
@@ -193,6 +202,67 @@ func rpmInventory(ctx context.Context, opts Options) (*InventoryResult, error) {
 		logf("  %s: %d packages from %s", db.Format, len(db.Packages), db.DB)
 	}
 	res.Unreadable = noteRPMFailures(res.Unreadable, rpms, logf)
+	return res, nil
+}
+
+// sbomInventory lists what --sbom resolved the document to.
+//
+// This is the output worth having before a scan, and more so here than
+// anywhere else: the whole risk of scanning a bill of materials is that a
+// component was read under a name OSV has no records for, and this is where
+// that is visible -- the queried names beside the ones the document wrote.
+func sbomInventory(opts Options) (*InventoryResult, error) {
+	logf := opts.Logf
+	bom, err := readSBOM(&opts)
+	if err != nil {
+		return nil, err
+	}
+
+	res := &InventoryResult{
+		Target:    opts.SBOM,
+		Mode:      opts.mode(),
+		Databases: ospkg.SuppliedResults(opts.sbomOS),
+	}
+
+	// An ecosystem that cannot be derived is recorded, not fatal -- the point
+	// of this output is to see that a scan would have had nothing to query
+	// with, before running one. Skipped when the document named no OS package
+	// at all, where "no ecosystem" is not a problem to report.
+	if len(opts.sbomOS) > 0 {
+		eco, distro, err := ospkg.SuppliedIdentity(opts.sbomOS, opts.OSVEcosystem)
+		res.OS = &OSInfo{ID: distro, Ecosystem: eco}
+		if err != nil {
+			res.OS.EcosystemError = err.Error()
+			logf("  ! %v", err)
+		}
+	}
+
+	for _, l := range []langdb.Result{
+		{Format: langdb.FormatPyPI, Packages: opts.sbomPyPI, Roots: []string{opts.SBOM}},
+		{Format: langdb.FormatNPM, Packages: opts.sbomNPM, Roots: []string{opts.SBOM}},
+		{Format: langdb.FormatMaven, Packages: opts.sbomMaven, Roots: []string{opts.SBOM}},
+	} {
+		if len(l.Packages) > 0 {
+			res.Languages = append(res.Languages, l)
+		}
+	}
+
+	// Go has no column here, because this output is package databases and
+	// installed distributions and a Go module is neither -- image mode reads
+	// them out of binaries and does not list them either. Said rather than
+	// dropped: a document whose Go modules simply vanished from the inventory
+	// would read as a document that had none.
+	if len(opts.sbomGo) > 0 {
+		res.Notes = append(res.Notes, fmt.Sprintf(
+			"%d Go module(s) in this document are not listed above: this output covers package "+
+				"databases and installed distributions, and Go's inventory is neither. They are scanned.",
+			len(opts.sbomGo)))
+	}
+
+	for _, db := range res.Databases {
+		logf("  %s: %d packages from %s", db.Format, len(db.Packages), db.DB)
+	}
+	res.Unreadable = noteSBOMFailures(res.Unreadable, bom, logf)
 	return res, nil
 }
 

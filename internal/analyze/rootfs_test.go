@@ -49,6 +49,15 @@ func TestCheckTarget(t *testing.T) {
 			name: "all three", wantErr: true, errFragment: "--image, --rootfs, --repo",
 			opts: Options{Image: "debian:12", RootFS: "/mnt/x", Repo: "github.com/x/y"},
 		},
+		{name: "sbom alone", opts: Options{SBOM: "bom.json"}},
+		{
+			name: "sbom and image", wantErr: true, errFragment: "--image, --sbom",
+			opts: Options{Image: "debian:12", SBOM: "bom.json"},
+		},
+		{
+			name: "sbom and rpm", wantErr: true, errFragment: "--rpm, --sbom",
+			opts: Options{RPM: []string{"a.rpm"}, SBOM: "bom.json"},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

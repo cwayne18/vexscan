@@ -25,9 +25,9 @@ import (
 // would read as complete. The population is exactly the one the text summary's
 // remediation line counts -- affected, and not already answered by a published
 // VEX statement -- so the two never disagree.
-func renderFixPlan(res *analyze.Result) string {
+func renderFixPlan(res *analyze.Result, o renderOpts) string {
 	var b strings.Builder
-	writeHeader(&b, res)
+	writeHeader(&b, res, o.pal)
 
 	if len(res.Findings) == 0 {
 		writeNoFindings(&b, res)
@@ -68,10 +68,10 @@ func renderFixPlan(res *analyze.Result) string {
 	b.WriteString("\n")
 
 	if len(plan) > 0 {
-		writeUpgradePlan(&b, plan)
+		writeUpgradePlan(&b, plan, o.pal)
 	}
 	if len(noFix) > 0 {
-		writeNoFix(&b, noFix)
+		writeNoFix(&b, noFix, o.pal)
 	}
 
 	// The footer is the fix plan's own, not renderText's. writeFooter repeats
@@ -81,7 +81,7 @@ func renderFixPlan(res *analyze.Result) string {
 	// caveats still repeat verbatim, because that promise is about the scan
 	// and not about the view.
 	if strings.Count(b.String(), "\n") > footerThreshold {
-		writeCaveats(&b, res)
+		writeCaveats(&b, res, o.pal)
 		writeFixSummary(&b, s)
 	}
 	return b.String()
@@ -272,7 +272,7 @@ func isDebianFamily(ecosystem string) bool {
 // report's columns do -- ECOSYSTEM only when the plan spans more than one, KEV
 // only when something in it is actually listed -- so a single-ecosystem image
 // with no known-exploited flaws gets neither.
-func writeUpgradePlan(b *strings.Builder, plan []upgrade) {
+func writeUpgradePlan(b *strings.Builder, plan []upgrade, pal palette) {
 	showEco := distinctEcosystems(plan) > 1
 	showKEV := false
 	for _, u := range plan {
@@ -302,7 +302,7 @@ func writeUpgradePlan(b *strings.Builder, plan []upgrade) {
 			truncate(u.current, 28),
 			truncate(u.fixedIn, 28),
 			fmt.Sprintf("%d", len(u.advisories)),
-			cvss.Display(u.topLabel),
+			pal.severity(cvss.Display(u.topLabel)),
 		)
 		if showKEV {
 			kev := ""
@@ -314,7 +314,8 @@ func writeUpgradePlan(b *strings.Builder, plan []upgrade) {
 		table = append(table, cells)
 	}
 
-	fmt.Fprintf(b, "UPGRADE (%d) - apply these to clear the fixable findings\n", len(plan))
+	fmt.Fprintf(b, "%s - apply these to clear the fixable findings\n",
+		pal.heading(fmt.Sprintf("UPGRADE (%d)", len(plan))))
 	writeTable(b, table)
 	b.WriteString("\n")
 }
@@ -323,7 +324,7 @@ func writeUpgradePlan(b *strings.Builder, plan []upgrade) {
 // honest about what it leaves behind. Same columns and sort as the main
 // report's AFFECTED table, minus the FIXED IN column that would read "no fix"
 // on every row.
-func writeNoFix(b *strings.Builder, rows []analyze.Finding) {
+func writeNoFix(b *strings.Builder, rows []analyze.Finding, pal palette) {
 	sorted := make([]analyze.Finding, len(rows))
 	copy(sorted, rows)
 	sortForDisplay(sorted)
@@ -340,7 +341,7 @@ func writeNoFix(b *strings.Builder, rows []analyze.Finding) {
 	table := [][]string{header}
 	for _, f := range sorted {
 		cells := []string{
-			displaySeverity(f),
+			pal.severity(displaySeverity(f)),
 			shortAdvisory(f),
 			truncate(f.Component(), 40),
 			truncate(f.Version, 28),
@@ -354,7 +355,8 @@ func writeNoFix(b *strings.Builder, rows []analyze.Finding) {
 		table = append(table, cells)
 	}
 
-	fmt.Fprintf(b, "NO FIX YET (%d) - affected, but no patch has shipped\n", len(sorted))
+	fmt.Fprintf(b, "%s - affected, but no patch has shipped\n",
+		pal.heading(fmt.Sprintf("NO FIX YET (%d)", len(sorted))))
 	writeTable(b, table)
 	b.WriteString("\n")
 }

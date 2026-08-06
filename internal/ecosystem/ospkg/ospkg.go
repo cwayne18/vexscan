@@ -160,6 +160,10 @@ type prepared struct {
 	// tree, so there is no filesystem to test presence against. Every verdict
 	// that needs one is gated on this being false.
 	metadataOnly bool
+	// metaOrigin names what handed the inventory in -- MethodRPMFile or
+	// MethodSBOM -- and becomes the evidence origin on the findings it
+	// produces. Empty unless metadataOnly.
+	metaOrigin string
 	// meta is the header metadata for the supplied packages, keyed by metaKey.
 	// Empty unless metadataOnly.
 	meta map[string]pkgdb.Meta

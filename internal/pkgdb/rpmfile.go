@@ -117,6 +117,18 @@ type Meta struct {
 	// real not_present verdict rather than only undetermined ones.
 	ELF []string `json:"elf,omitempty"`
 
+	// FilesKnown reports whether the file list behind ELF was actually read.
+	//
+	// A package that genuinely ships no code and a package nobody looked at
+	// are indistinguishable by ELF alone -- both have len(ELF) == 0 -- and the
+	// two call for opposite verdicts: one is "there is no code here", the
+	// other is "nothing was learned". Only a reader with the header in front
+	// of it can tell them apart, so only ReadFile sets this. Every other way a
+	// Meta comes into being -- an SBOM component, a hand-built literal --
+	// leaves it false and gets the cautious answer, which is the direction a
+	// zero value has to fall in a tool whose worst failure is a clean report.
+	FilesKnown bool `json:"files_known,omitempty"`
+
 	// SourcePackage is true for a .src.rpm. Source packages install nothing and
 	// are not what a distribution files advisories against, so callers skip
 	// them rather than report a package that cannot be installed.
@@ -125,6 +137,13 @@ type Meta struct {
 
 // HasELF reports whether the package ships any executable object.
 func (m Meta) HasELF() bool { return len(m.ELF) > 0 }
+
+// CanRuleOutCode reports whether this metadata is enough to say the package
+// installs nothing that could execute.
+//
+// An empty ELF list is only evidence when its emptiness was observed, so the
+// file list has to be known before its silence means anything.
+func (m Meta) CanRuleOutCode() bool { return m.FilesKnown && !m.HasELF() }
 
 // ReadFile parses an RPM package file's headers into the same Package the rpm
 // database reader produces, so nothing downstream can tell the difference.
@@ -178,13 +197,18 @@ func ReadFile(r io.Reader) (Package, Meta, error) {
 		Version: rpmEVR(int(h.i32(tagEpoch)), h.str(tagVersion), h.str(tagRelease)),
 		Epoch:   int(h.i32(tagEpoch)),
 		Arch:    h.str(tagArch),
-		Source:  sourceRPMName(h.str(tagSourceRPM)),
+		Source:  SourceRPMName(h.str(tagSourceRPM)),
 		Files:   normalizePaths(h.files()),
 	}
 	meta := Meta{
 		Vendor:       h.str(tagVendor),
 		Distribution: h.str(tagDistribution),
 		ELF:          h.elfFiles(),
+		// The header was read to the end, so an empty ELF list above is a
+		// package that ships no code and not a question that went unasked. Set
+		// here and nowhere else: every error path above returns Meta{}, and
+		// that zero value has to keep meaning "unknown".
+		FilesKnown: true,
 		// A source package has no SOURCERPM of its own, and rpm marks it with
 		// SOURCEPACKAGE. Either alone would misfire -- some binary packages
 		// genuinely lack SOURCERPM -- so both are consulted.
@@ -442,11 +466,11 @@ func rpmEVR(epoch int, version, release string) string {
 	return fmt.Sprintf("%d:%s", epoch, evr)
 }
 
-// sourceRPMName extracts the source package name from a SOURCERPM value like
+// SourceRPMName extracts the source package name from a SOURCERPM value like
 // "openssl-3.2.2-16.el10.src.rpm", which is name-version-release.src.rpm. The
 // name itself may contain hyphens ("java-21-openjdk"), so the tail is stripped
 // by position from the right rather than by splitting from the left.
-func sourceRPMName(srpm string) string {
+func SourceRPMName(srpm string) string {
 	s := strings.TrimSuffix(strings.TrimSpace(srpm), ".src.rpm")
 	s = strings.TrimSuffix(s, ".nosrc.rpm")
 	if s == "" || s == srpm {

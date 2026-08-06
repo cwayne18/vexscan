@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/cwayne18/vexscan/internal/ecosystem"
+	"github.com/cwayne18/vexscan/internal/langdb"
 	"github.com/cwayne18/vexscan/internal/modgraph"
 	"github.com/cwayne18/vexscan/internal/osv"
 	"github.com/cwayne18/vexscan/internal/target"
@@ -511,5 +512,68 @@ func TestCodeFilesCountsConsoleScripts(t *testing.T) {
 	got := codeFiles([]string{"/usr/bin/pygmentize", "/usr/share/doc/README"})
 	if len(got) != 1 || got[0] != "/usr/bin/pygmentize" {
 		t.Errorf("codeFiles = %v", got)
+	}
+}
+
+// sbomDist is one PyPI component out of a bill of materials: coordinates and
+// nothing else. No RECORD, no top_level.txt, no directory -- Files and
+// ImportNames are both unset and both unknown, which is the whole point.
+func sbomDist(name, version string) langdb.Package {
+	return langdb.Package{Format: langdb.FormatPyPI, Name: name, Version: version, Dir: "bom.json"}
+}
+
+// only returns the single finding, and fails if there is not exactly one.
+func only(t *testing.T, got map[string]ecosystem.Finding) ecosystem.Finding {
+	t.Helper()
+	if len(got) != 1 {
+		t.Fatalf("got %d findings, want 1: %v", len(got), got)
+	}
+	for _, f := range got {
+		return f
+	}
+	return ecosystem.Finding{}
+}
+
+// A handed-in inventory decides nothing. Both of this plugin's tests read the
+// distribution's file list, and a component out of a bill of materials has
+// none -- which the code below the metadata branch would take for a
+// distribution that installs no importable Python and clear outright.
+func TestSBOMComponentsAreNeverCleared(t *testing.T) {
+	img := pyImage(t, nil) // the empty tree --sbom stands up
+	opts := Options{Packages: []langdb.Package{sbomDist("django", "4.2.1")}}
+
+	f := only(t, statusesWith(t, img, []ecosystem.Subject{{Raw: "all"}}, opts))
+	if f.Status != ecosystem.StatusUndetermined {
+		t.Errorf("status = %q, want %q", f.Status, ecosystem.StatusUndetermined)
+	}
+	if f.Method == MethodNoCode {
+		t.Errorf("method = %q: an SBOM lists no files, so it cannot rule code out", f.Method)
+	}
+	if f.Reason != ecosystem.ReasonNoReachabilityTest {
+		t.Errorf("reason = %q, want %q -- the report sizes its caveat by counting this",
+			f.Reason, ecosystem.ReasonNoReachabilityTest)
+	}
+	if len(f.Evidence) != 1 || f.Evidence[0].Origin != ecosystem.OriginSBOM {
+		t.Fatalf("evidence = %+v, want one row from %q", f.Evidence, ecosystem.OriginSBOM)
+	}
+	if !strings.Contains(f.Evidence[0].Detail, "bill of materials") {
+		t.Errorf("evidence does not say where it came from: %q", f.Evidence[0].Detail)
+	}
+}
+
+// An absent component says what was consulted, and it was not an image.
+func TestSBOMAbsenceDoesNotClaimAnImage(t *testing.T) {
+	img := pyImage(t, nil)
+	opts := Options{Packages: []langdb.Package{sbomDist("django", "4.2.1")}}
+
+	f := only(t, statusesWith(t, img, []ecosystem.Subject{{Ecosystem: "pypi", Name: "flask", Raw: "pypi:flask"}}, opts))
+	if f.Status != ecosystem.StatusNotPresent {
+		t.Errorf("status = %q, want %q", f.Status, ecosystem.StatusNotPresent)
+	}
+	if len(f.Evidence) != 1 {
+		t.Fatalf("evidence = %+v, want one row", f.Evidence)
+	}
+	if got := f.Evidence[0].Detail; !strings.Contains(got, "bill of materials") || strings.Contains(got, "image") {
+		t.Errorf("evidence talks about the wrong thing: %q", got)
 	}
 }

@@ -13,6 +13,7 @@ import (
 
 	"github.com/cwayne18/vexscan/internal/binscan"
 	"github.com/cwayne18/vexscan/internal/ecosystem"
+	"github.com/cwayne18/vexscan/internal/osv"
 	"github.com/cwayne18/vexscan/internal/source"
 	"github.com/cwayne18/vexscan/internal/target"
 )
@@ -628,5 +629,87 @@ func TestPluginIdentity(t *testing.T) {
 	}
 	if !ecosystem.MatchEcosystem(p, "Go") || !ecosystem.MatchEcosystem(p, "golang") {
 		t.Error("the plugin should be selectable by both its id and its ecosystem")
+	}
+}
+
+// sbomFindings runs the whole plugin over one advisory with a handed-in
+// inventory and no binaries to find.
+func sbomFindings(t *testing.T, mods []Module, subjects []ecosystem.Subject) []ecosystem.Finding {
+	t.Helper()
+	ctx := context.Background()
+	// The empty tree --sbom stands up: there is nothing in it, and nothing
+	// below may go looking.
+	img := &target.Image{Ref: "--sbom bom.json", FS: target.NewDirFS(t.TempDir())}
+	p := New(Options{Modules: mods})
+
+	comps, err := p.InventoryImage(ctx, img, subjects)
+	if err != nil {
+		t.Fatalf("InventoryImage: %v", err)
+	}
+	adv := &osv.Advisory{ID: "CVE-2024-0001", Summary: "a hole"}
+	items := make([]ecosystem.WorkItem, 0, len(comps))
+	for _, c := range comps {
+		items = append(items, ecosystem.WorkItem{
+			Component:  c,
+			Advisories: map[string]*osv.Advisory{adv.ID: adv},
+			Requested:  []string{adv.ID},
+			Targeted:   len(subjects) > 0 && !subjects[0].MatchesAll(),
+		})
+	}
+	findings, err := p.AnalyzeImage(ctx, img, items)
+	if err != nil {
+		t.Fatalf("AnalyzeImage: %v", err)
+	}
+	return findings
+}
+
+// A handed-in inventory decides nothing. Every test this plugin makes reads a
+// binary -- the symbol table, or govulncheck over it -- and there is no
+// binary; without the metadata branch the loop over an empty binary list
+// reports nothing at all for a module the document plainly names, which reads
+// as a module with no advisories against it.
+func TestSBOMModulesAreReportedAndUndetermined(t *testing.T) {
+	mods := []Module{{Path: "golang.org/x/net", Version: "v0.17.0"}}
+
+	findings := sbomFindings(t, mods, []ecosystem.Subject{{Raw: "all"}})
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+	}
+	f := findings[0]
+	if f.Module != "golang.org/x/net" || f.Version != "v0.17.0" {
+		t.Errorf("coordinates = %s@%s, want golang.org/x/net@v0.17.0", f.Module, f.Version)
+	}
+	if f.Status != ecosystem.StatusUndetermined {
+		t.Errorf("status = %q, want %q", f.Status, ecosystem.StatusUndetermined)
+	}
+	if f.Reason != ecosystem.ReasonNoReachabilityTest {
+		t.Errorf("reason = %q, want %q -- the report sizes its caveat by counting this",
+			f.Reason, ecosystem.ReasonNoReachabilityTest)
+	}
+	if len(f.Evidence) != 1 || f.Evidence[0].Origin != ecosystem.OriginSBOM {
+		t.Fatalf("evidence = %+v, want one row from %q", f.Evidence, ecosystem.OriginSBOM)
+	}
+	if !strings.Contains(f.Evidence[0].Detail, "bill of materials") {
+		t.Errorf("evidence does not say where it came from: %q", f.Evidence[0].Detail)
+	}
+}
+
+// The same module listed twice is one thing to say, and a subject naming one
+// module selects only that one -- the two filters group and groupAll apply to
+// binaries, applied here to a document instead.
+func TestSBOMModulesAreDedupedAndSelectable(t *testing.T) {
+	mods := []Module{
+		{Path: "golang.org/x/net", Version: "v0.17.0"},
+		{Path: "golang.org/x/net", Version: "v0.17.0"},
+		{Path: "golang.org/x/text", Version: "v0.13.0"},
+	}
+
+	if got := len(sbomFindings(t, mods, []ecosystem.Subject{{Raw: "all"}})); got != 2 {
+		t.Errorf("got %d findings for --all, want 2 (the repeat is one module)", got)
+	}
+
+	one := sbomFindings(t, mods, []ecosystem.Subject{{Name: "golang.org/x/text", Raw: "golang.org/x/text"}})
+	if len(one) != 1 || one[0].Module != "golang.org/x/text" {
+		t.Errorf("a named module selected %+v, want only golang.org/x/text", one)
 	}
 }

@@ -7,6 +7,7 @@ import (
 
 	"github.com/cwayne18/vexscan/internal/ecosystem"
 	"github.com/cwayne18/vexscan/internal/elfgraph"
+	"github.com/cwayne18/vexscan/internal/pkgdb"
 )
 
 // Methods name the deterministic test behind a status, and appear in the
@@ -24,13 +25,21 @@ const (
 	// because it names the absence of a test and not a test -- the statuses it
 	// accompanies are undetermined.
 	MethodRPMFile = "rpm-file-metadata"
+	// MethodSBOM: a bill of materials said the package is there and nothing
+	// else. Like MethodRPMFile it is an evidence origin rather than a method,
+	// and it is the weaker of the two: an rpm header at least lists the files
+	// the package would install, so it can rule out code; a CycloneDX component
+	// is a name, a version and a purl, so it can rule out nothing.
+	//
+	// Shared with the language plugins, which say exactly the same thing about
+	// exactly the same document. See ecosystem.OriginSBOM.
+	MethodSBOM = ecosystem.OriginSBOM
 )
 
 // ReasonNoReachabilityTest is the reason on every finding a metadata-only scan
-// could not decide. It is exported because the report counts them to write its
-// caveat, and a caveat that disagreed with the rows it explains would be worse
-// than none.
-const ReasonNoReachabilityTest = "no_reachability_test_possible"
+// could not decide. See ecosystem.ReasonNoReachabilityTest, where it is shared
+// with the plugins that produce the same rows from the same SBOM.
+const ReasonNoReachabilityTest = ecosystem.ReasonNoReachabilityTest
 
 // evaluator holds what every finding for one component needs.
 type evaluator struct {
@@ -39,13 +48,18 @@ type evaluator struct {
 	sym   *symbolCache
 	trust bool // --trust-import-absence
 	// meta is set when the inventory was handed in rather than read out of a
-	// tree, and g is nil. See evaluateMetadata.
-	meta bool
-	logf func(string, ...any)
+	// tree, and g is nil. See evaluateMetadata. origin names what handed it in,
+	// and is what the evidence rows say.
+	meta   bool
+	origin string
+	logf   func(string, ...any)
 }
 
 func (p *Plugin) evaluator(pr *prepared, g *elfgraph.Graph, st *state) evaluator {
-	return evaluator{g: g, st: st, sym: pr.syms, trust: p.TrustImportAbsence, meta: pr.metadataOnly, logf: p.Logf}
+	return evaluator{
+		g: g, st: st, sym: pr.syms, trust: p.TrustImportAbsence,
+		meta: pr.metadataOnly, origin: pr.metaOrigin, logf: p.Logf,
+	}
 }
 
 // evaluate decides one advisory against one installed package.
@@ -65,6 +79,9 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 	// carries a record for this id makes no difference to the fact that the
 	// image does not contain the package the id was asked about.
 	if e.st.absent {
+		if e.metaOrigin() == MethodSBOM {
+			return ecosystem.SBOMAbsent(f, c.Name, MethodInventory)
+		}
 		f.Status = ecosystem.StatusNotPresent
 		f.Justification = "component_not_present"
 		f.Method = MethodInventory
@@ -176,14 +193,21 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 	return f
 }
 
-// evaluateMetadata decides one advisory against a package file, with no
-// filesystem behind it.
+// evaluateMetadata decides one advisory against an inventory handed in from
+// outside, with no filesystem behind it.
 //
-// Two answers are available and the third one is not. A package whose header
-// lists no ELF object installs no code that could execute, and that is the
-// same evidence MethodNoCode rests on when it is read out of an image -- so it
-// is reused verbatim rather than given a weaker name for having come from a
-// file. Everything else is undetermined.
+// At most two answers are available and the third one is not. A package whose
+// header lists no ELF object installs no code that could execute, and that is
+// the same evidence MethodNoCode rests on when it is read out of an image --
+// so it is reused verbatim rather than given a weaker name for having come
+// from a file. Everything else is undetermined.
+//
+// Whether even that first answer is available depends on the source. An rpm
+// header carries FILECLASS, so it earns not_present; a description that lists
+// no files at all -- an SBOM component, say -- has not established that the
+// package ships no code, only that nobody looked. Meta.CanRuleOutCode is where
+// those two part company, and it is deliberately the conservative test: the
+// cost of the wrong answer here is a package declared clean that is not.
 //
 // It is never linked and never not_in_path. Both of those are claims about
 // what the dynamic linker would load, no closure ran, and there is nothing to
@@ -192,7 +216,7 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 func (e evaluator) evaluateMetadata(f ecosystem.Finding) ecosystem.Finding {
 	pkg, meta := e.st.pkg, e.st.meta
 
-	if !meta.HasELF() {
+	if meta.CanRuleOutCode() {
 		f.Status = ecosystem.StatusNotPresent
 		f.Justification = "vulnerable_code_not_present"
 		f.Method = MethodNoCode
@@ -207,11 +231,35 @@ func (e evaluator) evaluateMetadata(f ecosystem.Finding) ecosystem.Finding {
 	f.Status = ecosystem.StatusUndetermined
 	f.Reason = ReasonNoReachabilityTest
 	f.Evidence = []ecosystem.Evidence{{
-		Origin: MethodRPMFile,
-		Detail: fmt.Sprintf("%s would install %s, but this scan read a package file and not a system, so nothing can be said about whether they would be loaded",
-			pkg.Name, objects(meta.ELF)),
+		Origin: e.metaOrigin(),
+		Detail: metadataDetail(pkg, meta),
 	}}
 	return f
+}
+
+// metaOrigin is the evidence origin for a handed-in inventory, defaulting to
+// the rpm file this path was built for. The default is here as well as in
+// suppliedOrigin because an evaluator can be built directly in a test.
+func (e evaluator) metaOrigin() string {
+	if e.origin != "" {
+		return e.origin
+	}
+	return MethodRPMFile
+}
+
+// metadataDetail says what the metadata did and did not establish.
+//
+// The two cases are separate sentences because they are separate sizes of gap.
+// A package known to ship ELF objects that could not be traced leaves one
+// question open; a package whose file list was never available leaves two, and
+// a reader deciding how much to trust the row needs to know which.
+func metadataDetail(pkg pkgdb.Package, meta pkgdb.Meta) string {
+	if !meta.FilesKnown {
+		return fmt.Sprintf("%s was described by metadata that does not list its files, so neither whether it installs executable code nor whether that code would be loaded can be answered from it",
+			pkg.Name)
+	}
+	return fmt.Sprintf("%s would install %s, but this scan read a package file and not a system, so nothing can be said about whether they would be loaded",
+		pkg.Name, objects(meta.ELF))
 }
 
 // blockers are the taints that stop this package's objects being declared

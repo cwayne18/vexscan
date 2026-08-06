@@ -22,18 +22,32 @@ import (
 // Plain aligned columns, not box drawing. These reports are pasted into gists,
 // CI logs and terminals of every width, and are grepped and cut. A row that
 // survives all of that is worth more than one that looks better in a
-// screenshot. There is no colour for the same reason.
+// screenshot.
 //
-// pager.go does look at whether stdout is a tty, which is not a reversal of
-// that: it decides whether to run less, and changes no bytes. Everything here
-// renders identically for a terminal, a file and a pipe -- including the footer
-// below, whose threshold is counted in the report's own lines and never in the
-// terminal's height.
+// Colour is the one exception, and is held to the same rule: it is carried in a
+// palette that is empty unless a human is watching (color.go), it is never the
+// only thing saying something, and stripping the escapes from a coloured report
+// reproduces the uncoloured one byte for byte. A file, a gist and a pipe get the
+// empty palette, so the bytes that get diffed and grepped are unchanged --
+// including the footer below, whose threshold is counted in the report's own
+// lines and never in the terminal's height.
+
+// renderOpts is how a report is rendered, as opposed to what is in it.
+//
+// One struct rather than two parameters because the palette has to reach the
+// same writers --details does, and threading a second argument through sixteen
+// of them makes every one of their signatures a list. The zero value is the
+// plain, uncoloured, summary-only report, which is what the tests want and what
+// a pipe gets.
+type renderOpts struct {
+	details bool
+	pal     palette
+}
 
 // renderText renders a scan result for humans.
-func renderText(res *analyze.Result, details bool) string {
+func renderText(res *analyze.Result, o renderOpts) string {
 	var b strings.Builder
-	writeHeader(&b, res)
+	writeHeader(&b, res, o.pal)
 
 	if len(res.Findings) == 0 {
 		writeNoFindings(&b, res)
@@ -42,14 +56,14 @@ func renderText(res *analyze.Result, details bool) string {
 
 	writeSummary(&b, res, false)
 	for _, s := range sections(res) {
-		writeSection(&b, s, details)
+		writeSection(&b, s, o)
 	}
 
 	// Long enough that the header is gone: say it all again. Measured on the
 	// report rather than on the terminal, so a file, a gist and a paged
 	// terminal all get the same bytes.
 	if strings.Count(b.String(), "\n") > footerThreshold {
-		writeFooter(&b, res)
+		writeFooter(&b, res, o.pal)
 	}
 	return b.String()
 }
@@ -88,13 +102,49 @@ func writeNoFindings(b *strings.Builder, res *analyze.Result) {
 // never renders as a clean one, and no amount of table formatting below is
 // allowed to push them out of sight. That last promise is why writeFooter
 // exists: at 172 lines, the table below pushes them out of sight anyway.
-func writeHeader(b *strings.Builder, res *analyze.Result) {
+func writeHeader(b *strings.Builder, res *analyze.Result, pal palette) {
 	fmt.Fprintf(b, "vexscan report (%s) for %s\n", res.Mode, res.Target)
 	if res.Module != "" {
 		fmt.Fprintf(b, "module: %s\n", res.Module)
 	}
-	writeCaveats(b, res)
+	writeProvenance(b, res.Descriptor)
+	writeCaveats(b, res, pal)
 	b.WriteString("\n")
+}
+
+// writeProvenance names the build that ran and the advisories it read.
+//
+// One line, in the header and deliberately not in the footer: it is not a
+// caveat, and repeating it would put it beside the INCOMPLETE banners that are
+// repeated because they matter. It is here at all because a saved report is
+// read long after the run, and an empty one raises exactly two questions --
+// which build produced it, and how old the advisories behind it are.
+func writeProvenance(b *strings.Builder, d *analyze.Descriptor) {
+	if d == nil {
+		return
+	}
+	parts := make([]string, 0, 3)
+	if d.Version != "" {
+		name := d.Tool
+		if name == "" {
+			name = "vexscan"
+		}
+		parts = append(parts, name+" "+d.Version)
+	}
+	if !d.Started.IsZero() {
+		when := d.Started.UTC().Format("2006-01-02 15:04 MST")
+		if d.Duration != "" {
+			when += ", " + d.Duration
+		}
+		parts = append(parts, when)
+	}
+	if !d.AdvisoriesAsOf.IsZero() && d.AdvisorySource != "" {
+		parts = append(parts, "advisories from "+d.AdvisorySource)
+	}
+	if len(parts) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "scanned by: %s\n", strings.Join(parts, " -- "))
 }
 
 // writeCaveats writes everything that changes how the rows should be read: the
@@ -104,7 +154,12 @@ func writeHeader(b *strings.Builder, res *analyze.Result) {
 // Split out of writeHeader so the footer can repeat it verbatim. A caveat that
 // appeared at one end of a long report and not the other would be worse than
 // one printed twice.
-func writeCaveats(b *strings.Builder, res *analyze.Result) {
+func writeCaveats(dst *strings.Builder, res *analyze.Result, pal palette) {
+	// Rendered into a sub-builder so palette.banners can bold every caveat
+	// prefix in one pass; see its comment for why that beats ten call sites.
+	b := &strings.Builder{}
+	defer func() { dst.WriteString(pal.banners(b.String())) }()
+
 	for _, e := range res.Ecosystems {
 		if e.Error != "" {
 			fmt.Fprintf(b, "INCOMPLETE: ecosystem %s did not run - %s\n", e.ID, e.Error)
@@ -150,15 +205,22 @@ func writeCaveats(b *strings.Builder, res *analyze.Result) {
 	writeTriageCaveats(b, res)
 }
 
-// writeMetadataCaveat says that --rpm read a package file and not a system.
+// writeMetadataCaveat says that --rpm or --sbom described the packages rather
+// than a system holding them.
 //
 // It is a NOTE and not an INCOMPLETE banner: nothing failed, and the scan read
 // everything there was to read. What it changes is what the rows are allowed to
 // mean -- an undetermined row here is not one the tool gave up on, it is one
 // the input cannot answer. Without this the report is indistinguishable from an
 // image scan that could not close over anything.
+//
+// Both modes, with different wording, because they lose different amounts. An
+// rpm header still lists the files the package installs, so --rpm can rule a
+// package out for shipping no code; a CycloneDX component lists nothing, so
+// --sbom cannot rule anything out at all. Saying the same sentence over both
+// would overstate the weaker one.
 func writeMetadataCaveat(b *strings.Builder, res *analyze.Result) {
-	if res.Mode != "rpm" {
+	if res.Mode != "rpm" && res.Mode != "sbom" {
 		return
 	}
 	undetermined, noCode := 0, 0
@@ -170,19 +232,34 @@ func writeMetadataCaveat(b *strings.Builder, res *analyze.Result) {
 			noCode++
 		}
 	}
-	// The first two lines are unconditional. They are worth printing even with
-	// no findings at all to explain: "No findings" out of a package file is a
-	// weaker statement than the same words out of an image, and this is the
-	// whole of the difference.
-	b.WriteString("NOTE: this read package metadata, not an installed system. No ELF\n")
-	b.WriteString("      reachability test could run -- there is no filesystem to trace.\n")
+	// The opening lines are unconditional. They are worth printing even with no
+	// findings at all to explain: "No findings" out of a document is a weaker
+	// statement than the same words out of an image, and this is the whole of
+	// the difference.
+	if res.Mode == "sbom" {
+		b.WriteString("NOTE: this read a bill of materials, not an installed system. No ELF\n")
+		b.WriteString("      reachability test could run -- there is no filesystem to trace -- and a\n")
+		b.WriteString("      CycloneDX component does not list the files it installs, so unlike a\n")
+		b.WriteString("      package file it cannot rule a package out for shipping no code either.\n")
+		b.WriteString("      Every row below is a package the document says is installed, and\n")
+		b.WriteString("      nothing here can say whether its code would ever run.\n")
+	} else {
+		b.WriteString("NOTE: this read package metadata, not an installed system. No ELF\n")
+		b.WriteString("      reachability test could run -- there is no filesystem to trace.\n")
+	}
 
 	if undetermined > 0 {
-		fmt.Fprintf(b, "      %d finding(s) below are undetermined for that reason. For scale: on a\n", undetermined)
-		// The reference measurement is here because the obvious next question
-		// is what the missing test would have been worth, and the honest answer
-		// on the distribution this was built against is: about one finding.
-		b.WriteString("      measured SUSE 15.6 image that test ruled out 1 finding of 47.\n")
+		if res.Mode == "sbom" {
+			fmt.Fprintf(b, "      %d finding(s) below are undetermined for that reason. Scan the image\n", undetermined)
+			b.WriteString("      or tree these components came from to get an answer.\n")
+		} else {
+			fmt.Fprintf(b, "      %d finding(s) below are undetermined for that reason. For scale: on a\n", undetermined)
+			// The reference measurement is here because the obvious next
+			// question is what the missing test would have been worth, and the
+			// honest answer on the distribution this was built against is:
+			// about one finding.
+			b.WriteString("      measured SUSE 15.6 image that test ruled out 1 finding of 47.\n")
+		}
 	}
 	if noCode > 0 {
 		fmt.Fprintf(b, "      %d finding(s) below are ruled out on the header alone, which is the\n", noCode)
@@ -255,8 +332,8 @@ const footerThreshold = 30
 // after reading 154 rows. The caveats, because an INCOMPLETE banner that only
 // appears above 154 rows is one nobody sees -- and this is also the end a CI
 // log, a piped file and a gist all land on.
-func writeFooter(b *strings.Builder, res *analyze.Result) {
-	writeCaveats(b, res)
+func writeFooter(b *strings.Builder, res *analyze.Result, pal palette) {
+	writeCaveats(b, res, pal)
 	writeSummary(b, res, true)
 }
 
@@ -625,12 +702,12 @@ func sections(res *analyze.Result) []section {
 }
 
 // writeSection prints one heading and its table.
-func writeSection(b *strings.Builder, s section, details bool) {
+func writeSection(b *strings.Builder, s section, o renderOpts) {
 	rows := make([]analyze.Finding, len(s.findings))
 	copy(rows, s.findings)
 	sortForDisplay(rows)
 
-	fmt.Fprintf(b, "%s (%d) - %s\n", s.title, len(rows), s.note)
+	fmt.Fprintf(b, "%s - %s\n", o.pal.heading(fmt.Sprintf("%s (%d)", s.title, len(rows))), s.note)
 
 	// The VERDICT column earns its place only when the section holds more than
 	// one status. In a Debian image everything affected is "linked", and a
@@ -674,7 +751,7 @@ func writeSection(b *strings.Builder, s section, details bool) {
 	table := [][]string{header}
 	for _, f := range rows {
 		cells := []string{
-			displaySeverity(f),
+			o.pal.severity(displaySeverity(f)),
 			shortAdvisory(f),
 			truncate(f.Component(), 40),
 			truncate(f.Version, 28),
@@ -689,7 +766,7 @@ func writeSection(b *strings.Builder, s section, details bool) {
 			cells = append(cells, displayKEV(f))
 		}
 		if showVerdict {
-			cells = append(cells, string(f.Status))
+			cells = append(cells, o.pal.status(f.Status, string(f.Status)))
 		}
 		if s.vex {
 			cells = append(cells, f.VEX.Status, truncate(vexReason(f.VEX), 44))
@@ -700,10 +777,10 @@ func writeSection(b *strings.Builder, s section, details bool) {
 	}
 	writeTable(b, table)
 
-	if details {
+	if o.details {
 		b.WriteString("\n")
 		for _, f := range rows {
-			writeDetail(b, f)
+			writeDetail(b, f, o.pal)
 		}
 	}
 	b.WriteString("\n")
@@ -965,6 +1042,9 @@ func shortAdvisory(f analyze.Finding) string {
 // Two spaces between columns and no padding after the last one, matching
 // renderInventory. Trailing whitespace is not written, so a row can be diffed
 // and a column can be cut without picking up invisible padding.
+//
+// Widths are measured with visibleWidth and not with len([]rune(cell)), because
+// a coloured cell is runes that occupy no columns; see its comment.
 func writeTable(b *strings.Builder, rows [][]string) {
 	if len(rows) == 0 {
 		return
@@ -972,8 +1052,8 @@ func writeTable(b *strings.Builder, rows [][]string) {
 	widths := make([]int, len(rows[0]))
 	for _, r := range rows {
 		for i, cell := range r {
-			if i < len(widths) && len([]rune(cell)) > widths[i] {
-				widths[i] = len([]rune(cell))
+			if i < len(widths) && visibleWidth(cell) > widths[i] {
+				widths[i] = visibleWidth(cell)
 			}
 		}
 	}
@@ -985,7 +1065,7 @@ func writeTable(b *strings.Builder, rows [][]string) {
 			}
 			line.WriteString(cell)
 			if i < len(r)-1 {
-				line.WriteString(strings.Repeat(" ", widths[i]-len([]rune(cell))))
+				line.WriteString(strings.Repeat(" ", widths[i]-visibleWidth(cell)))
 			}
 		}
 		b.WriteString(strings.TrimRight(line.String(), " "))
@@ -1021,12 +1101,14 @@ func listCVEs(cves []string, max int) string {
 // writeDetail prints everything known about one finding: the block the report
 // used to print for every finding, plus the evidence and the plugin's own
 // characterisation, neither of which the text output has ever shown.
-func writeDetail(b *strings.Builder, f analyze.Finding) {
+func writeDetail(b *strings.Builder, f analyze.Finding, pal palette) {
 	id := f.CVE
 	if f.GoID != "" && f.GoID != f.CVE {
 		id = fmt.Sprintf("%s (%s)", f.CVE, f.GoID)
 	}
-	fmt.Fprintf(b, "%-22s %s\n", statusLabel(f.Status), component(f))
+	// Padded before it is coloured: %-22s counts the escape bytes, and the
+	// verdict is the first column of every detail block.
+	fmt.Fprintf(b, "%s %s\n", pal.status(f.Status, fmt.Sprintf("%-22s", statusLabel(f.Status))), component(f))
 	fmt.Fprintf(b, "  cve:      %s\n", id)
 	if len(f.Upstream) > 0 {
 		fmt.Fprintf(b, "  fixes:    %s\n", listCVEs(f.Upstream, 5))

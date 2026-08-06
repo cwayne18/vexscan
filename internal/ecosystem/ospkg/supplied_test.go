@@ -5,21 +5,38 @@ import (
 	"testing"
 
 	"github.com/cwayne18/vexscan/internal/ecosystem"
+	"github.com/cwayne18/vexscan/internal/osv"
 	"github.com/cwayne18/vexscan/internal/pkgdb"
 	"github.com/cwayne18/vexscan/internal/target"
 )
 
+// rocky and sle stand in for a header ReadFile parsed to the end, so both set
+// FilesKnown -- without it their empty ELF lists would mean "nobody looked"
+// rather than "this package ships no code", and the two lead to opposite
+// verdicts. See TestAnUnreadFileListIsNotAClearance.
 func rocky(name, version string) Supplied {
 	return Supplied{
 		Package: pkgdb.Package{Format: pkgdb.FormatRPM, Name: name, Version: version, Arch: "x86_64", DB: "/tmp/repo/" + name + ".rpm"},
-		Meta:    pkgdb.Meta{Vendor: "Rocky Enterprise Software Foundation", Distribution: "Rocky Linux 9"},
+		Meta:    pkgdb.Meta{Vendor: "Rocky Enterprise Software Foundation", Distribution: "Rocky Linux 9", FilesKnown: true},
 	}
 }
 
 func sle(name, version string) Supplied {
 	return Supplied{
 		Package: pkgdb.Package{Format: pkgdb.FormatRPM, Name: name, Version: version, Arch: "x86_64", DB: "/tmp/sle/" + name + ".rpm"},
-		Meta:    pkgdb.Meta{Vendor: "SUSE LLC <https://www.suse.com/>", Distribution: "SUSE Linux Enterprise 15"},
+		Meta:    pkgdb.Meta{Vendor: "SUSE LLC <https://www.suse.com/>", Distribution: "SUSE Linux Enterprise 15", FilesKnown: true},
+	}
+}
+
+// fromSBOM stands in for a component sbomsrc built out of a purl: coordinates,
+// a distribution stated outright, and nothing else. No vendor, no distribution
+// header, no file list -- it is deliberately the emptiest Supplied that still
+// has to produce a usable scan.
+func fromSBOM(name, version string, rel osv.Release) Supplied {
+	return Supplied{
+		Package: pkgdb.Package{Format: pkgdb.FormatDeb, Name: name, Version: version, Arch: "amd64", DB: "bom.json"},
+		Release: rel,
+		Origin:  MethodSBOM,
 	}
 }
 
@@ -182,6 +199,76 @@ func TestSuppliedIdentity(t *testing.T) {
 		}
 	})
 
+	// An SBOM component has no VENDOR and no DISTRIBUTION -- everything
+	// releaseFromHeader works from is absent -- so without the stated release
+	// this inventory would resolve to nothing at all and demand
+	// --osv-ecosystem for a document that plainly says which distribution it
+	// describes.
+	t.Run("a stated release carries an inventory with no headers", func(t *testing.T) {
+		pkgs := []Supplied{
+			fromSBOM("libssl3", "3.0.11-1~deb12u2", osv.Release{ID: "debian", VersionID: "12"}),
+			fromSBOM("zlib1g", "1:1.2.13.dfsg-1", osv.Release{ID: "debian", VersionID: "12"}),
+		}
+		eco, distro, err := SuppliedIdentity(pkgs, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if eco != "Debian:12" {
+			t.Errorf("ecosystem = %q, want Debian:12", eco)
+		}
+		if distro != "debian" {
+			t.Errorf("distro = %q, want debian for the purl namespace", distro)
+		}
+	})
+
+	// The LTS suffix is the reason the whole Release travels rather than an id
+	// and a version: "Ubuntu:22.04" is a real ecosystem that answers HTTP 200
+	// with no records, so getting it wrong renders as a clean image.
+	t.Run("a stated release keeps its LTS suffix", func(t *testing.T) {
+		pkgs := []Supplied{fromSBOM("libssl3", "3.0.2-0ubuntu1.15", osv.ReleaseFromDistro("ubuntu", "22.04"))}
+		eco, _, err := SuppliedIdentity(pkgs, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if eco != "Ubuntu:22.04:LTS" {
+			t.Errorf("ecosystem = %q, want Ubuntu:22.04:LTS", eco)
+		}
+	})
+
+	// A stated identity beats an inferred one. The headers here are a synthesis
+	// from two free-text tags; the release was read off a field whose whole job
+	// is to say this.
+	t.Run("a stated release wins over the headers", func(t *testing.T) {
+		s := rocky("openssl-libs", "1:3.5.5-2.el9_8")
+		s.Release = osv.Release{ID: "almalinux", VersionID: "9"}
+		eco, distro, err := SuppliedIdentity([]Supplied{s}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if eco != "AlmaLinux:9" || distro != "almalinux" {
+			t.Errorf("eco = %q, distro = %q; want the stated release, not the header", eco, distro)
+		}
+	})
+
+	// The error has to describe the document the user handed over. Telling
+	// someone who ran --sbom that their VENDOR headers are unusable sends them
+	// looking at rpm files they never had.
+	t.Run("an SBOM with no distro says so in its own vocabulary", func(t *testing.T) {
+		pkgs := []Supplied{fromSBOM("libssl3", "3.0.11-1~deb12u2", osv.Release{})}
+		_, _, err := SuppliedIdentity(pkgs, "")
+		if err == nil {
+			t.Fatal("components of unknown provenance scanned anyway")
+		}
+		for _, want := range []string{"SBOM components", "distro qualifier", "--osv-ecosystem"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("err = %v, want it to mention %q", err, want)
+			}
+		}
+		if strings.Contains(err.Error(), "VENDOR") {
+			t.Errorf("err = %v, which names headers an SBOM does not have", err)
+		}
+	})
+
 	// Two distributions in one directory have no single right ecosystem, and
 	// filing half the inventory under the wrong one is a silent miss, not a
 	// visible one.
@@ -309,6 +396,83 @@ func TestMetadataOnlyStatusTable(t *testing.T) {
 	// tells a reader nothing about what was and was not looked at.
 	if !strings.Contains(f.Evidence[0].Detail, "libssl.so.3") {
 		t.Errorf("evidence = %q, want it to name the ELF objects", f.Evidence[0].Detail)
+	}
+}
+
+// TestAnUnreadFileListIsNotAClearance is the guard on the zero Meta.
+//
+// An rpm header answers "does this package ship code"; a description that
+// carries no file list -- an SBOM component is the case this exists for --
+// does not. Both arrive here with an empty ELF slice, and only FilesKnown
+// tells them apart. Getting this wrong does not produce a wrong-looking
+// report: it produces a clean one, for a package nobody examined.
+func TestAnUnreadFileListIsNotAClearance(t *testing.T) {
+	unread := rocky("openssl-libs", "1:3.5.5-2.el9_8")
+	unread.Meta.FilesKnown = false
+
+	p := New(Options{Packages: []Supplied{unread}})
+	img := &target.Image{Ref: "--rpm /tmp/repo", FS: target.NewDirFS(t.TempDir())}
+
+	f := statuses(t, p, img, []ecosystem.Subject{{Raw: "all", Name: ""}})["openssl-libs"]
+	if f.Status != ecosystem.StatusUndetermined {
+		t.Fatalf("status = %s via %s, want undetermined -- an unexamined package was declared clean", f.Status, f.Method)
+	}
+	if f.Method == MethodNoCode {
+		t.Errorf("method = %s, which claims evidence that was never read", f.Method)
+	}
+	if f.Reason != ReasonNoReachabilityTest {
+		t.Errorf("reason = %q, want %q", f.Reason, ReasonNoReachabilityTest)
+	}
+	// The row has to say which question went unanswered, or "undetermined"
+	// reads the same as it does for a package that was fully examined and
+	// merely untraceable.
+	if len(f.Evidence) != 1 || !strings.Contains(f.Evidence[0].Detail, "does not list its files") {
+		t.Errorf("evidence = %+v, want it to say the file list was missing", f.Evidence)
+	}
+}
+
+// TestSBOMFindingsSayWhereTheyCameFrom checks the two halves of an SBOM row a
+// reader has to be able to tell apart from an --rpm one.
+//
+// The origin differs, because the evidence differs: an rpm header was read and
+// a bill of materials was believed. The reason does not, because
+// writeMetadataCaveat counts ReasonNoReachabilityTest to size the note that
+// explains these rows, and a caveat that disagreed with the rows under it
+// would be worse than no caveat.
+func TestSBOMFindingsSayWhereTheyCameFrom(t *testing.T) {
+	p := New(Options{Packages: []Supplied{
+		fromSBOM("libssl3", "3.0.11-1~deb12u2", osv.Release{ID: "debian", VersionID: "12"}),
+	}})
+	img := &target.Image{Ref: "--sbom bom.json", FS: target.NewDirFS(t.TempDir())}
+
+	f := statuses(t, p, img, []ecosystem.Subject{{Raw: "all"}})["libssl3"]
+	if f.Status != ecosystem.StatusUndetermined {
+		t.Fatalf("status = %s via %s; a bill of materials cannot settle anything", f.Status, f.Method)
+	}
+	if f.Reason != ReasonNoReachabilityTest {
+		t.Errorf("reason = %q, want %q -- the report's caveat counts this", f.Reason, ReasonNoReachabilityTest)
+	}
+	if len(f.Evidence) != 1 || f.Evidence[0].Origin != MethodSBOM {
+		t.Fatalf("evidence = %+v, want one %s note", f.Evidence, MethodSBOM)
+	}
+	if !strings.Contains(f.Evidence[0].Detail, "does not list its files") {
+		t.Errorf("detail = %q, want it to say the file list was never available", f.Evidence[0].Detail)
+	}
+}
+
+// An inventory that states no origin is an --rpm one: the field postdates that
+// caller, and a zero value there must not silently relabel its evidence.
+func TestAnUnstatedOriginIsTheRPMOne(t *testing.T) {
+	ships := rocky("openssl-libs", "1:3.5.5-2.el9_8")
+	ships.Package.Files = []string{"/usr/lib64/libssl.so.3"}
+	ships.Meta.ELF = ships.Package.Files
+
+	p := New(Options{Packages: []Supplied{ships}})
+	img := &target.Image{Ref: "--rpm /tmp/repo", FS: target.NewDirFS(t.TempDir())}
+
+	f := statuses(t, p, img, []ecosystem.Subject{{Raw: "all"}})["openssl-libs"]
+	if len(f.Evidence) != 1 || f.Evidence[0].Origin != MethodRPMFile {
+		t.Errorf("evidence = %+v, want one %s note", f.Evidence, MethodRPMFile)
 	}
 }
 

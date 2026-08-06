@@ -461,3 +461,51 @@ func TestParseOSReleaseWithoutIDIsAnError(t *testing.T) {
 		t.Fatal("expected an error for os-release with no ID")
 	}
 }
+
+// ReleaseFromDistro is the whole of what an SBOM knows about the operating
+// system, and the LTS suffix is the part of the ecosystem string it cannot see.
+// Getting it wrong is not a visible error: "Ubuntu:22.04" is a valid ecosystem
+// that answers HTTP 200 with nothing in it.
+func TestReleaseFromDistro(t *testing.T) {
+	tests := []struct {
+		id, version string
+		want        string
+	}{
+		{"debian", "12", "Debian:12"},
+		{"debian", "12.15", "Debian:12"},
+		{"alpine", "3.19.9", "Alpine:v3.19"},
+		{"rocky", "9.3", "Rocky Linux:9"},
+		{"rhel", "9.2", "Red Hat"},
+
+		// April of an even year, and nothing else.
+		{"ubuntu", "20.04", "Ubuntu:20.04:LTS"},
+		{"ubuntu", "22.04", "Ubuntu:22.04:LTS"},
+		{"ubuntu", "24.04", "Ubuntu:24.04:LTS"},
+		{"ubuntu", "23.04", "Ubuntu:23.04"},
+		{"ubuntu", "22.10", "Ubuntu:22.10"},
+
+		// openEuler ships LTS in March.
+		{"openeuler", "24.03", "openEuler:24.03-LTS"},
+		{"openeuler", "24.09", "openEuler:24.09"},
+
+		// Case and stray space come from a purl namespace, not a curated table.
+		{"Debian", " 12 ", "Debian:12"},
+	}
+	for _, tt := range tests {
+		got, err := ReleaseFromDistro(tt.id, tt.version).Ecosystem()
+		if err != nil || got != tt.want {
+			t.Errorf("ReleaseFromDistro(%q, %q) = %q, %v; want %q", tt.id, tt.version, got, err, tt.want)
+		}
+	}
+}
+
+// An unknown distribution is an error rather than an empty ecosystem, for the
+// same reason it is when it comes out of os-release: a query with no ecosystem
+// finds nothing and reads exactly like a clean image.
+func TestReleaseFromDistroRefusesToGuess(t *testing.T) {
+	for _, id := range []string{"", "nixos", "gentoo"} {
+		if got, err := ReleaseFromDistro(id, "1.0").Ecosystem(); err == nil {
+			t.Errorf("ReleaseFromDistro(%q, \"1.0\") = %q, want an error", id, got)
+		}
+	}
+}

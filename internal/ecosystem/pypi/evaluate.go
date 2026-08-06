@@ -41,6 +41,13 @@ type evaluator struct {
 	// and it was never built.
 	g *modgraph.Graph
 
+	// meta is set when the inventory was handed in rather than read out of a
+	// tree, and g is nil for that reason rather than for want of a component
+	// that needed it. The two are not interchangeable: a nil graph on its own
+	// still leaves the file list to conclude from, and there is no file list
+	// here. See ecosystem.SBOMFinding.
+	meta bool
+
 	trust bool // --trust-import-absence
 }
 
@@ -62,6 +69,9 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 	// carries a record for this id makes no difference to the fact that the
 	// image does not contain the distribution the id was asked about.
 	if e.st.absent {
+		if e.meta {
+			return ecosystem.SBOMAbsent(f, c.Name, MethodInventory)
+		}
 		if len(e.st.unreadable) > 0 {
 			// Something in a site-packages directory could not be identified, so
 			// "no distribution here is named X" is not a claim this scan is
@@ -92,6 +102,15 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 		f.Status = ecosystem.StatusUndetermined
 		f.Reason = "no_osv_package_mapping"
 		return f
+	}
+
+	// Before the file list, because there is not one. Everything below reads
+	// e.st.files() as an account of what the distribution installs, and a
+	// component out of a bill of materials installs nothing as far as this
+	// process can see -- which would take the empty list for the manifest of a
+	// distribution that ships no code.
+	if e.meta {
+		return ecosystem.SBOMFinding(f, c.Name)
 	}
 
 	files := e.st.files()
