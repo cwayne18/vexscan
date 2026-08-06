@@ -1,12 +1,20 @@
-// Package vexpr proposes OpenVEX statements for the findings vexscan ruled out
-// and opens a pull request adding them to a VEX Hub repository.
+// Package vexpr writes OpenVEX documents recording the findings vexscan ruled
+// out, laid out as a VEX Hub repository so they can be contributed to one.
 //
 // It is the write counterpart to internal/vex, which only reads. The split is
 // deliberate and matches the invariant that package documents: nothing that
 // reaches a verdict may also publish one. vexpr never touches a finding's
 // status -- it reads the verdict local evidence already produced and serialises
-// the ruled-out ones into the format a hub distributes, so the PR says exactly
-// what the scan said and nothing the scan did not.
+// the ruled-out ones into the format a hub distributes, so the documents say
+// exactly what the scan said and nothing the scan did not.
+//
+// It writes to a directory and stops there. Getting those files into a hub is a
+// pull request against somebody else's repository, and that is git's job and
+// gh's job: they already handle forks, signing, branch protection and the
+// review itself, and a hand-rolled API client handles none of them. Splitting
+// there also puts a human in front of the diff, which for a statement that
+// tells other people's scanners to stop reporting a vulnerability is the point
+// rather than an inconvenience.
 package vexpr
 
 import (
@@ -56,6 +64,64 @@ type Doc struct {
 	// document that did not come from an existing file.
 	original map[string]json.RawMessage
 	order    []string
+	// layout is how the file it was parsed from was formatted, so re-emitting
+	// it does not reflow lines nothing changed.
+	layout layout
+}
+
+// layout is the whitespace of a JSON file this package rewrites: enough to put
+// back what was there rather than what encoding/json would have chosen.
+//
+// It exists because the diff is the product. A one-statement change to
+// rancher/vexhub's 4381-line index should be four added lines; re-indenting to
+// this package's taste would make it 4381 changed lines and bury the thing a
+// maintainer is being asked to review. Two spaces and a trailing newline are
+// the defaults, matching every published hub seen so far, and a file that
+// disagrees keeps its own.
+type layout struct {
+	indent  string
+	lastNL  bool
+	learned bool
+}
+
+// defaultLayout is what a file created here looks like.
+func defaultLayout() layout { return layout{indent: "  ", lastNL: true, learned: true} }
+
+// detectLayout reads a JSON file's formatting off the file.
+//
+// The indent is the leading whitespace of the first indented line, which is how
+// an indent unit is expressed in a pretty-printed object; a file that is not
+// pretty-printed leaves it empty and is re-emitted the same way.
+func detectLayout(b []byte) layout {
+	l := layout{lastNL: bytes.HasSuffix(b, []byte("\n")), learned: true}
+	for _, line := range bytes.Split(b, []byte("\n"))[1:] {
+		trimmed := bytes.TrimLeft(line, " \t")
+		if len(trimmed) == 0 {
+			continue
+		}
+		l.indent = string(line[:len(line)-len(trimmed)])
+		break
+	}
+	return l
+}
+
+// render pretty-prints compact JSON in this layout.
+func (l layout) render(compact []byte) ([]byte, error) {
+	if !l.learned {
+		l = defaultLayout()
+	}
+	out := compact
+	if l.indent != "" {
+		var buf bytes.Buffer
+		if err := json.Indent(&buf, compact, "", l.indent); err != nil {
+			return nil, err
+		}
+		out = buf.Bytes()
+	}
+	if l.lastNL {
+		out = append(out, '\n')
+	}
+	return out, nil
 }
 
 // docShape is the typed on-wire form of a Doc, used to marshal a freshly built
@@ -218,6 +284,7 @@ func ParseDoc(b []byte) (*Doc, bool) {
 		Statements: shape.Statements,
 		original:   fields,
 		order:      order,
+		layout:     detectLayout(b),
 	}
 	if d.Statements == nil {
 		d.Statements = []Statement{}
@@ -274,18 +341,19 @@ func (d *Doc) MarshalJSON() ([]byte, error) {
 	return marshalOrderedObject(order, fields)
 }
 
-// Marshal renders the document as the pretty-printed JSON a hub stores, with a
-// trailing newline so the committed file matches what an editor would save.
+// Marshal renders the document as the pretty-printed JSON a hub stores, in the
+// formatting of the file it was parsed from -- two spaces and a trailing
+// newline for a document created here.
 func (d *Doc) Marshal() ([]byte, error) {
 	compact, err := marshalNoEscape(d)
 	if err != nil {
 		return nil, fmt.Errorf("vexpr: marshal document: %w", err)
 	}
-	var out bytes.Buffer
-	if err := json.Indent(&out, compact, "", "  "); err != nil {
+	out, err := d.layout.render(compact)
+	if err != nil {
 		return nil, fmt.Errorf("vexpr: indent document: %w", err)
 	}
-	return append(out.Bytes(), '\n'), nil
+	return out, nil
 }
 
 // setRawField sets a field's value, appending its key to order only if it was

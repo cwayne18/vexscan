@@ -45,37 +45,35 @@ func main() {
 		repo   = flag.String("repo", "", "git source repo to analyze via govulncheck source mode, e.g. github.com/rancher/rancher (mutually exclusive with --image and --rootfs)")
 		sbom   = flag.String("sbom", "", "CycloneDX JSON bill of materials to scan -- a path, or '-' for stdin "+
 			"(mutually exclusive with the other targets; a component names a package and nothing else, so every finding is undetermined)")
-		ref         = flag.String("ref", "", "branch, tag, or commit to check out for --repo (default: repo default branch)")
-		repoPath    = flag.String("repo-path", ".", "module subdirectory within --repo to scan")
-		module      = flag.String("module", "", "deprecated alias for --package golang:MODULE")
-		all         = flag.Bool("all", false, "check everything each ecosystem can inventory, instead of named packages")
-		cvesFlag    = flag.String("cves", "", "comma-separated CVE/GHSA/GO ids to check; alone, they are resolved against the whole target")
-		cvesFile    = flag.String("cves-file", "", "path to a file with one CVE/GHSA/GO id per line (merged with --cves)")
-		modVersion  = flag.String("module-version", "", "override the module version (image mode only; default: read from each binary's build info)")
-		showVer     = flag.Bool("V", false, "print vexscan's version and exit")
-		goVersion   = flag.String("go-version", "", "pin the Go toolchain for --repo analysis, e.g. 1.24.0 (useful with --package golang:stdlib)")
-		goos        = flag.String("os", "linux", "image OS variant to pull (image mode)")
-		arch        = flag.String("arch", "amd64", "image architecture variant to pull (image mode)")
-		osvEco      = flag.String("osv-ecosystem", "", "override the OSV ecosystem derived from the image's os-release, e.g. 'Debian:12'")
-		dlopen      = flag.String("dlopen-policy", "taint", "what a reachable dlopen does to the closure: taint (block conclusions) or assume-none")
-		dynamic     = flag.String("dynamic-import-policy", "taint", "what an import of a computed name does to a language import graph: taint (block conclusions) or assume-none; these are far more common than dlopen, so assume-none discards much more")
-		triageOn    = flag.Bool("triage", false, "order findings by exploitation evidence: EPSS scores and CISA's known-exploited catalog. Adds two columns and sorts known-exploited first, then by EPSS percentile; nothing is hidden, and no severity changes. Downloads two public feeds (~4 MB, cached under VEXSCAN_TRIAGE_CACHE)")
-		mine        = flag.Bool("mine-advisories", false, "with --llm, let the model read each advisory's prose for symbols to check against the image")
-		trustAbs    = flag.Bool("trust-import-absence", false, "let a missing dynamic import of the vulnerable symbol conclude not_in_execute_path (see README: this is weaker than it looks)")
-		useLLM      = flag.Bool("llm", false, "consult a chat model on genuinely-affected CVEs for exploitability (needs a provider: --llm-endpoint or --llm-command)")
-		llmURL      = flag.String("llm-endpoint", "", "OpenAI-compatible chat/completions URL for --llm -- an API provider, or a local Ollama (env: VEXSCAN_LLM_ENDPOINT; credential: VEXSCAN_LLM_TOKEN)")
-		llmModel    = flag.String("llm-model", "", "model id for --llm-endpoint (env: VEXSCAN_LLM_MODEL; default gpt-4o)")
-		llmCommand  = flag.String("llm-command", "", "for --llm, run this installed CLI instead of calling an endpoint, e.g. 'claude -p'; the prompt arrives on its stdin (env: VEXSCAN_LLM_COMMAND)")
-		format      = flag.String("format", "text", "output format: text, json, fixplan (a remediation-first view of the fixable findings), or inventory (list the image's OS packages and exit)")
-		details     = flag.Bool("details", false, "with --format text, print the full evidence block under each row instead of the table alone")
-		out         = flag.String("out", "", "write output to this file instead of stdout")
-		gistFlag    = flag.Bool("gist", false, "also upload the output to a public GitHub gist and print its URL (needs GITHUB_TOKEN/GH_TOKEN with gist scope)")
-		gistSecret  = flag.Bool("gist-secret", false, "with --gist, create a secret (unlisted) gist instead of a public one")
-		vexPR       = flag.Bool("vexhub-pr", false, "open a pull request against the --vexhub repository adding OpenVEX not_affected statements for every finding vexscan ruled out (needs a GitHub --vexhub and GITHUB_TOKEN/GH_TOKEN with pull-request scope)")
-		vexPRRepo   = flag.String("vexhub-pr-repo", "", "with --vexhub-pr, push the branch to this owner/repo fork you maintain instead of straight to the hub (the fork must be kept in sync with the hub's default branch)")
-		vexPRAuthor = flag.String("vex-author", "", "with --vexhub-pr, the OpenVEX author to record (default: the authenticated GitHub user)")
-		vexPRDry    = flag.Bool("vexhub-pr-dry-run", false, "with --vexhub-pr, print the files the PR would add or change and exit without pushing or opening it")
-		failOnSev   = flag.String("fail-on", "", "exit 3 if any counted finding is at or above this severity: "+
+		ref        = flag.String("ref", "", "branch, tag, or commit to check out for --repo (default: repo default branch)")
+		repoPath   = flag.String("repo-path", ".", "module subdirectory within --repo to scan")
+		module     = flag.String("module", "", "deprecated alias for --package golang:MODULE")
+		all        = flag.Bool("all", false, "check everything each ecosystem can inventory, instead of named packages")
+		cvesFlag   = flag.String("cves", "", "comma-separated CVE/GHSA/GO ids to check; alone, they are resolved against the whole target")
+		cvesFile   = flag.String("cves-file", "", "path to a file with one CVE/GHSA/GO id per line (merged with --cves)")
+		modVersion = flag.String("module-version", "", "override the module version (image mode only; default: read from each binary's build info)")
+		showVer    = flag.Bool("V", false, "print vexscan's version and exit")
+		goVersion  = flag.String("go-version", "", "pin the Go toolchain for --repo analysis, e.g. 1.24.0 (useful with --package golang:stdlib)")
+		goos       = flag.String("os", "linux", "image OS variant to pull (image mode)")
+		arch       = flag.String("arch", "amd64", "image architecture variant to pull (image mode)")
+		osvEco     = flag.String("osv-ecosystem", "", "override the OSV ecosystem derived from the image's os-release, e.g. 'Debian:12'")
+		dlopen     = flag.String("dlopen-policy", "taint", "what a reachable dlopen does to the closure: taint (block conclusions) or assume-none")
+		dynamic    = flag.String("dynamic-import-policy", "taint", "what an import of a computed name does to a language import graph: taint (block conclusions) or assume-none; these are far more common than dlopen, so assume-none discards much more")
+		triageOn   = flag.Bool("triage", false, "order findings by exploitation evidence: EPSS scores and CISA's known-exploited catalog. Adds two columns and sorts known-exploited first, then by EPSS percentile; nothing is hidden, and no severity changes. Downloads two public feeds (~4 MB, cached under VEXSCAN_TRIAGE_CACHE)")
+		mine       = flag.Bool("mine-advisories", false, "with --llm, let the model read each advisory's prose for symbols to check against the image")
+		trustAbs   = flag.Bool("trust-import-absence", false, "let a missing dynamic import of the vulnerable symbol conclude not_in_execute_path (see README: this is weaker than it looks)")
+		useLLM     = flag.Bool("llm", false, "consult a chat model on genuinely-affected CVEs for exploitability (needs a provider: --llm-endpoint or --llm-command)")
+		llmURL     = flag.String("llm-endpoint", "", "OpenAI-compatible chat/completions URL for --llm -- an API provider, or a local Ollama (env: VEXSCAN_LLM_ENDPOINT; credential: VEXSCAN_LLM_TOKEN)")
+		llmModel   = flag.String("llm-model", "", "model id for --llm-endpoint (env: VEXSCAN_LLM_MODEL; default gpt-4o)")
+		llmCommand = flag.String("llm-command", "", "for --llm, run this installed CLI instead of calling an endpoint, e.g. 'claude -p'; the prompt arrives on its stdin (env: VEXSCAN_LLM_COMMAND)")
+		format     = flag.String("format", "text", "output format: text, json, fixplan (a remediation-first view of the fixable findings), or inventory (list the image's OS packages and exit)")
+		details    = flag.Bool("details", false, "with --format text, print the full evidence block under each row instead of the table alone")
+		out        = flag.String("out", "", "write output to this file instead of stdout")
+		gistFlag   = flag.Bool("gist", false, "also upload the output to a public GitHub gist and print its URL (needs GITHUB_TOKEN/GH_TOKEN with gist scope)")
+		gistSecret = flag.Bool("gist-secret", false, "with --gist, create a secret (unlisted) gist instead of a public one")
+		vexOut     = flag.String("vex-out", "", "write OpenVEX not_affected documents for every finding vexscan ruled out into this directory, laid out as a VEX hub; with --vexhub they are merged into what that hub already publishes, so the directory can be a clone of it (see contrib/vexhub-pr.sh)")
+		vexAuthor  = flag.String("vex-author", "", "with --vex-out, the OpenVEX author to record on the statements -- required, and it is you: a not_affected claim is someone's assertion")
+		failOnSev  = flag.String("fail-on", "", "exit 3 if any counted finding is at or above this severity: "+
 			strings.Join(cvss.Labels, ", ")+", or 'any'. Off by default; see --fail-on-status for what counts")
 		failOnStat = flag.String("fail-on-status", "", "which findings --fail-on weighs: a comma-separated list of "+
 			"affected, undetermined, vexed, cleared, or 'all' (default affected -- vulnerable code present and loadable, "+
@@ -124,15 +122,10 @@ func main() {
 	default:
 		fail("unknown --format %q; want text, json, fixplan, or inventory", *format)
 	}
-	prOn, err := vexPRActivation(*vexPR, *vexPRDry, *vexPRRepo, *vexPRAuthor)
-	if err != nil {
-		fail("%v", err)
-	}
-	*vexPR = prOn
-	// Caught here so a missing --vexhub is a command-line error before the scan,
+	// Caught here so a missing author is a command-line error before the scan,
 	// not after it.
-	if *vexPR && len(vexhubs) == 0 {
-		fail("--vexhub-pr needs a --vexhub to open the pull request against, e.g. --vexhub https://github.com/rancher/vexhub")
+	if err := checkVexOut(*vexOut, *vexAuthor); err != nil {
+		fail("%v", err)
 	}
 	// Canonicalized here, and strictly, so that a typo is a command-line error
 	// before the pull rather than an empty report after it. cvss.Parse rather
@@ -317,22 +310,21 @@ func main() {
 		os.Exit(1)
 	}
 
-	// The PR flow only runs on a complete scan: an incomplete one might have
+	// --vex-out only runs on a complete scan: an incomplete one might have
 	// missed the very component that would have kept a finding out of RULED OUT,
-	// and a not_affected statement published from a partial scan is exactly the
+	// and a not_affected statement written from a partial scan is exactly the
 	// kind of wrong this tool must never be. It runs before the gate because the
 	// gate decides a build's fate, which is unrelated to whether a hub should
 	// learn what was ruled out.
-	if *vexPR {
-		if err := runVexhubPR(ctx, res, vexhubs, vexhubPROptions{
-			pushRepo:  *vexPRRepo,
-			author:    *vexPRAuthor,
-			dryRun:    *vexPRDry,
-			version:   buildinfo.String(),
+	if *vexOut != "" {
+		if err := runVexOut(ctx, res, vexOutOptions{
+			dir:       *vexOut,
+			author:    *vexAuthor,
+			hubs:      vexhubs,
 			timestamp: started.UTC().Format(time.RFC3339),
 			logf:      logf,
 		}); err != nil {
-			fmt.Fprintf(os.Stderr, "error: vexhub-pr: %v\n", err)
+			fmt.Fprintf(os.Stderr, "error: vex-out: %v\n", err)
 			os.Exit(1)
 		}
 	}
@@ -696,6 +688,12 @@ Examples:
   # Share the report as a public gist (needs GITHUB_TOKEN/GH_TOKEN with gist scope)
   vexscan --image rancher/hardened-kubernetes:v1.30.1 \
     --package golang:golang.org/x/net --cves CVE-2023-39325 --gist
+
+  # Write what this scan ruled out into a clone of the hub, ready to review
+  gh repo clone rancher/vexhub
+  vexscan --image rancher/hardened-kubernetes:v1.30.1 --all \
+    --vexhub ./vexhub --vex-out ./vexhub --vex-author 'Acme Security'
+  git -C vexhub diff        # then contrib/vexhub-pr.sh, or commit it yourself
 
 --triage answers a question severity does not: is anyone exploiting this? It
 downloads EPSS (a 30-day exploitation-activity forecast, per CVE) and CISA's

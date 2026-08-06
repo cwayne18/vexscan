@@ -7,32 +7,76 @@ import (
 )
 
 // indexFile is the hub's index.json: the map from product purl to the location
-// of that product's document. Unknown top-level fields are not preserved -- the
-// format defines only these two -- but the order of existing packages is, so a
-// PR that adds one product does not reshuffle the file.
+// of that product's document.
+//
+// The file is held as its original bytes, not just as the two fields this code
+// reads. A hub's index is its own artifact -- rancher/vexhub's is 208 KB and
+// over a thousand entries -- and re-serialising a decoded form would rewrite
+// every line of it, dropping any field the format has grown since this was
+// written and burying a one-product change in a whole-file diff. So existing
+// package entries are re-emitted verbatim, new ones are appended, and unknown
+// top-level members are carried through in their original order.
 type indexFile struct {
-	Version  int            `json:"version"`
-	Packages []indexPackage `json:"packages"`
+	// packages are the entries in file order, each keeping its raw bytes.
+	packages []indexPackage
+	// original and order preserve the top-level object, as in Doc. Both are nil
+	// for an index built from nothing.
+	original map[string]json.RawMessage
+	order    []string
+	// layout is the formatting of the file it was parsed from, so adding one
+	// package does not reflow the other thousand.
+	layout layout
 }
 
+// indexPackage is one entry in index.json's packages array: the two fields this
+// code reads, plus the bytes it was read from.
 type indexPackage struct {
 	ID       string `json:"id"`
 	Location string `json:"location"`
+
+	raw json.RawMessage
 }
 
-// parseIndex decodes index.json. A missing or unreadable index is a fatal
-// condition for this flow, not a recoverable one: without it there is no way to
-// know where an existing product's document lives, and guessing would risk
-// writing a second document the hub never reads.
+// newIndex is the index of a hub that does not exist yet -- the --vex-out case
+// with no --vexhub to merge against, where the output tree is a hub being
+// started rather than one being added to.
+func newIndex() *indexFile {
+	return &indexFile{
+		original: map[string]json.RawMessage{"version": json.RawMessage("1")},
+		order:    []string{"version", "packages"},
+		layout:   defaultLayout(),
+	}
+}
+
+// parseIndex decodes index.json. An unreadable index is a fatal condition for
+// this flow, not a recoverable one: without it there is no way to know where an
+// existing product's document lives, and guessing would risk writing a second
+// document the hub never reads.
 func parseIndex(b []byte) (*indexFile, error) {
-	var idx indexFile
-	if err := json.Unmarshal(b, &idx); err != nil {
+	var shape struct {
+		Packages []json.RawMessage `json:"packages"`
+	}
+	if err := json.Unmarshal(b, &shape); err != nil {
 		return nil, fmt.Errorf("vexpr: parse index.json: %w", err)
 	}
-	if idx.Version == 0 {
-		idx.Version = 1
+	fields := map[string]json.RawMessage{}
+	if err := json.Unmarshal(b, &fields); err != nil {
+		return nil, fmt.Errorf("vexpr: parse index.json: %w", err)
 	}
-	return &idx, nil
+	order, err := objectKeyOrder(b)
+	if err != nil {
+		return nil, fmt.Errorf("vexpr: parse index.json: %w", err)
+	}
+	idx := &indexFile{original: fields, order: order, layout: detectLayout(b)}
+	for i, raw := range shape.Packages {
+		var p indexPackage
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, fmt.Errorf("vexpr: parse index.json: package %d: %w", i, err)
+		}
+		p.raw = append(json.RawMessage(nil), raw...)
+		idx.packages = append(idx.packages, p)
+	}
+	return idx, nil
 }
 
 // location returns the stored document path for a product, matching keys the way
@@ -40,7 +84,7 @@ func parseIndex(b []byte) (*indexFile, error) {
 // so both sides are compared decoded.
 func (idx *indexFile) location(product string) (string, bool) {
 	want := decodeKey(product)
-	for _, p := range idx.Packages {
+	for _, p := range idx.packages {
 		if decodeKey(p.ID) == want {
 			return p.Location, true
 		}
@@ -65,16 +109,48 @@ func (idx *indexFile) ensure(product string) (location string, changed bool, err
 	if err != nil {
 		return "", false, err
 	}
-	idx.Packages = append(idx.Packages, indexPackage{ID: key, Location: loc})
+	idx.packages = append(idx.packages, indexPackage{ID: key, Location: loc})
 	return loc, true, nil
 }
 
+// marshal renders index.json: every original member in its original place, with
+// packages replaced by the same array plus whatever was appended.
 func (idx *indexFile) marshal() ([]byte, error) {
-	b, err := json.MarshalIndent(idx, "", "  ")
+	entries := make([]json.RawMessage, 0, len(idx.packages))
+	for _, p := range idx.packages {
+		if p.raw != nil {
+			entries = append(entries, p.raw)
+			continue
+		}
+		b, err := marshalNoEscape(struct {
+			ID       string `json:"id"`
+			Location string `json:"location"`
+		}{p.ID, p.Location})
+		if err != nil {
+			return nil, fmt.Errorf("vexpr: marshal index.json: %w", err)
+		}
+		entries = append(entries, b)
+	}
+	packages, err := marshalNoEscape(entries)
 	if err != nil {
 		return nil, fmt.Errorf("vexpr: marshal index.json: %w", err)
 	}
-	return append(b, '\n'), nil
+
+	fields := make(map[string]json.RawMessage, len(idx.original)+1)
+	for k, v := range idx.original {
+		fields[k] = v
+	}
+	order := setRawField(append([]string(nil), idx.order...), fields, "packages", packages)
+
+	compact, err := marshalOrderedObject(order, fields)
+	if err != nil {
+		return nil, fmt.Errorf("vexpr: marshal index.json: %w", err)
+	}
+	out, err := idx.layout.render(compact)
+	if err != nil {
+		return nil, fmt.Errorf("vexpr: indent index.json: %w", err)
+	}
+	return out, nil
 }
 
 // decodeKey reduces a product key to the spelling used for comparison: the same

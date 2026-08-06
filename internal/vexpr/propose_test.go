@@ -2,175 +2,99 @@ package vexpr
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/cwayne18/vexscan/internal/analyze"
 )
 
-// fakeHub is a minimal in-memory GitHub API standing in for a VEX hub, enough to
-// drive Propose and Submit through their real HTTP client.
+// fakeHub is a hub held in memory: an index and whatever documents it points at.
+// It stands in for *vex.Hub, which reads the same two things off a directory or
+// over HTTPS.
 type fakeHub struct {
-	files      map[string]string // path -> content, at the base commit
-	createdRef string
-	prHead     string
-	prBase     string
-	prTitle    string
-	committed  []string // paths written into the commit tree
+	index string
+	files map[string]string
 }
 
-func (h *fakeHub) handler(t *testing.T) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		p := r.URL.Path
-		switch {
-		case p == "/user":
-			writeJSON(w, map[string]any{"login": "octo"})
-		case strings.HasSuffix(p, "/git/ref/heads/main"):
-			writeJSON(w, map[string]any{"object": map[string]any{"sha": "basesha"}})
-		case strings.Contains(p, "/git/commits/"):
-			writeJSON(w, map[string]any{"tree": map[string]any{"sha": "basetree"}})
-		case strings.HasSuffix(p, "/git/trees") && r.Method == http.MethodPost:
-			var body struct {
-				Tree []struct {
-					Path string `json:"path"`
-				} `json:"tree"`
-			}
-			json.NewDecoder(r.Body).Decode(&body)
-			for _, e := range body.Tree {
-				h.committed = append(h.committed, e.Path)
-			}
-			writeJSON(w, map[string]any{"sha": "newtree"})
-		case strings.HasSuffix(p, "/git/commits") && r.Method == http.MethodPost:
-			writeJSON(w, map[string]any{"sha": "newcommit"})
-		case strings.HasSuffix(p, "/git/refs") && r.Method == http.MethodPost:
-			var body struct {
-				Ref string `json:"ref"`
-			}
-			json.NewDecoder(r.Body).Decode(&body)
-			h.createdRef = body.Ref
-			w.WriteHeader(http.StatusCreated)
-			writeJSON(w, map[string]any{"ref": body.Ref})
-		case strings.HasSuffix(p, "/pulls") && r.Method == http.MethodPost:
-			var body struct{ Head, Base, Title string }
-			json.NewDecoder(r.Body).Decode(&body)
-			h.prHead, h.prBase, h.prTitle = body.Head, body.Base, body.Title
-			writeJSON(w, map[string]any{"html_url": "https://github.com/acme/hub/pull/7"})
-		case strings.Contains(p, "/contents/"):
-			file := p[strings.Index(p, "/contents/")+len("/contents/"):]
-			content, ok := h.files[file]
-			if !ok {
-				w.WriteHeader(http.StatusNotFound)
-				writeJSON(w, map[string]any{"message": "Not Found"})
-				return
-			}
-			writeJSON(w, map[string]any{
-				"content":  base64.StdEncoding.EncodeToString([]byte(content)),
-				"encoding": "base64",
-			})
-		case strings.HasSuffix(p, "/acme/hub") || strings.HasSuffix(p, "/acme/hub/"):
-			writeJSON(w, map[string]any{"default_branch": "main"})
-		default:
-			t.Logf("unhandled %s %s", r.Method, p)
-			w.WriteHeader(http.StatusNotFound)
-			writeJSON(w, map[string]any{"message": "unhandled: " + p})
-		}
+func (h *fakeHub) IndexRaw() []byte { return []byte(h.index) }
+
+func (h *fakeHub) Raw(_ context.Context, loc string) ([]byte, bool, error) {
+	b, ok := h.files[loc]
+	if !ok {
+		return nil, false, nil
+	}
+	return []byte(b), true, nil
+}
+
+const syntheticLoc = "pkg/oci/index.docker.io/example/synthetic/scan.openvex.json"
+
+// syntheticIndex is a hub index that already knows the product the test
+// findings are filed under.
+func syntheticIndex(extra ...string) string {
+	entries := append([]string{
+		`{"id":"pkg:oci/synthetic?repository_url=index.docker.io%2Fexample%2Fsynthetic","location":"` + syntheticLoc + `"}`,
+	}, extra...)
+	return `{"version":1,"packages":[` + strings.Join(entries, ",") + `]}`
+}
+
+// ruledOutResult is a scan that ruled out the named CVEs against testProduct.
+func ruledOutResult(cves ...string) *analyze.Result {
+	res := &analyze.Result{Target: "example/synthetic:latest"}
+	for i, cve := range cves {
+		res.Findings = append(res.Findings, analyze.Finding{
+			ID: cve, CVE: cve, Product: testProduct,
+			PURL:          "pkg:deb/debian/pkg" + string(rune('a'+i)) + "@1",
+			Status:        analyze.StatusNotPresent,
+			Justification: "component_not_present", Method: "pkgdb",
+		})
+	}
+	return res
+}
+
+func proposeInto(t *testing.T, hub HubReader, res *analyze.Result) *Plan {
+	t.Helper()
+	plan, err := Propose(context.Background(), res, Options{
+		Hub: hub, Author: "Acme Security", Timestamp: testTime,
 	})
-	return mux
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plan
 }
 
-func writeJSON(w http.ResponseWriter, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(v)
-}
-
-func TestProposeAndSubmit(t *testing.T) {
-	hub := &fakeHub{files: map[string]string{
-		"index.json": `{"version":1,"packages":[
-			{"id":"pkg:oci/synthetic?repository_url=index.docker.io%2Fexample%2Fsynthetic","location":"pkg/oci/index.docker.io/example/synthetic/scan.openvex.json"}
-		]}`,
-		"pkg/oci/index.docker.io/example/synthetic/scan.openvex.json": `{
+func TestProposeMergesIntoExistingDocument(t *testing.T) {
+	hub := &fakeHub{index: syntheticIndex(), files: map[string]string{
+		syntheticLoc: `{
 			"@context":"https://openvex.dev/ns/v0.2.0","author":"Prev","version":1,
 			"timestamp":"2026-01-01T00:00:00Z","statements":[
 				{"vulnerability":{"name":"CVE-OLD"},
 				 "products":[{"@id":"pkg:oci/synthetic?repository_url=index.docker.io/example/synthetic",
-				   "subcomponents":[{"@id":"pkg:deb/debian/old@1"}]}],
+				   "subcomponents":[{"@id":"pkg:deb/debian/pkga@1"}]}],
 				 "status":"not_affected"}
 			]}`,
 	}}
-	srv := httptest.NewServer(hub.handler(t))
-	defer srv.Close()
+	// CVE-OLD is already in the document against the same subcomponent, so only
+	// CVE-NEW is new.
+	res := ruledOutResult("CVE-OLD", "CVE-NEW")
+	res.Findings[1].PURL = "pkg:deb/debian/pkga@1"
+	res.Findings[1].Product = testProduct
 
-	res := &analyze.Result{
-		Target: "example/synthetic:latest",
-		Findings: []analyze.Finding{
-			{ID: "CVE-NEW", CVE: "CVE-NEW", Product: testProduct, PURL: "pkg:deb/debian/new@2",
-				Status: analyze.StatusNotPresent, Justification: "component_not_present", Method: "pkgdb"},
-			// Already in the hub's document -> must be merged out.
-			{ID: "CVE-OLD", CVE: "CVE-OLD", Product: testProduct, PURL: "pkg:deb/debian/old@1",
-				Status: analyze.StatusNotInPath, Justification: "vulnerable_code_not_in_execute_path"},
-		},
-	}
-
-	plan, err := Propose(context.Background(), res, Options{
-		HubURL:    "https://github.com/acme/hub",
-		Token:     "t",
-		Version:   "v-test",
-		Timestamp: testTime,
-		apiBase:   srv.URL,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if plan.Empty() {
-		t.Fatal("plan is empty; expected the new CVE to be proposed")
-	}
+	plan := proposeInto(t, hub, res)
 	if plan.Statements != 1 {
 		t.Fatalf("statements = %d, want 1 (CVE-OLD deduped away)", plan.Statements)
 	}
-	// Only the product document changes; index.json is untouched (existing product).
-	if len(plan.Changes) != 1 {
-		t.Fatalf("changes = %d, want 1: %+v", len(plan.Changes), plan.Changes)
+	// Only the product document changes; index.json already knows this product.
+	if len(plan.Changes) != 1 || plan.Changes[0].Path != syntheticLoc {
+		t.Fatalf("changes = %+v, want only %s", pathsOf(plan), syntheticLoc)
 	}
-	if !strings.Contains(string(plan.Changes[0].Content), "CVE-NEW") {
-		t.Errorf("document does not contain the new CVE:\n%s", plan.Changes[0].Content)
-	}
-	if !strings.Contains(string(plan.Changes[0].Content), "CVE-OLD") {
-		t.Errorf("merge dropped the pre-existing statement:\n%s", plan.Changes[0].Content)
-	}
-
-	url, err := plan.Submit(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if url != "https://github.com/acme/hub/pull/7" {
-		t.Errorf("pr url = %q", url)
-	}
-	if hub.createdRef != "refs/heads/"+plan.Branch {
-		t.Errorf("created ref = %q, want the plan branch %q", hub.createdRef, plan.Branch)
-	}
-	if hub.prHead != plan.Branch || hub.prBase != "main" {
-		t.Errorf("PR head/base = %q/%q, want %q/main", hub.prHead, hub.prBase, plan.Branch)
-	}
-	if len(hub.committed) != 1 {
-		t.Errorf("committed files = %v, want the single product document", hub.committed)
-	}
-}
-
-func TestProposeEmptyWhenNothingRuledOut(t *testing.T) {
-	res := &analyze.Result{Findings: []analyze.Finding{
-		{ID: "CVE-1", CVE: "CVE-1", Product: testProduct, PURL: "pkg:deb/debian/a@1", Status: analyze.StatusLinked},
-	}}
-	plan, err := Propose(context.Background(), res, Options{HubURL: "https://github.com/acme/hub", Token: "t", Timestamp: testTime})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !plan.Empty() {
-		t.Fatalf("plan not empty: %+v", plan)
+	got := string(plan.Changes[0].Content)
+	for _, want := range []string{"CVE-NEW", "CVE-OLD", `"Prev"`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("merged document lost %s:\n%s", want, got)
+		}
 	}
 }
 
@@ -179,39 +103,24 @@ func TestProposeEmptyWhenNothingRuledOut(t *testing.T) {
 // cannot read".
 //
 // Those used to take the same branch: an unreadable document fell through to a
-// fresh one, and the PR then carried a whole-file rewrite that deleted whatever
-// the hub had published -- other authors' statements, other authors' names. A
-// statement vexscan cannot decode is still one its publisher meant and quite
-// possibly one another reader acts on, so the file has to be left exactly as it
-// is, and the omission reported rather than counted as success.
+// fresh one, and the output then replaced whatever the hub had published --
+// other authors' statements, other authors' names. A statement vexscan cannot
+// decode is still one its publisher meant and quite possibly one another reader
+// acts on, so the file has to be left exactly as it is, and the omission
+// reported rather than counted as success.
 func TestProposeLeavesUnparsableDocumentAlone(t *testing.T) {
-	const loc = "pkg/oci/index.docker.io/example/synthetic/scan.openvex.json"
-	hub := &fakeHub{files: map[string]string{
-		"index.json": `{"version":1,"packages":[
-			{"id":"pkg:oci/synthetic?repository_url=index.docker.io%2Fexample%2Fsynthetic","location":"` + loc + `"}
-		]}`,
-		loc: `{"@context":"https://openvex.dev/ns/v0.2.0","author":"Vendor",` +
-			`"statements":[{"vulnerability":{"name":"CVE-VENDOR-1"}}` + "\n\n" + `NOT JSON`,
-	}}
-	srv := httptest.NewServer(hub.handler(t))
-	defer srv.Close()
-
-	res := &analyze.Result{Target: "example/synthetic:latest", Findings: []analyze.Finding{
-		{ID: "CVE-NEW", CVE: "CVE-NEW", Product: testProduct, PURL: "pkg:deb/debian/new@2",
-			Status: analyze.StatusNotPresent, Justification: "component_not_present", Method: "pkgdb"},
+	hub := &fakeHub{index: syntheticIndex(), files: map[string]string{
+		syntheticLoc: `{"@context":"https://openvex.dev/ns/v0.2.0","author":"Vendor",` +
+			`"statements":[{"vulnerability":{"name":"CVE-VENDOR-1"}}` + "\n\nNOT JSON",
 	}}
 
-	plan, err := Propose(context.Background(), res, Options{
-		HubURL: "https://github.com/acme/hub", Token: "t", Timestamp: testTime, apiBase: srv.URL,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	plan := proposeInto(t, hub, ruledOutResult("CVE-NEW"))
 	if !plan.Empty() {
-		t.Fatalf("plan rewrites an unreadable document: %+v", plan.Changes)
+		t.Fatalf("plan rewrites an unreadable document: %v", pathsOf(plan))
 	}
-	if len(plan.Unparsable) != 1 || plan.Unparsable[0] != loc {
-		t.Fatalf("Unparsable = %v, want [%s] -- the omission must be reported, not silent", plan.Unparsable, loc)
+	if len(plan.Unparsable) != 1 || plan.Unparsable[0] != syntheticLoc {
+		t.Fatalf("Unparsable = %v, want [%s] -- the omission must be reported, not silent",
+			plan.Unparsable, syntheticLoc)
 	}
 }
 
@@ -221,36 +130,20 @@ func TestProposeLeavesUnparsableDocumentAlone(t *testing.T) {
 // to mean the document was replaced. The document below is valid and must be
 // merged into, not overwritten.
 func TestProposeVersionAsStringIsStillReadable(t *testing.T) {
-	const loc = "pkg/oci/index.docker.io/example/synthetic/scan.openvex.json"
-	hub := &fakeHub{files: map[string]string{
-		"index.json": `{"version":1,"packages":[
-			{"id":"pkg:oci/synthetic?repository_url=index.docker.io%2Fexample%2Fsynthetic","location":"` + loc + `"}
-		]}`,
-		loc: `{"@context":"https://openvex.dev/ns/v0.2.0","author":"Vendor","version":"1",
+	hub := &fakeHub{index: syntheticIndex(), files: map[string]string{
+		syntheticLoc: `{"@context":"https://openvex.dev/ns/v0.2.0","author":"Vendor","version":"1",
 			"timestamp":"2026-01-01T00:00:00Z","statements":[
 				{"vulnerability":{"name":"CVE-VENDOR-1"},
 				 "products":[{"@id":"pkg:oci/synthetic?repository_url=index.docker.io/example/synthetic"}],
 				 "status":"not_affected"}]}`,
 	}}
-	srv := httptest.NewServer(hub.handler(t))
-	defer srv.Close()
 
-	res := &analyze.Result{Target: "example/synthetic:latest", Findings: []analyze.Finding{
-		{ID: "CVE-NEW", CVE: "CVE-NEW", Product: testProduct, PURL: "pkg:deb/debian/new@2",
-			Status: analyze.StatusNotPresent, Justification: "component_not_present", Method: "pkgdb"},
-	}}
-
-	plan, err := Propose(context.Background(), res, Options{
-		HubURL: "https://github.com/acme/hub", Token: "t", Timestamp: testTime, apiBase: srv.URL,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	plan := proposeInto(t, hub, ruledOutResult("CVE-NEW"))
 	if len(plan.Unparsable) != 0 {
 		t.Fatalf(`a "version":"1" document was treated as unreadable: %v`, plan.Unparsable)
 	}
 	if len(plan.Changes) != 1 {
-		t.Fatalf("changes = %d, want 1", len(plan.Changes))
+		t.Fatalf("changes = %v, want one document", pathsOf(plan))
 	}
 	got := string(plan.Changes[0].Content)
 	for _, want := range []string{"CVE-VENDOR-1", "CVE-NEW", `"Vendor"`, `"version": "1"`} {
@@ -260,71 +153,248 @@ func TestProposeVersionAsStringIsStillReadable(t *testing.T) {
 	}
 }
 
-// TestProposeNeverCommitsOutsideHubRoot drives a hostile product name all the
-// way through to the commit, because the checks in location.go are only worth
+// TestProposeNewProductExtendsIndex checks the other half of a merge: a product
+// the hub does not carry needs a document and an index entry pointing at it.
+func TestProposeNewProductExtendsIndex(t *testing.T) {
+	// A hub that indexes something else entirely, with a top-level field this
+	// code does not model.
+	hub := &fakeHub{index: `{"version":1,"metadata":{"owner":"someone"},"packages":[
+		{"id":"pkg:golang/example.com/other","location":"pkg/golang/example.com/other/scan.openvex.json","note":"kept"}
+	]}`}
+
+	plan := proposeInto(t, hub, ruledOutResult("CVE-NEW"))
+	want := []string{syntheticLoc, "index.json"}
+	if got := pathsOf(plan); !equalStrings(got, want) {
+		t.Fatalf("changes = %v, want %v", got, want)
+	}
+
+	idx := plan.Changes[1].Content
+	// The hub's own entry, its unknown per-entry field and its unknown
+	// top-level field all survive: an index is the hub's artifact, and a
+	// one-product change must not rewrite it.
+	for _, keep := range []string{`"owner": "someone"`, `"note": "kept"`, "pkg:golang/example.com/other"} {
+		if !strings.Contains(string(idx), keep) {
+			t.Errorf("index.json lost %s:\n%s", keep, idx)
+		}
+	}
+	// And the new product is filed under its encoded key.
+	if !strings.Contains(string(idx), "index.docker.io%2Fexample%2Fsynthetic") {
+		t.Errorf("index.json does not carry the new product:\n%s", idx)
+	}
+	var check map[string]any
+	if err := json.Unmarshal(idx, &check); err != nil {
+		t.Fatalf("index.json is not valid JSON: %v\n%s", err, idx)
+	}
+}
+
+// TestProposeWithNoHubBootstrapsOne is --vex-out without --vexhub: there is
+// nothing to merge against, so the output is a hub in its own right and must
+// carry the index that makes it one.
+func TestProposeWithNoHubBootstrapsOne(t *testing.T) {
+	plan := proposeInto(t, nil, ruledOutResult("CVE-NEW"))
+	want := []string{syntheticLoc, "index.json"}
+	if got := pathsOf(plan); !equalStrings(got, want) {
+		t.Fatalf("changes = %v, want %v", got, want)
+	}
+	if !strings.Contains(string(plan.Changes[0].Content), `"Acme Security"`) {
+		t.Errorf("fresh document does not carry the author:\n%s", plan.Changes[0].Content)
+	}
+}
+
+func TestProposeNeedsAnAuthor(t *testing.T) {
+	_, err := Propose(context.Background(), ruledOutResult("CVE-NEW"), Options{Timestamp: testTime})
+	if err == nil {
+		t.Fatal("Propose with no author = nil error; an OpenVEX statement has to say who is asserting it")
+	}
+}
+
+func TestProposeEmptyWhenNothingRuledOut(t *testing.T) {
+	res := &analyze.Result{Findings: []analyze.Finding{
+		{ID: "CVE-1", CVE: "CVE-1", Product: testProduct, PURL: "pkg:deb/debian/a@1", Status: analyze.StatusLinked},
+	}}
+	plan := proposeInto(t, nil, res)
+	if !plan.Empty() {
+		t.Fatalf("plan not empty: %v", pathsOf(plan))
+	}
+}
+
+// TestWriteNeverEscapesTheOutputDirectory drives a hostile product name all the
+// way to the filesystem, because the checks in location.go are only worth
 // anything if nothing downstream re-derives a path around them.
 //
 // The product name here is what vexscan would build from a Go main module read
 // out of a binary inside a scanned image -- a string the image's author chose.
-func TestProposeNeverCommitsOutsideHubRoot(t *testing.T) {
-	hub := &fakeHub{files: map[string]string{
-		"index.json": `{"version":1,"packages":[]}`,
-	}}
-	srv := httptest.NewServer(hub.handler(t))
-	defer srv.Close()
-
-	const evil = "pkg:golang/example.com/m/../../../../.github/workflows/release"
-	res := &analyze.Result{Target: "example/synthetic:latest", Findings: []analyze.Finding{
-		{ID: "CVE-EVIL", CVE: "CVE-EVIL", Product: evil, PURL: "pkg:golang/golang.org/x/net",
-			Status: analyze.StatusNotPresent, Justification: "component_not_present", Method: "pkgdb"},
-		{ID: "CVE-OK", CVE: "CVE-OK", Product: testProduct, PURL: "pkg:deb/debian/new@2",
-			Status: analyze.StatusNotPresent, Justification: "component_not_present", Method: "pkgdb"},
-	}}
-
-	plan, err := Propose(context.Background(), res, Options{
-		HubURL: "https://github.com/acme/hub", Token: "t", Timestamp: testTime, apiBase: srv.URL,
+func TestWriteNeverEscapesTheOutputDirectory(t *testing.T) {
+	res := ruledOutResult("CVE-OK")
+	res.Findings = append(res.Findings, analyze.Finding{
+		ID: "CVE-EVIL", CVE: "CVE-EVIL",
+		Product:       "pkg:golang/example.com/m/../../../../.github/workflows/release",
+		PURL:          "pkg:golang/golang.org/x/net",
+		Status:        analyze.StatusNotPresent,
+		Justification: "component_not_present", Method: "pkgdb",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+
+	plan := proposeInto(t, nil, res)
 	if plan.Empty() {
-		t.Fatal("plan is empty; the well-formed product should still have been proposed")
+		t.Fatal("plan is empty; the well-formed product should still have been written")
 	}
-	if _, err := plan.Submit(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	for _, p := range hub.committed {
-		if p == "index.json" {
+	for _, ch := range plan.Changes {
+		if ch.Path == "index.json" {
 			continue
 		}
-		if !strings.HasPrefix(p, "pkg/") || strings.Contains(p, "..") {
-			t.Errorf("commit writes %q, outside the hub's pkg/ tree", p)
+		if !strings.HasPrefix(ch.Path, "pkg/") || strings.Contains(ch.Path, "..") {
+			t.Errorf("plan writes %q, outside the hub's pkg/ tree", ch.Path)
 		}
 	}
-	if len(hub.committed) == 0 {
-		t.Error("nothing was committed; the test proves nothing")
+
+	root := t.TempDir()
+	dir := filepath.Join(root, "hub")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.Write(dir); err != nil {
+		t.Fatal(err)
+	}
+	var written []string
+	filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			rel, _ := filepath.Rel(root, p)
+			written = append(written, filepath.ToSlash(rel))
+		}
+		return nil
+	})
+	if len(written) == 0 {
+		t.Fatal("nothing was written; the test proves nothing")
+	}
+	for _, p := range written {
+		if !strings.HasPrefix(p, "hub/") {
+			t.Errorf("Write put %q outside the output directory", p)
+		}
 	}
 }
 
-func TestParseGitHubRepo(t *testing.T) {
-	cases := map[string][2]string{
-		"https://github.com/rancher/vexhub":                      {"rancher", "vexhub"},
-		"https://github.com/rancher/vexhub.git":                  {"rancher", "vexhub"},
-		"https://raw.githubusercontent.com/rancher/vexhub/HEAD/": {"rancher", "vexhub"},
-	}
-	for in, want := range cases {
-		o, r, err := parseGitHubRepo(in)
-		if err != nil {
-			t.Errorf("%s: %v", in, err)
-			continue
-		}
-		if o != want[0] || r != want[1] {
-			t.Errorf("%s -> %s/%s, want %s/%s", in, o, r, want[0], want[1])
+// TestWriteRefusesANonLocalPath is the last-line check, exercised directly
+// because no path built by this package should ever reach it.
+func TestWriteRefusesANonLocalPath(t *testing.T) {
+	for _, bad := range []string{"../escape.json", "/etc/passwd"} {
+		p := &Plan{Changes: []FileChange{{Path: bad, Content: []byte("{}")}}}
+		if err := p.Write(t.TempDir()); err == nil {
+			t.Errorf("Write(%q) = nil error, want a refusal", bad)
 		}
 	}
-	for _, bad := range []string{"", "/some/local/dir", "https://example.com/x/y"} {
-		if _, _, err := parseGitHubRepo(bad); err == nil {
-			t.Errorf("parseGitHubRepo(%q) = nil error, want error", bad)
+}
+
+// TestWriteIntoAHubClone is the documented workflow: merge against a clone and
+// write back into it, so the result is a git diff.
+func TestWriteIntoAHubClone(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "index.json"), []byte(syntheticIndex()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	docPath := filepath.Join(dir, filepath.FromSlash(syntheticLoc))
+	if err := os.MkdirAll(filepath.Dir(docPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	existing := `{"@context":"https://openvex.dev/ns/v0.2.0","author":"Vendor","version":1,
+		"timestamp":"2026-01-01T00:00:00Z","statements":[]}`
+	if err := os.WriteFile(docPath, []byte(existing), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	hub := &fakeHub{index: syntheticIndex(), files: map[string]string{syntheticLoc: existing}}
+	plan := proposeInto(t, hub, ruledOutResult("CVE-NEW"))
+	if err := plan.Write(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := os.ReadFile(docPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(after), "CVE-NEW") {
+		t.Errorf("the clone's document was not updated:\n%s", after)
+	}
+	if !strings.Contains(string(after), `"Vendor"`) {
+		t.Errorf("writing back into the clone dropped the existing author:\n%s", after)
+	}
+}
+
+// TestProposeKeepsTheHubsFormatting is the point of the whole design, applied
+// to whitespace: the reviewer of the resulting pull request has to be able to
+// see what changed.
+//
+// rancher/vexhub's index.json is 4381 lines and has no trailing newline.
+// Re-emitting it with this package's own preferences -- two spaces, newline at
+// end -- turns a one-product addition into a diff that touches the last line
+// too, and against a hub indenting with four spaces it would touch all 4381.
+// So the formatting is read off the file and reproduced, and the only lines in
+// the diff are the ones with new content.
+func TestProposeKeepsTheHubsFormatting(t *testing.T) {
+	// Four-space indent, no trailing newline, on both files.
+	index := "{\n" +
+		`    "version": 1,` + "\n" +
+		`    "packages": [` + "\n" +
+		`        {"id":"pkg:golang/example.com/other","location":"pkg/golang/example.com/other/scan.openvex.json"}` + "\n" +
+		"    ]\n}"
+	doc := "{\n" +
+		`    "@context": "https://openvex.dev/ns/v0.2.0",` + "\n" +
+		`    "author": "Vendor",` + "\n" +
+		`    "version": 1,` + "\n" +
+		`    "statements": []` + "\n}"
+
+	hub := &fakeHub{index: index, files: map[string]string{syntheticLoc: doc}}
+	// The index does not carry the scanned product, so both files change.
+	plan := proposeInto(t, hub, ruledOutResult("CVE-NEW"))
+	if got, want := pathsOf(plan), []string{syntheticLoc, "index.json"}; !equalStrings(got, want) {
+		t.Fatalf("changes = %v, want %v", got, want)
+	}
+
+	for _, ch := range plan.Changes {
+		got := string(ch.Content)
+		if strings.HasSuffix(got, "\n") {
+			t.Errorf("%s gained a trailing newline the hub does not have:\n%s", ch.Path, got)
+		}
+		if strings.Contains(got, "\n  \"") {
+			t.Errorf("%s was reindented from four spaces to two:\n%s", ch.Path, got)
+		}
+		if !strings.Contains(got, "\n    \"") {
+			t.Errorf("%s does not use the hub's four-space indent:\n%s", ch.Path, got)
 		}
 	}
+}
+
+// TestMarshalDefaultsToTwoSpacesAndANewline covers the other side: a file this
+// package creates has no formatting to inherit, so it picks the conventional
+// one rather than emitting a single line.
+func TestMarshalDefaultsToTwoSpacesAndANewline(t *testing.T) {
+	plan := proposeInto(t, nil, ruledOutResult("CVE-NEW"))
+	for _, ch := range plan.Changes {
+		got := string(ch.Content)
+		if !strings.HasSuffix(got, "\n") {
+			t.Errorf("%s has no trailing newline:\n%s", ch.Path, got)
+		}
+		if !strings.Contains(got, "\n  \"") {
+			t.Errorf("%s is not indented with two spaces:\n%s", ch.Path, got)
+		}
+	}
+}
+
+func pathsOf(p *Plan) []string {
+	out := make([]string, 0, len(p.Changes))
+	for _, ch := range p.Changes {
+		out = append(out, ch.Path)
+	}
+	return out
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

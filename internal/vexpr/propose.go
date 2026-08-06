@@ -3,52 +3,55 @@ package vexpr
 import (
 	"context"
 	"fmt"
-	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
-	"strings"
 
 	"github.com/cwayne18/vexscan/internal/analyze"
 )
 
-// Options configures a PR proposal.
+// HubReader is the read side of a VEX hub: enough to merge into what a hub
+// already publishes without holding a credential that could write to it.
+//
+// *vex.Hub satisfies it, and that is the point. The hub this merges against is
+// the same hub --vexhub already read during the scan, over the same transport,
+// with the same URL-or-directory handling -- there is no second notion of what
+// a hub is, and no second way to reach one.
+type HubReader interface {
+	// IndexRaw is index.json exactly as published.
+	IndexRaw() []byte
+	// Raw returns one file's bytes by a location the index gave, or ok=false
+	// when the hub has no such file.
+	Raw(ctx context.Context, loc string) ([]byte, bool, error)
+}
+
+// Options configures a proposal.
 type Options struct {
-	// HubURL is the --vexhub the PR targets. Only a github.com (or its
-	// raw.githubusercontent.com form) URL can be turned into a pull request; a
-	// raw base or a local directory cannot, and is reported as such.
-	HubURL string
-	// PushRepo is "owner/repo" to push the branch to -- a fork the caller
-	// maintains. Empty pushes a branch straight to the hub repository, which is
-	// the right default for a token with write access to it.
-	PushRepo string
-	// Author overrides the OpenVEX author. Empty derives it from the
-	// authenticated GitHub user.
+	// Hub is the hub to merge against, read-only. Nil starts from an empty
+	// index, which is how a hub gets bootstrapped rather than added to.
+	Hub HubReader
+	// Author is the OpenVEX author recorded on every statement written. It has
+	// no default: an author is a claim of responsibility for the assertion, and
+	// there is nobody but the caller who can make it.
 	Author string
-	// Token overrides the GitHub token; empty reads GITHUB_TOKEN / GH_TOKEN.
-	Token string
-	// Version is vexscan's version, recorded in the commit for provenance.
-	Version string
 	// Timestamp is the scan time, used on every statement so a re-run of the
 	// same scan produces the same document.
 	Timestamp string
 	// Logf receives progress lines. Nil discards them.
 	Logf func(string, ...any)
-
-	// apiBase overrides the GitHub API root. It exists for tests, which point
-	// it at an httptest server; it is unexported so it cannot leak into the
-	// public surface.
-	apiBase string
 }
 
-// FileChange is one file the PR creates or rewrites, path relative to the
-// repository root.
+// FileChange is one file to write, path relative to the output directory (and
+// so also relative to the hub root, since the two share a layout).
 type FileChange struct {
 	Path    string
 	Content []byte
 }
 
-// Plan is everything a PR would change, computed but not yet pushed. It is
-// returned so --vexhub-pr-dry-run can show the exact diff before anything is
-// written, and Submit turns it into a real pull request.
+// Plan is every file a proposal would write, computed but not yet on disk.
+//
+// Computing and writing are separate so the caller can report what is about to
+// happen, and so the whole merge is testable without a filesystem.
 type Plan struct {
 	Changes    []FileChange
 	Products   []ProductChange
@@ -58,24 +61,10 @@ type Plan struct {
 	Skipped int
 	// Unparsable is every hub document that exists but could not be decoded,
 	// and was therefore left exactly as the hub published it. Reported rather
-	// than counted silently: each one is a product this PR says nothing about,
-	// and a hub maintainer reading the PR would otherwise have no way to tell
-	// that from a product with nothing to say.
+	// than counted silently: each one is a product this proposal says nothing
+	// about, and a reader would otherwise have no way to tell that from a
+	// product with nothing to say.
 	Unparsable []string
-
-	Branch string
-	Title  string
-	Body   string
-
-	// unexported: what Submit needs to act.
-	gh            *githubClient
-	pushOwner     string
-	pushName      string
-	upstreamOwner string
-	upstreamName  string
-	baseBranch    string
-	baseSHA       string
-	head          string
 }
 
 // ProductChange records, for the summary, which vulnerabilities were added to
@@ -85,17 +74,19 @@ type ProductChange struct {
 	Vulns   []string
 }
 
-// Empty reports whether the plan would change nothing -- every ruled-out finding
-// was already covered, or there were none to begin with.
+// Empty reports whether the proposal would change nothing -- every ruled-out
+// finding was already covered, or there were none to begin with.
 func (p *Plan) Empty() bool { return len(p.Changes) == 0 }
 
-// Propose computes the pull request that would add vexscan's ruled-out findings
-// to the hub, reading the hub's current state to merge rather than clobber. It
-// performs no writes; Submit does.
+// Propose computes the documents that record this scan's ruled-out findings,
+// merged into whatever the hub already publishes. It writes nothing; Write does.
 func Propose(ctx context.Context, res *analyze.Result, opts Options) (*Plan, error) {
 	logf := opts.Logf
 	if logf == nil {
 		logf = func(string, ...any) {}
+	}
+	if opts.Author == "" {
+		return nil, fmt.Errorf("vexpr: no author to record on the statements")
 	}
 
 	proposals, skipped := selectProposals(res, opts.Timestamp)
@@ -103,60 +94,13 @@ func Propose(ctx context.Context, res *analyze.Result, opts Options) (*Plan, err
 		return &Plan{Skipped: skipped}, nil
 	}
 
-	upstreamOwner, upstreamName, err := parseGitHubRepo(opts.HubURL)
-	if err != nil {
-		return nil, err
-	}
-	gh, err := newGitHubClient(opts.Token, opts.Version)
-	if err != nil {
-		return nil, err
-	}
-	if opts.apiBase != "" {
-		gh.API = opts.apiBase
-	}
-
-	login, err := gh.login(ctx)
-	if err != nil {
-		return nil, err
-	}
-	author := opts.Author
-	if author == "" {
-		author = fmt.Sprintf("%s (via vexscan)", login)
-	}
-
-	pushOwner, pushName := upstreamOwner, upstreamName
-	if opts.PushRepo != "" {
-		pushOwner, pushName, err = splitOwnerRepo(opts.PushRepo)
+	idx := newIndex()
+	if opts.Hub != nil {
+		parsed, err := parseIndex(opts.Hub.IndexRaw())
 		if err != nil {
 			return nil, err
 		}
-	}
-
-	up, err := gh.repo(ctx, upstreamOwner, upstreamName)
-	if err != nil {
-		return nil, err
-	}
-	baseBranch := up.DefaultBranch
-
-	// The branch is created on the push repo, so it must be based on a commit
-	// that repo has. For a direct push that is the hub's default head; for a
-	// fork it is the fork's own default head, which the contributor keeps in
-	// sync.
-	baseSHA, err := pushBaseSHA(ctx, gh, pushOwner, pushName, upstreamOwner, upstreamName, baseBranch)
-	if err != nil {
-		return nil, err
-	}
-
-	idxRaw, ok, err := gh.fileAt(ctx, pushOwner, pushName, "index.json", baseSHA)
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return nil, fmt.Errorf("vexpr: %s/%s has no index.json; is it a VEX hub?", pushOwner, pushName)
-	}
-	idx, err := parseIndex(idxRaw)
-	if err != nil {
-		return nil, err
+		idx = parsed
 	}
 
 	var (
@@ -169,34 +113,30 @@ func Propose(ctx context.Context, res *analyze.Result, opts Options) (*Plan, err
 	for _, prop := range proposals {
 		loc, idxChanged, err := idx.ensure(prop.Product)
 		if err != nil {
-			logf("  ! vexhub-pr: %s skipped: %v", prop.Product, err)
+			logf("  ! vex-out: %s skipped: %v", prop.Product, err)
 			continue
 		}
-		existing, exists, err := gh.fileAt(ctx, pushOwner, pushName, loc, baseSHA)
+
+		doc, ok, err := readDoc(ctx, opts.Hub, loc)
 		if err != nil {
 			return nil, err
 		}
-		var doc *Doc
-		if exists {
-			d, ok := ParseDoc(existing)
-			if !ok {
-				// The file is there and this cannot read it, which is not the
-				// same as it not being there. Starting a fresh document would
-				// put a whole-file rewrite in the PR and delete whatever the
-				// file said: a statement vexscan cannot parse is still one its
-				// publisher meant, and quite possibly one another reader acts
-				// on. Leave it exactly as it is, and account for it.
-				logf("  ! vexhub-pr: %s: %s exists but could not be parsed; left untouched", prop.Product, loc)
-				unparsable = append(unparsable, loc)
-				continue
-			}
-			doc = d
-		} else {
-			doc = NewDoc(author, opts.Timestamp)
+		if !ok {
+			// The file is there and this cannot read it, which is not the same
+			// as it not being there. Starting a fresh document would overwrite
+			// whatever the file said: a statement vexscan cannot decode is
+			// still one its publisher meant, and quite possibly one another
+			// reader acts on. Leave it exactly as it is, and account for it.
+			logf("  ! vex-out: %s: %s exists but could not be parsed; left untouched", prop.Product, loc)
+			unparsable = append(unparsable, loc)
+			continue
+		}
+		if doc == nil {
+			doc = NewDoc(opts.Author, opts.Timestamp)
 		}
 
 		before := len(doc.Statements)
-		added := mergeStatements(doc, prop, author, opts.Timestamp)
+		added := mergeStatements(doc, prop, opts.Author, opts.Timestamp)
 		if added == 0 {
 			// Nothing new for this product: leave the index untouched even if
 			// ensure would have added a key (it only does so for a product with
@@ -220,7 +160,10 @@ func Propose(ctx context.Context, res *analyze.Result, opts Options) (*Plan, err
 	if len(changes) == 0 {
 		return &Plan{Skipped: skipped, Unparsable: unparsable}, nil
 	}
-	if indexTouched {
+	// A hub being bootstrapped has no index.json on disk yet, so it is written
+	// even when no product was added to it -- otherwise the output would be a
+	// tree of documents nothing points at.
+	if indexTouched || opts.Hub == nil {
 		idxContent, err := idx.marshal()
 		if err != nil {
 			return nil, err
@@ -228,62 +171,67 @@ func Propose(ctx context.Context, res *analyze.Result, opts Options) (*Plan, err
 		changes = append(changes, FileChange{Path: "index.json", Content: idxContent})
 	}
 
-	branch := "vexscan/ruled-out-" + branchStamp(opts.Timestamp)
-	head := branch
-	if pushOwner != upstreamOwner {
-		head = pushOwner + ":" + branch
-	}
-	title := fmt.Sprintf("Add %d vexscan not_affected statement(s)", stmtTotal)
-	body := buildBody(res.Target, opts.Version, productChgs)
-
 	return &Plan{
-		Changes:       changes,
-		Products:      productChgs,
-		Statements:    stmtTotal,
-		Skipped:       skipped,
-		Unparsable:    unparsable,
-		Branch:        branch,
-		Title:         title,
-		Body:          body,
-		gh:            gh,
-		pushOwner:     pushOwner,
-		pushName:      pushName,
-		upstreamOwner: upstreamOwner,
-		upstreamName:  upstreamName,
-		baseBranch:    baseBranch,
-		baseSHA:       baseSHA,
-		head:          head,
+		Changes:    changes,
+		Products:   productChgs,
+		Statements: stmtTotal,
+		Skipped:    skipped,
+		Unparsable: unparsable,
 	}, nil
 }
 
-// Submit pushes the plan as a branch and opens the pull request, returning its
-// URL.
-func (p *Plan) Submit(ctx context.Context) (string, error) {
-	if p.Empty() {
-		return "", fmt.Errorf("vexpr: nothing to submit")
+// readDoc fetches and decodes the hub's existing document for a location.
+//
+// The three outcomes are distinct and the caller acts differently on each: a
+// decoded document to merge into (doc != nil, ok), no document there at all
+// (nil, ok), and a document that exists but does not decode (nil, !ok).
+func readDoc(ctx context.Context, hub HubReader, loc string) (*Doc, bool, error) {
+	if hub == nil {
+		return nil, true, nil
 	}
-	message := p.Title + "\n\n" + p.Body
-	sha, err := p.gh.commitFiles(ctx, p.pushOwner, p.pushName, p.baseSHA, message, p.Changes)
+	raw, exists, err := hub.Raw(ctx, loc)
 	if err != nil {
-		return "", err
+		return nil, false, err
 	}
-	if err := p.gh.createBranch(ctx, p.pushOwner, p.pushName, p.Branch, sha); err != nil {
-		return "", err
+	if !exists {
+		return nil, true, nil
 	}
-	return p.gh.openPR(ctx, p.upstreamOwner, p.upstreamName, p.head, p.baseBranch, p.Title, p.Body)
+	doc, ok := ParseDoc(raw)
+	if !ok {
+		return nil, false, nil
+	}
+	return doc, true, nil
 }
 
-// pushBaseSHA is the commit a new branch is based on: the hub's default head for
-// a direct push, or the fork's own default head for a fork push.
-func pushBaseSHA(ctx context.Context, gh *githubClient, pushOwner, pushName, upOwner, upName, upBranch string) (string, error) {
-	if pushOwner == upOwner && pushName == upName {
-		return gh.branchHead(ctx, upOwner, upName, upBranch)
+// Write puts the plan on disk under dir, creating parent directories as needed.
+//
+// dir may be a clone of the hub itself, which is the intended shape: merge
+// against the clone, write back into it, and read the result as a git diff.
+// Nothing is written outside dir -- the paths were vetted where they were built,
+// and vetted again here, because this is the step that touches a filesystem and
+// the check that matters is the one nearest the syscall.
+func (p *Plan) Write(dir string) error {
+	if dir == "" {
+		return fmt.Errorf("vexpr: no output directory")
 	}
-	fork, err := gh.repo(ctx, pushOwner, pushName)
+	root, err := filepath.Abs(dir)
 	if err != nil {
-		return "", err
+		return fmt.Errorf("vexpr: %s: %w", dir, err)
 	}
-	return gh.branchHead(ctx, pushOwner, pushName, fork.DefaultBranch)
+	for _, ch := range p.Changes {
+		rel := filepath.FromSlash(ch.Path)
+		if !filepath.IsLocal(rel) {
+			return fmt.Errorf("vexpr: refusing to write %q: not a path inside %s", ch.Path, dir)
+		}
+		full := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			return fmt.Errorf("vexpr: %s: %w", ch.Path, err)
+		}
+		if err := os.WriteFile(full, ch.Content, 0o644); err != nil {
+			return fmt.Errorf("vexpr: %s: %w", ch.Path, err)
+		}
+	}
+	return nil
 }
 
 // addedVulns lists the vulnerability names of a slice of statements, for the
@@ -295,84 +243,4 @@ func addedVulns(sts []Statement) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-// buildBody is the pull request description: what produced it, and every
-// statement it adds, grouped by product.
-func buildBody(target, version string, products []ProductChange) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "Automated by [vexscan](https://github.com/cwayne18/vexscan)")
-	if version != "" {
-		fmt.Fprintf(&b, " %s", version)
-	}
-	b.WriteString(".\n\n")
-	if target != "" {
-		fmt.Fprintf(&b, "Scan target: `%s`\n\n", target)
-	}
-	b.WriteString("These `not_affected` statements record findings vexscan ruled out because " +
-		"the vulnerable code is not present or cannot run. Each carries the OpenVEX " +
-		"justification behind the verdict; review before merging.\n\n")
-	for _, pc := range products {
-		fmt.Fprintf(&b, "### `%s`\n", pc.Product)
-		for _, v := range pc.Vulns {
-			fmt.Fprintf(&b, "- %s\n", v)
-		}
-		b.WriteString("\n")
-	}
-	return b.String()
-}
-
-// parseGitHubRepo pulls owner and repo out of a hub URL, accepting the same
-// github.com form the reader does plus its raw.githubusercontent.com rewrite.
-// Anything else -- a bare raw base, a local directory -- cannot become a PR.
-func parseGitHubRepo(location string) (owner, repo string, err error) {
-	location = strings.TrimSpace(location)
-	if location == "" {
-		return "", "", fmt.Errorf("vexpr: no --vexhub given to open a PR against")
-	}
-	if !strings.HasPrefix(location, "http://") && !strings.HasPrefix(location, "https://") {
-		return "", "", fmt.Errorf("vexpr: --vexhub %q is not a GitHub URL; --vexhub-pr needs e.g. https://github.com/rancher/vexhub", location)
-	}
-	u, err := url.Parse(location)
-	if err != nil {
-		return "", "", fmt.Errorf("vexpr: %s: %w", location, err)
-	}
-	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-	switch {
-	case strings.EqualFold(u.Host, "github.com"):
-		if len(parts) < 2 {
-			return "", "", fmt.Errorf("vexpr: %s: not an owner/repo URL", location)
-		}
-		return parts[0], strings.TrimSuffix(parts[1], ".git"), nil
-	case strings.EqualFold(u.Host, "raw.githubusercontent.com"):
-		if len(parts) < 2 {
-			return "", "", fmt.Errorf("vexpr: %s: not an owner/repo URL", location)
-		}
-		return parts[0], parts[1], nil
-	default:
-		return "", "", fmt.Errorf("vexpr: --vexhub host %q is not GitHub; --vexhub-pr can only open PRs against github.com hubs", u.Host)
-	}
-}
-
-// splitOwnerRepo parses an "owner/repo" push target.
-func splitOwnerRepo(s string) (owner, repo string, err error) {
-	s = strings.TrimSpace(s)
-	owner, repo, ok := strings.Cut(s, "/")
-	if !ok || owner == "" || repo == "" {
-		return "", "", fmt.Errorf("vexpr: --vexhub-pr-repo %q is not in owner/repo form", s)
-	}
-	return owner, strings.TrimSuffix(repo, ".git"), nil
-}
-
-// branchStamp turns a scan timestamp into a branch-name-safe suffix.
-func branchStamp(ts string) string {
-	if ts == "" {
-		return "latest"
-	}
-	repl := strings.NewReplacer("-", "", ":", "", ".", "")
-	s := repl.Replace(ts)
-	if s == "" {
-		return "latest"
-	}
-	return s
 }
