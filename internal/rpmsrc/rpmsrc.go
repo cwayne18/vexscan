@@ -34,6 +34,14 @@ import (
 // rejected.
 const maxHeaderRead = 8 << 20
 
+// maxDeepRead bounds what a single --rpm-deep read may pull off a remote server.
+//
+// Deep mode has to read the whole compressed payload to reach the ELF objects at
+// the end of it, so the header-only cap does not apply -- but an unbounded read
+// off a mirror is still a read a hostile Content-Length could make enormous. A
+// gigabyte is far above any real distribution package and stops that.
+const maxDeepRead = 1 << 30
+
 // Package is one RPM that parsed, and where it came from.
 type Package struct {
 	pkgdb.Package
@@ -46,6 +54,13 @@ type Package struct {
 // Result is everything a --rpm value resolved to.
 type Result struct {
 	Packages []Package
+
+	// ExtractRoot is the directory --rpm-deep extracted ELF objects into, the
+	// tree the OS plugin's dynsym test reads them out of. Empty in the ordinary
+	// header-only mode, and empty in deep mode too until the first package
+	// actually ships an ELF object worth extracting. The caller owns it and is
+	// responsible for removing it.
+	ExtractRoot string
 
 	// Skipped are files deliberately not scanned: source packages, and
 	// anything in a directory that is not an rpm at all. Named rather than
@@ -73,17 +88,36 @@ type Note struct {
 // inside a directory that fails is recorded in Failed and the walk continues,
 // because one bad package must not cost the other three hundred -- but the
 // caller must still fail the run over it.
-func Read(ctx context.Context, specs []string, logf func(string, ...any)) (*Result, error) {
+//
+// deep is --rpm-deep. When it is set, each package's cpio payload is
+// decompressed and its ELF objects written under Result.ExtractRoot, so the OS
+// plugin can read their symbol tables. It is the whole cost difference between
+// the two modes: header-only reads kilobytes and never allocates a temp tree;
+// deep reads the entire package and unpacks its objects.
+func Read(ctx context.Context, specs []string, deep bool, logf func(string, ...any)) (*Result, error) {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
 	out := &Result{}
+	if deep {
+		root, err := os.MkdirTemp("", "vexscan-rpm-deep-")
+		if err != nil {
+			return nil, err
+		}
+		out.ExtractRoot = root
+	}
 	for _, spec := range specs {
-		if err := readOne(ctx, spec, out, logf); err != nil {
+		if err := readOne(ctx, spec, deep, out, logf); err != nil {
+			if out.ExtractRoot != "" {
+				os.RemoveAll(out.ExtractRoot)
+			}
 			return nil, err
 		}
 	}
 	if len(out.Packages) == 0 {
+		if out.ExtractRoot != "" {
+			os.RemoveAll(out.ExtractRoot)
+		}
 		// Every path resolved and none of them held a package. Reporting an
 		// empty inventory would scan clean, which is the one outcome an empty
 		// result may never produce.
@@ -98,9 +132,9 @@ func Read(ctx context.Context, specs []string, logf func(string, ...any)) (*Resu
 	return out, nil
 }
 
-func readOne(ctx context.Context, spec string, out *Result, logf func(string, ...any)) error {
+func readOne(ctx context.Context, spec string, deep bool, out *Result, logf func(string, ...any)) error {
 	if isURL(spec) {
-		pkg, err := readURL(ctx, spec, logf)
+		pkg, err := readURL(ctx, spec, deep, out.ExtractRoot, logf)
 		if err != nil {
 			return fmt.Errorf("%s: %w", spec, err)
 		}
@@ -113,14 +147,14 @@ func readOne(ctx context.Context, spec string, out *Result, logf func(string, ..
 		return fmt.Errorf("--rpm %s: %w", spec, err)
 	}
 	if !fi.IsDir() {
-		pkg, err := readPath(spec)
+		pkg, err := readPath(spec, deep, out.ExtractRoot)
 		if err != nil {
 			return fmt.Errorf("%s: %w", spec, err)
 		}
 		out.add(*pkg, spec, logf)
 		return nil
 	}
-	return readDir(spec, out, logf)
+	return readDir(spec, deep, out, logf)
 }
 
 // readDir walks a directory for packages.
@@ -130,7 +164,7 @@ func readOne(ctx context.Context, spec string, out *Result, logf func(string, ..
 // not an rpm is skipped silently by extension and noted when it claimed to be
 // one -- a .rpm that is an HTML error page is worth saying out loud, because it
 // is how a broken mirror looks.
-func readDir(dir string, out *Result, logf func(string, ...any)) error {
+func readDir(dir string, deep bool, out *Result, logf func(string, ...any)) error {
 	var found []string
 	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -153,7 +187,7 @@ func readDir(dir string, out *Result, logf func(string, ...any)) error {
 	logf("Reading %d rpm package file(s) from %s...", len(found), dir)
 
 	for _, p := range found {
-		pkg, err := readPath(p)
+		pkg, err := readPath(p, deep, out.ExtractRoot)
 		if err != nil {
 			out.Failed = append(out.Failed, Note{Src: p, Reason: err.Error()})
 			continue
@@ -178,28 +212,45 @@ func (r *Result) add(pkg Package, src string, logf func(string, ...any)) {
 	r.Packages = append(r.Packages, pkg)
 }
 
-func readPath(p string) (*Package, error) {
+func readPath(p string, deep bool, extractRoot string) (*Package, error) {
 	f, err := os.Open(p)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	pkg, meta, err := pkgdb.ReadFile(io.LimitReader(f, maxHeaderRead))
+
+	if !deep {
+		pkg, meta, err := pkgdb.ReadFile(io.LimitReader(f, maxHeaderRead))
+		if err != nil {
+			return nil, err
+		}
+		return &Package{Package: pkg, Meta: meta}, nil
+	}
+
+	// Deep mode reads the header off the same file handle and then keeps
+	// going: ReadFile stops exactly at the payload, so f is left positioned at
+	// its first byte. No LimitReader here -- the payload is the point.
+	pkg, meta, err := pkgdb.ReadFile(f)
 	if err != nil {
+		return nil, err
+	}
+	if err := extractPayload(f, meta, extractRoot); err != nil {
 		return nil, err
 	}
 	return &Package{Package: pkg, Meta: meta}, nil
 }
 
-// readURL streams a package until its header ends, then hangs up.
+// readURL streams a package header, then hangs up -- unless deep mode needs the
+// payload too.
 //
-// There is no Range request here on purpose. Each rpm section states its own
-// length in its first sixteen bytes, so a plain GET that stops reading is
-// enough -- and it works against servers that ignore Range, which several
-// mirrors do. Closing the body mid-response is what actually saves the
+// In the ordinary mode there is no Range request on purpose. Each rpm section
+// states its own length in its first sixteen bytes, so a plain GET that stops
+// reading is enough -- and it works against servers that ignore Range, which
+// several mirrors do. Closing the body mid-response is what actually saves the
 // transfer; on the packages measured that is 99.3% of a 2.4 MB file left
-// unfetched.
-func readURL(ctx context.Context, u string, logf func(string, ...any)) (*Package, error) {
+// unfetched. Deep mode gives that up: it has to read the whole body to reach the
+// ELF objects at the end of the payload.
+func readURL(ctx context.Context, u string, deep bool, extractRoot string, logf func(string, ...any)) (*Package, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
@@ -216,7 +267,11 @@ func readURL(ctx context.Context, u string, logf func(string, ...any)) (*Package
 		return nil, fmt.Errorf("server answered %s", resp.Status)
 	}
 
-	c := &counter{r: io.LimitReader(resp.Body, maxHeaderRead)}
+	limit := int64(maxHeaderRead)
+	if deep {
+		limit = maxDeepRead
+	}
+	c := &counter{r: io.LimitReader(resp.Body, limit)}
 	pkg, meta, err := pkgdb.ReadFile(c)
 	if err != nil {
 		if errors.Is(err, pkgdb.ErrNotRPM) {
@@ -224,8 +279,26 @@ func readURL(ctx context.Context, u string, logf func(string, ...any)) (*Package
 		}
 		return nil, err
 	}
-	logf("Fetched the header of %s: read %s of %s", filepath.Base(u), humanBytes(c.n), humanBytes(resp.ContentLength))
+	if deep {
+		if err := extractPayload(c, meta, extractRoot); err != nil {
+			return nil, err
+		}
+		logf("Fetched %s of %s (deep): read %s", filepath.Base(u), humanBytes(resp.ContentLength), humanBytes(c.n))
+	} else {
+		logf("Fetched the header of %s: read %s of %s", filepath.Base(u), humanBytes(c.n), humanBytes(resp.ContentLength))
+	}
 	return &Package{Package: pkg, Meta: meta}, nil
+}
+
+// extractPayload unpacks the ELF objects a package's header promised, from the
+// payload the reader is now positioned at. A package that ships no ELF object
+// has nothing to extract and the header already said so, so this is a no-op
+// there rather than a decompression of a payload with nothing wanted in it.
+func extractPayload(r io.Reader, meta pkgdb.Meta, root string) error {
+	if root == "" || len(meta.ELF) == 0 {
+		return nil
+	}
+	return extractELF(r, meta.ELF, root)
 }
 
 // counter records how much of a stream was actually consumed, which is the

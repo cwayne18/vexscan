@@ -78,6 +78,21 @@ type Options struct {
 	// install any code at all -- it does.
 	RPM []string
 
+	// RPMDeep is --rpm-deep. It decompresses each package's cpio payload and
+	// extracts its ELF objects, so the OS plugin can read their dynamic symbol
+	// tables. It does not change what verdicts are reachable in kind -- there
+	// is still no filesystem and no entrypoint, so nothing is ever linked --
+	// but it lets the dynsym-absent test rule a finding out as not_present when
+	// the vulnerable function is exported by nothing the package ships. It only
+	// bites alongside --mine-advisories, which is what supplies the symbol to
+	// look for. See the extract half of internal/rpmsrc.
+	RPMDeep bool
+
+	// rpmExtractRoot is the tree RPMDeep extracted into, filled in by readRPMs.
+	// openRPMTree roots the scanned filesystem there instead of at an empty
+	// directory, and owns removing it.
+	rpmExtractRoot string
+
 	// rpmPackages is what RPM resolved to. It is unexported and filled in by
 	// runTree rather than by the caller, because reading it is I/O and Validate
 	// promises to do none: a scan must be able to fail on a bad flag before it
@@ -511,17 +526,27 @@ func openTree(ctx context.Context, opts *Options) (*target.Image, func(), error)
 	return img, cleanup, nil
 }
 
-// openRPMTree gives --rpm a tree to be scanned against: an empty one.
+// openRPMTree gives --rpm a tree to be scanned against.
 //
-// A real empty directory rather than a nil filesystem, and the difference is
-// not cosmetic. Every walk, every Unreadable check and every plugin's "does
-// this apply" question runs over it unchanged, and each of them gets the
-// truthful answer -- there is no filesystem here, because these packages were
-// never installed. A nil RootFS would make the same statement by panicking.
+// In the ordinary mode that tree is empty, and a real empty directory rather
+// than a nil filesystem, and the difference is not cosmetic. Every walk, every
+// Unreadable check and every plugin's "does this apply" question runs over it
+// unchanged, and each of them gets the truthful answer -- there is no filesystem
+// here, because these packages were never installed. A nil RootFS would make the
+// same statement by panicking.
+//
+// Under --rpm-deep the tree is the directory readRPMs extracted the packages'
+// ELF objects into, so the dynsym test can open them at their installed paths.
+// It is still not a system -- nothing but those objects is in it -- but it is no
+// longer empty. Either way this owns removing it.
 func openRPMTree(opts *Options) (*target.Image, func(), error) {
-	dest, err := os.MkdirTemp("", "vexscan-rpm-")
-	if err != nil {
-		return nil, nil, err
+	dest := opts.rpmExtractRoot
+	if dest == "" {
+		var err error
+		dest, err = os.MkdirTemp("", "vexscan-rpm-")
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	return &target.Image{
 		Ref: strings.Join(opts.RPM, ", "),
@@ -596,7 +621,7 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	// registryFor hands these to the OS plugin at construction time. And in
 	// here rather than in Validate, which promises to touch neither disk nor
 	// network.
-	rpms, err := readRPMs(ctx, &opts)
+	rpms, err := readRPMs(ctx, &opts, opts.RPMDeep)
 	if err != nil {
 		return nil, err
 	}
@@ -699,14 +724,19 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 //
 // It returns the whole result rather than just the packages because what would
 // not parse matters as much as what did: see noteRPMFailures.
-func readRPMs(ctx context.Context, opts *Options) (*rpmsrc.Result, error) {
+//
+// deep is passed explicitly rather than read from opts because only a scan
+// benefits from the extraction: inventory mode never runs the dynsym test, and
+// an extraction root it created would leak, since only openRPMTree removes one.
+func readRPMs(ctx context.Context, opts *Options, deep bool) (*rpmsrc.Result, error) {
 	if len(opts.RPM) == 0 {
 		return nil, nil
 	}
-	res, err := rpmsrc.Read(ctx, opts.RPM, opts.Logf)
+	res, err := rpmsrc.Read(ctx, opts.RPM, deep, opts.Logf)
 	if err != nil {
 		return nil, err
 	}
+	opts.rpmExtractRoot = res.ExtractRoot
 	opts.rpmPackages = make([]ospkg.Supplied, 0, len(res.Packages))
 	for _, p := range res.Packages {
 		opts.rpmPackages = append(opts.rpmPackages, ospkg.Supplied{Package: p.Package, Meta: p.Meta})
