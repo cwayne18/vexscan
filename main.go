@@ -124,11 +124,13 @@ func main() {
 	default:
 		fail("unknown --format %q; want text, json, fixplan, or inventory", *format)
 	}
-	// --vexhub-pr and its companions need a hub to target. Caught here so a
-	// missing --vexhub is a command-line error before the scan, not after it.
-	if *vexPRRepo != "" || *vexPRAuthor != "" || *vexPRDry {
-		*vexPR = true
+	prOn, err := vexPRActivation(*vexPR, *vexPRDry, *vexPRRepo, *vexPRAuthor)
+	if err != nil {
+		fail("%v", err)
 	}
+	*vexPR = prOn
+	// Caught here so a missing --vexhub is a command-line error before the scan,
+	// not after it.
 	if *vexPR && len(vexhubs) == 0 {
 		fail("--vexhub-pr needs a --vexhub to open the pull request against, e.g. --vexhub https://github.com/rancher/vexhub")
 	}

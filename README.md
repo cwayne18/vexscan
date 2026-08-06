@@ -1547,6 +1547,15 @@ the hub did not yet cover.
 - **Push to a fork you maintain with `--vexhub-pr-repo owner/repo`** when your
   token cannot push a branch straight to the hub. Keep that fork's default branch
   in sync with the hub's.
+- **A document vexscan cannot parse is left exactly as it is.** If the hub's
+  existing file for a product does not decode, the PR proposes nothing for that
+  product and says so on stderr, rather than replacing the file with a fresh one.
+  A statement this version cannot read is still one its publisher meant.
+- **`--vexhub-pr` has to be the flag you typed.** `--vexhub-pr-repo` and
+  `--vex-author` modify the pull request; neither turns it on. On their own they
+  are a command-line error (exit 2), so a `--vex-author` carried over from an
+  earlier command cannot open a PR nobody asked for. `--vexhub-pr-dry-run` does
+  imply it, because a dry run writes nothing.
 
 It needs a `GITHUB_TOKEN` / `GH_TOKEN` with pull-request scope on the hub (the
 same variables `--gist` uses; this uses GitHub's REST API directly, so no `gh`
@@ -1717,8 +1726,8 @@ Three properties are deliberate:
 | `--roots` | | Extra entrypoints for the closures — shared libraries and language imports; repeatable |
 | `--vexhub` | | VEX Repository to check findings against, e.g. `https://github.com/rancher/vexhub` (also a raw base URL or a local directory); repeatable, earliest wins — see [VEX hubs](#vex-hubs---vexhub) |
 | `--vexhub-pr` | `false` | Open a PR against the `--vexhub` repo adding OpenVEX `not_affected` statements for the findings ruled out — see [Contributing ruled-out findings back](#contributing-ruled-out-findings-back---vexhub-pr) |
-| `--vexhub-pr-repo` | | With `--vexhub-pr`, push the branch to this `owner/repo` fork instead of straight to the hub |
-| `--vex-author` | *(GitHub user)* | With `--vexhub-pr`, the OpenVEX `author` to record on the statements |
+| `--vexhub-pr-repo` | | With `--vexhub-pr`, push the branch to this `owner/repo` fork instead of straight to the hub — an error without `--vexhub-pr` |
+| `--vex-author` | *(GitHub user)* | With `--vexhub-pr`, the OpenVEX `author` to record on the statements — an error without `--vexhub-pr` |
 | `--vexhub-pr-dry-run` | `false` | With `--vexhub-pr`, print the files the PR would change and exit without pushing or opening it |
 | `--severity` | *(all)* | Only report findings at these severities: `CRITICAL`, `HIGH`, `UNKNOWN`, `MEDIUM`, `LOW`, `NONE`; comma-separated or repeatable. `UNKNOWN` must be named to be shown — see [Filtering by severity](#filtering-by-severity---severity) |
 | `--triage` | `false` | Order findings by exploitation evidence — EPSS scores and CISA's known-exploited catalog. Adds two columns and re-sorts; hides nothing and changes no severity — see [Prioritising by exploitation evidence](#prioritising-by-exploitation-evidence---triage) |

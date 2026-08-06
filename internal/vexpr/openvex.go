@@ -38,10 +38,16 @@ const (
 // document never silently strips fields off the statements it already holds. A
 // Doc built fresh (original == nil) is marshaled from the typed shape instead.
 type Doc struct {
-	Context    string      `json:"@context"`
-	ID         string      `json:"@id,omitempty"`
-	Author     string      `json:"author"`
-	Version    int         `json:"version"`
+	Context string `json:"@context"`
+	ID      string `json:"@id,omitempty"`
+	Author  string `json:"author"`
+	// Version is any rather than int because published hubs disagree about it:
+	// OpenVEX calls for a number and some tooling writes "1" as a string. A
+	// typed int made the string form a decode failure, and a decode failure in
+	// this package used to mean the document was replaced wholesale. Nothing
+	// here reads the value -- a preserved document re-emits it verbatim -- so
+	// the loosest type that round-trips is the right one.
+	Version    any         `json:"version"`
 	Timestamp  string      `json:"timestamp"`
 	Statements []Statement `json:"statements"`
 
@@ -58,7 +64,7 @@ type docShape struct {
 	Context    string      `json:"@context"`
 	ID         string      `json:"@id,omitempty"`
 	Author     string      `json:"author"`
-	Version    int         `json:"version"`
+	Version    any         `json:"version"`
 	Timestamp  string      `json:"timestamp"`
 	Statements []Statement `json:"statements"`
 }

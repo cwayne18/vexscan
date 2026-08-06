@@ -52,6 +52,9 @@ func (idx *indexFile) location(product string) (string, bool) {
 // location it should be written to and whether the index changed.
 func (idx *indexFile) ensure(product string) (location string, changed bool, err error) {
 	if loc, ok := idx.location(product); ok {
+		if err := checkHubLocation(loc); err != nil {
+			return "", false, err
+		}
 		return loc, false, nil
 	}
 	loc, err := productLocation(product)

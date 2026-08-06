@@ -56,6 +56,12 @@ type Plan struct {
 	// Skipped is how many ruled-out findings could not be written as a
 	// matchable statement (no product, component or id).
 	Skipped int
+	// Unparsable is every hub document that exists but could not be decoded,
+	// and was therefore left exactly as the hub published it. Reported rather
+	// than counted silently: each one is a product this PR says nothing about,
+	// and a hub maintainer reading the PR would otherwise have no way to tell
+	// that from a product with nothing to say.
+	Unparsable []string
 
 	Branch string
 	Title  string
@@ -156,6 +162,7 @@ func Propose(ctx context.Context, res *analyze.Result, opts Options) (*Plan, err
 	var (
 		changes      []FileChange
 		productChgs  []ProductChange
+		unparsable   []string
 		stmtTotal    int
 		indexTouched bool
 	)
@@ -165,15 +172,26 @@ func Propose(ctx context.Context, res *analyze.Result, opts Options) (*Plan, err
 			logf("  ! vexhub-pr: %s skipped: %v", prop.Product, err)
 			continue
 		}
-		var doc *Doc
-		if existing, ok, err := gh.fileAt(ctx, pushOwner, pushName, loc, baseSHA); err != nil {
+		existing, exists, err := gh.fileAt(ctx, pushOwner, pushName, loc, baseSHA)
+		if err != nil {
 			return nil, err
-		} else if ok {
-			if d, ok := ParseDoc(existing); ok {
-				doc = d
-			}
 		}
-		if doc == nil {
+		var doc *Doc
+		if exists {
+			d, ok := ParseDoc(existing)
+			if !ok {
+				// The file is there and this cannot read it, which is not the
+				// same as it not being there. Starting a fresh document would
+				// put a whole-file rewrite in the PR and delete whatever the
+				// file said: a statement vexscan cannot parse is still one its
+				// publisher meant, and quite possibly one another reader acts
+				// on. Leave it exactly as it is, and account for it.
+				logf("  ! vexhub-pr: %s: %s exists but could not be parsed; left untouched", prop.Product, loc)
+				unparsable = append(unparsable, loc)
+				continue
+			}
+			doc = d
+		} else {
 			doc = NewDoc(author, opts.Timestamp)
 		}
 
@@ -200,7 +218,7 @@ func Propose(ctx context.Context, res *analyze.Result, opts Options) (*Plan, err
 	}
 
 	if len(changes) == 0 {
-		return &Plan{Skipped: skipped}, nil
+		return &Plan{Skipped: skipped, Unparsable: unparsable}, nil
 	}
 	if indexTouched {
 		idxContent, err := idx.marshal()
@@ -223,6 +241,7 @@ func Propose(ctx context.Context, res *analyze.Result, opts Options) (*Plan, err
 		Products:      productChgs,
 		Statements:    stmtTotal,
 		Skipped:       skipped,
+		Unparsable:    unparsable,
 		Branch:        branch,
 		Title:         title,
 		Body:          body,

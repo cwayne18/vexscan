@@ -36,16 +36,96 @@ func productLocation(purl string) (string, error) {
 		if name == "" {
 			return "", fmt.Errorf("vexpr: %q: no module path", purl)
 		}
-		return path.Join("pkg", "golang", name) + "/" + docFileName, nil
+		return hubPath("golang", name, purl)
 	case "oci":
 		repo := repositoryURL(body)
 		if repo == "" {
 			return "", fmt.Errorf("vexpr: %q: no repository_url qualifier", purl)
 		}
-		return path.Join("pkg", "oci", repo) + "/" + docFileName, nil
+		return hubPath("oci", repo, purl)
 	default:
 		return "", fmt.Errorf("vexpr: %q: unsupported product type %q", purl, typ)
 	}
+}
+
+// hubRoot is the directory inside the hub every product document lives under.
+const hubRoot = "pkg"
+
+// hubPath is where a product of the given type and name is filed, refusing any
+// name that would put the document somewhere else in the repository.
+//
+// The check is not fussiness about malformed input. A golang product's name is
+// the main module path, and vexscan reads that out of the build info of a
+// binary inside the image being scanned -- whoever built that image chose the
+// string. An oci product's name comes from the image reference the same way.
+// Both are attacker-controlled on an untrusted target, and both arrive here on
+// their way to becoming a file path in somebody else's repository. path.Join
+// resolves "../.." rather than objecting to it, so a name that climbs out is
+// refused before the join instead of silently cleaned into an escape.
+func hubPath(typ, name, purl string) (string, error) {
+	if err := checkProductName(name, purl); err != nil {
+		return "", err
+	}
+	loc := path.Join(hubRoot, typ, name) + "/" + docFileName
+	// Belt to checkProductName's braces. Whatever the name turned out to be,
+	// the result has to land under pkg/ -- if it does not, the checks above
+	// have a hole, and the consequence worth preventing is the write, not the
+	// hole. A refusal here is a bug report; a file outside pkg/ is a commit in
+	// someone else's repository.
+	if !strings.HasPrefix(loc, hubRoot+"/") {
+		return "", fmt.Errorf("vexpr: %q: resolves to %q, outside %s/", purl, loc, hubRoot)
+	}
+	return loc, nil
+}
+
+// checkProductName rejects a product name that cannot become a path inside the
+// hub: one that climbs out of it, that is absolute, that has an empty segment,
+// or that carries a character no module path or registry name has.
+func checkProductName(name, purl string) error {
+	if name == "" {
+		return fmt.Errorf("vexpr: %q: no product name to file under", purl)
+	}
+	if strings.HasPrefix(name, "/") {
+		return fmt.Errorf("vexpr: %q: absolute product name %q", purl, name)
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f || r == '\\' {
+			return fmt.Errorf("vexpr: %q: product name contains %q", purl, r)
+		}
+	}
+	// "." and ".." are rejected outright rather than resolved, even where they
+	// would resolve to somewhere harmless inside pkg/: two spellings of one
+	// product would otherwise share a document while getting two index keys.
+	for _, seg := range strings.Split(name, "/") {
+		switch seg {
+		case "":
+			return fmt.Errorf("vexpr: %q: product name has an empty path segment", purl)
+		case ".", "..":
+			return fmt.Errorf("vexpr: %q: product name climbs out of %s/ at %q", purl, hubRoot, seg)
+		}
+	}
+	return nil
+}
+
+// checkHubLocation vets a document path the hub's own index.json supplied.
+//
+// It is looser than hubPath on purpose: the index is the hub's statement about
+// its own layout, and a hub is entitled to store documents somewhere other than
+// pkg/. What it is not entitled to do is name a path outside the repository, so
+// only traversal and absolute paths are refused.
+func checkHubLocation(loc string) error {
+	if loc == "" {
+		return fmt.Errorf("vexpr: index.json has an empty location")
+	}
+	if strings.HasPrefix(loc, "/") {
+		return fmt.Errorf("vexpr: index.json location %q is absolute", loc)
+	}
+	for _, seg := range strings.Split(loc, "/") {
+		if seg == ".." {
+			return fmt.Errorf("vexpr: index.json location %q climbs out of the repository", loc)
+		}
+	}
+	return nil
 }
 
 // indexKey is the spelling a product must have in index.json, which is not

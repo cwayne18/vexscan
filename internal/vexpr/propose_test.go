@@ -174,6 +174,138 @@ func TestProposeEmptyWhenNothingRuledOut(t *testing.T) {
 	}
 }
 
+// TestProposeLeavesUnparsableDocumentAlone covers the difference between "the
+// hub has no document for this product" and "the hub has one this version
+// cannot read".
+//
+// Those used to take the same branch: an unreadable document fell through to a
+// fresh one, and the PR then carried a whole-file rewrite that deleted whatever
+// the hub had published -- other authors' statements, other authors' names. A
+// statement vexscan cannot decode is still one its publisher meant and quite
+// possibly one another reader acts on, so the file has to be left exactly as it
+// is, and the omission reported rather than counted as success.
+func TestProposeLeavesUnparsableDocumentAlone(t *testing.T) {
+	const loc = "pkg/oci/index.docker.io/example/synthetic/scan.openvex.json"
+	hub := &fakeHub{files: map[string]string{
+		"index.json": `{"version":1,"packages":[
+			{"id":"pkg:oci/synthetic?repository_url=index.docker.io%2Fexample%2Fsynthetic","location":"` + loc + `"}
+		]}`,
+		loc: `{"@context":"https://openvex.dev/ns/v0.2.0","author":"Vendor",` +
+			`"statements":[{"vulnerability":{"name":"CVE-VENDOR-1"}}` + "\n\n" + `NOT JSON`,
+	}}
+	srv := httptest.NewServer(hub.handler(t))
+	defer srv.Close()
+
+	res := &analyze.Result{Target: "example/synthetic:latest", Findings: []analyze.Finding{
+		{ID: "CVE-NEW", CVE: "CVE-NEW", Product: testProduct, PURL: "pkg:deb/debian/new@2",
+			Status: analyze.StatusNotPresent, Justification: "component_not_present", Method: "pkgdb"},
+	}}
+
+	plan, err := Propose(context.Background(), res, Options{
+		HubURL: "https://github.com/acme/hub", Token: "t", Timestamp: testTime, apiBase: srv.URL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.Empty() {
+		t.Fatalf("plan rewrites an unreadable document: %+v", plan.Changes)
+	}
+	if len(plan.Unparsable) != 1 || plan.Unparsable[0] != loc {
+		t.Fatalf("Unparsable = %v, want [%s] -- the omission must be reported, not silent", plan.Unparsable, loc)
+	}
+}
+
+// TestProposeVersionAsStringIsStillReadable is the same guard from the other
+// side. OpenVEX calls the version a number and some published hubs write it as
+// a string; a typed int made that a decode failure, and a decode failure used
+// to mean the document was replaced. The document below is valid and must be
+// merged into, not overwritten.
+func TestProposeVersionAsStringIsStillReadable(t *testing.T) {
+	const loc = "pkg/oci/index.docker.io/example/synthetic/scan.openvex.json"
+	hub := &fakeHub{files: map[string]string{
+		"index.json": `{"version":1,"packages":[
+			{"id":"pkg:oci/synthetic?repository_url=index.docker.io%2Fexample%2Fsynthetic","location":"` + loc + `"}
+		]}`,
+		loc: `{"@context":"https://openvex.dev/ns/v0.2.0","author":"Vendor","version":"1",
+			"timestamp":"2026-01-01T00:00:00Z","statements":[
+				{"vulnerability":{"name":"CVE-VENDOR-1"},
+				 "products":[{"@id":"pkg:oci/synthetic?repository_url=index.docker.io/example/synthetic"}],
+				 "status":"not_affected"}]}`,
+	}}
+	srv := httptest.NewServer(hub.handler(t))
+	defer srv.Close()
+
+	res := &analyze.Result{Target: "example/synthetic:latest", Findings: []analyze.Finding{
+		{ID: "CVE-NEW", CVE: "CVE-NEW", Product: testProduct, PURL: "pkg:deb/debian/new@2",
+			Status: analyze.StatusNotPresent, Justification: "component_not_present", Method: "pkgdb"},
+	}}
+
+	plan, err := Propose(context.Background(), res, Options{
+		HubURL: "https://github.com/acme/hub", Token: "t", Timestamp: testTime, apiBase: srv.URL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Unparsable) != 0 {
+		t.Fatalf(`a "version":"1" document was treated as unreadable: %v`, plan.Unparsable)
+	}
+	if len(plan.Changes) != 1 {
+		t.Fatalf("changes = %d, want 1", len(plan.Changes))
+	}
+	got := string(plan.Changes[0].Content)
+	for _, want := range []string{"CVE-VENDOR-1", "CVE-NEW", `"Vendor"`, `"version": "1"`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("merged document lost %s:\n%s", want, got)
+		}
+	}
+}
+
+// TestProposeNeverCommitsOutsideHubRoot drives a hostile product name all the
+// way through to the commit, because the checks in location.go are only worth
+// anything if nothing downstream re-derives a path around them.
+//
+// The product name here is what vexscan would build from a Go main module read
+// out of a binary inside a scanned image -- a string the image's author chose.
+func TestProposeNeverCommitsOutsideHubRoot(t *testing.T) {
+	hub := &fakeHub{files: map[string]string{
+		"index.json": `{"version":1,"packages":[]}`,
+	}}
+	srv := httptest.NewServer(hub.handler(t))
+	defer srv.Close()
+
+	const evil = "pkg:golang/example.com/m/../../../../.github/workflows/release"
+	res := &analyze.Result{Target: "example/synthetic:latest", Findings: []analyze.Finding{
+		{ID: "CVE-EVIL", CVE: "CVE-EVIL", Product: evil, PURL: "pkg:golang/golang.org/x/net",
+			Status: analyze.StatusNotPresent, Justification: "component_not_present", Method: "pkgdb"},
+		{ID: "CVE-OK", CVE: "CVE-OK", Product: testProduct, PURL: "pkg:deb/debian/new@2",
+			Status: analyze.StatusNotPresent, Justification: "component_not_present", Method: "pkgdb"},
+	}}
+
+	plan, err := Propose(context.Background(), res, Options{
+		HubURL: "https://github.com/acme/hub", Token: "t", Timestamp: testTime, apiBase: srv.URL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Empty() {
+		t.Fatal("plan is empty; the well-formed product should still have been proposed")
+	}
+	if _, err := plan.Submit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range hub.committed {
+		if p == "index.json" {
+			continue
+		}
+		if !strings.HasPrefix(p, "pkg/") || strings.Contains(p, "..") {
+			t.Errorf("commit writes %q, outside the hub's pkg/ tree", p)
+		}
+	}
+	if len(hub.committed) == 0 {
+		t.Error("nothing was committed; the test proves nothing")
+	}
+}
+
 func TestParseGitHubRepo(t *testing.T) {
 	cases := map[string][2]string{
 		"https://github.com/rancher/vexhub":                      {"rancher", "vexhub"},
