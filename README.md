@@ -1509,6 +1509,50 @@ examined, while an unreachable hub only leaves rows in `AFFECTED` that a vendor
 had already answered. The first under-reports, which is the way this tool must
 never be wrong; the second over-reports, which is merely tiring.
 
+### Contributing ruled-out findings back (`--vexhub-pr`)
+
+`--vexhub` *reads* a hub. `--vexhub-pr` *writes* to one: it opens a pull request
+against the `--vexhub` repository adding an OpenVEX `not_affected` statement for
+every finding this scan **ruled out** — the `RULED OUT` section, where the
+vulnerable code is not present or cannot run — that the hub does not already
+answer.
+
+```sh
+vexscan --image rancher/hardened-kubernetes:v1.34.10-rke2r1-build20260724 --all \
+  --vexhub https://github.com/rancher/vexhub \
+  --vexhub-pr
+```
+
+Each ruled-out finding becomes one statement, filed under the artifact it was
+found in (`pkg:oci/…` or a Go binary's `pkg:golang/…`), scoped to the component
+purl, and carrying the OpenVEX justification the plugin already recorded
+(`component_not_present`, `vulnerable_code_not_present`,
+`vulnerable_code_not_in_execute_path`) plus a one-line `impact_statement` saying
+how vexscan reached the verdict. Existing documents are **merged, not
+overwritten**: a statement the hub already has for the same vulnerability and
+component is left in place, and `index.json` gains an entry only for a product
+the hub did not yet cover.
+
+- **Preview first with `--vexhub-pr-dry-run`.** It prints the branch, the PR
+  title, every statement grouped by product, and the files that would change,
+  and exits without touching the network beyond reading the hub.
+- **A finding the hub already speaks to is never touched.** If `--vexhub` matched
+  a statement for it — even an `affected` one — the PR leaves it alone. This flow
+  fills gaps; it does not overrule a vendor.
+- **Only a complete scan contributes.** If any ecosystem failed to inventory, the
+  PR is not opened: a `not_affected` claim from a partial scan is exactly the
+  kind of wrong this tool must never publish.
+- **The author is you.** By default the OpenVEX `author` is the authenticated
+  GitHub user (`<login> (via vexscan)`); override it with `--vex-author`.
+- **Push to a fork you maintain with `--vexhub-pr-repo owner/repo`** when your
+  token cannot push a branch straight to the hub. Keep that fork's default branch
+  in sync with the hub's.
+
+It needs a `GITHUB_TOKEN` / `GH_TOKEN` with pull-request scope on the hub (the
+same variables `--gist` uses; this uses GitHub's REST API directly, so no `gh`
+CLI is required inside the image). Only a `github.com` hub URL can become a PR —
+a raw base URL or a local directory cannot, and the flag says so.
+
 ### JSON
 
 The JSON is `schema_version: 2`:
@@ -1672,6 +1716,10 @@ Three properties are deliberate:
 | `--osv-ecosystem` | *(auto)* | Override the OSV ecosystem derived from os-release, from the `VENDOR`/`DISTRIBUTION` headers under `--rpm`, or from the `distro=` purl qualifier under `--sbom`, e.g. `Debian:12` |
 | `--roots` | | Extra entrypoints for the closures — shared libraries and language imports; repeatable |
 | `--vexhub` | | VEX Repository to check findings against, e.g. `https://github.com/rancher/vexhub` (also a raw base URL or a local directory); repeatable, earliest wins — see [VEX hubs](#vex-hubs---vexhub) |
+| `--vexhub-pr` | `false` | Open a PR against the `--vexhub` repo adding OpenVEX `not_affected` statements for the findings ruled out — see [Contributing ruled-out findings back](#contributing-ruled-out-findings-back---vexhub-pr) |
+| `--vexhub-pr-repo` | | With `--vexhub-pr`, push the branch to this `owner/repo` fork instead of straight to the hub |
+| `--vex-author` | *(GitHub user)* | With `--vexhub-pr`, the OpenVEX `author` to record on the statements |
+| `--vexhub-pr-dry-run` | `false` | With `--vexhub-pr`, print the files the PR would change and exit without pushing or opening it |
 | `--severity` | *(all)* | Only report findings at these severities: `CRITICAL`, `HIGH`, `UNKNOWN`, `MEDIUM`, `LOW`, `NONE`; comma-separated or repeatable. `UNKNOWN` must be named to be shown — see [Filtering by severity](#filtering-by-severity---severity) |
 | `--triage` | `false` | Order findings by exploitation evidence — EPSS scores and CISA's known-exploited catalog. Adds two columns and re-sorts; hides nothing and changes no severity — see [Prioritising by exploitation evidence](#prioritising-by-exploitation-evidence---triage) |
 | `--dlopen-policy` | `taint` | `taint` (block conclusions) or `assume-none` |
@@ -1730,7 +1778,8 @@ honored as a fallback so existing CI keeps working.
 | `VEXSCAN_TRIAGE_CACHE` | | Directory for the `--triage` feed cache (default `os.UserCacheDir()/vexscan/triage`, e.g. `~/Library/Caches` or `$XDG_CACHE_HOME`) |
 | `VEXSCAN_PAGER` | `GOMODVEX_PAGER` | Pager for terminal output; `$PAGER` is the fallback, `less` the default. Set it **empty** to never page — unlike the variables above, an empty value here is a decision rather than an absence |
 
-`GITHUB_TOKEN` / `GH_TOKEN` are for `--gist` only, and are unchanged.
+`GITHUB_TOKEN` / `GH_TOKEN` are for `--gist` (gist scope) and `--vexhub-pr`
+(pull-request scope on the hub), and are unchanged.
 
 ## Requirements
 
@@ -1741,7 +1790,7 @@ honored as a fallback so existing CI keeps working.
 - [`govulncheck`](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck) on
   `PATH` — optional, used only for Go binary mode
 - Network access for OSV lookups, and for `--repo` cloning
-- `GITHUB_TOKEN` / `GH_TOKEN` for `--gist`
+- `GITHUB_TOKEN` / `GH_TOKEN` for `--gist`, and for `--vexhub-pr`
 - An LLM provider for `--llm` — an endpoint and key, a local model, or an
   installed CLI. See [Choosing a provider](#choosing-a-provider); there is no
   default and nothing is required unless you pass `--llm`.
