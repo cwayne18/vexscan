@@ -71,6 +71,8 @@ func main() {
 		out        = flag.String("out", "", "write output to this file instead of stdout")
 		gistFlag   = flag.Bool("gist", false, "also upload the output to a public GitHub gist and print its URL (needs GITHUB_TOKEN/GH_TOKEN with gist scope)")
 		gistSecret = flag.Bool("gist-secret", false, "with --gist, create a secret (unlisted) gist instead of a public one")
+		vexOut     = flag.String("vex-out", "", "write OpenVEX not_affected documents for every finding vexscan ruled out into this directory, laid out as a VEX hub; with --vexhub they are merged into what that hub already publishes, so the directory can be a clone of it (see contrib/vexhub-pr.sh)")
+		vexAuthor  = flag.String("vex-author", "", "with --vex-out, the OpenVEX author to record on the statements -- required, and it is you: a not_affected claim is someone's assertion")
 		failOnSev  = flag.String("fail-on", "", "exit 3 if any counted finding is at or above this severity: "+
 			strings.Join(cvss.Labels, ", ")+", or 'any'. Off by default; see --fail-on-status for what counts")
 		failOnStat = flag.String("fail-on-status", "", "which findings --fail-on weighs: a comma-separated list of "+
@@ -119,6 +121,11 @@ func main() {
 	case "text", "json", "fixplan", "inventory":
 	default:
 		fail("unknown --format %q; want text, json, fixplan, or inventory", *format)
+	}
+	// Caught here so a missing author is a command-line error before the scan,
+	// not after it.
+	if err := checkVexOut(*vexOut, *vexAuthor); err != nil {
+		fail("%v", err)
 	}
 	// Canonicalized here, and strictly, so that a typo is a command-line error
 	// before the pull rather than an empty report after it. cvss.Parse rather
@@ -301,6 +308,25 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error: --fail-on was not evaluated, because the scan did not complete")
 		}
 		os.Exit(1)
+	}
+
+	// --vex-out only runs on a complete scan: an incomplete one might have
+	// missed the very component that would have kept a finding out of RULED OUT,
+	// and a not_affected statement written from a partial scan is exactly the
+	// kind of wrong this tool must never be. It runs before the gate because the
+	// gate decides a build's fate, which is unrelated to whether a hub should
+	// learn what was ruled out.
+	if *vexOut != "" {
+		if err := runVexOut(ctx, res, vexOutOptions{
+			dir:       *vexOut,
+			author:    *vexAuthor,
+			hubs:      vexhubs,
+			timestamp: started.UTC().Format(time.RFC3339),
+			logf:      logf,
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "error: vex-out: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	if gate.on {
@@ -662,6 +688,12 @@ Examples:
   # Share the report as a public gist (needs GITHUB_TOKEN/GH_TOKEN with gist scope)
   vexscan --image rancher/hardened-kubernetes:v1.30.1 \
     --package golang:golang.org/x/net --cves CVE-2023-39325 --gist
+
+  # Write what this scan ruled out into a clone of the hub, ready to review
+  gh repo clone rancher/vexhub
+  vexscan --image rancher/hardened-kubernetes:v1.30.1 --all \
+    --vexhub ./vexhub --vex-out ./vexhub --vex-author 'Acme Security'
+  git -C vexhub diff        # then contrib/vexhub-pr.sh, or commit it yourself
 
 --triage answers a question severity does not: is anyone exploiting this? It
 downloads EPSS (a 30-day exploitation-activity forecast, per CVE) and CISA's

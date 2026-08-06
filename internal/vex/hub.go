@@ -38,6 +38,11 @@ type Hub struct {
 	// index maps a canonical product purl to its document's relative location.
 	index map[string]string
 
+	// indexRaw is index.json exactly as published. Kept because a writer that
+	// adds a product to the index has to reproduce every field this package does
+	// not model, and re-serialising the decoded form would quietly drop them.
+	indexRaw []byte
+
 	mu   sync.Mutex
 	docs map[string]*Doc
 }
@@ -106,6 +111,7 @@ func Open(ctx context.Context, location string) (*Hub, error) {
 	if len(h.index) == 0 {
 		return nil, fmt.Errorf("vex: %s: index lists no packages", location)
 	}
+	h.indexRaw = raw
 	h.docs = make(map[string]*Doc)
 	return h, nil
 }
@@ -113,6 +119,38 @@ func Open(ctx context.Context, location string) (*Hub, error) {
 // Size reports how many products the hub indexes, for the log line that tells a
 // reader the hub was actually read.
 func (h *Hub) Size() int { return len(h.index) }
+
+// IndexRaw is index.json as the hub published it.
+func (h *Hub) IndexRaw() []byte { return h.indexRaw }
+
+// Location is where the hub files a product's document, relative to its root,
+// matching the product the same way Lookup does.
+func (h *Hub) Location(product string) (string, bool) {
+	loc, ok := h.index[canonicalProduct(product)]
+	return loc, ok
+}
+
+// Raw reads one file out of the hub verbatim, by a location the index gave.
+//
+// It exists for the writer in internal/vexpr, which merges into an existing
+// document and must reproduce every field OpenVEX allows -- including the ones
+// Doc does not model. Lookup's parsed form cannot do that, so this returns the
+// bytes. A file the hub does not have is ok=false rather than an error: the
+// caller's next step for "no document yet" is to start one.
+func (h *Hub) Raw(ctx context.Context, loc string) ([]byte, bool, error) {
+	b, err := h.fetch(ctx, loc)
+	if err == nil {
+		return b, true, nil
+	}
+	var se *StatusError
+	if errors.As(err, &se) && se.Status == http.StatusNotFound {
+		return nil, false, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	return nil, false, fmt.Errorf("vex: %s: %s: %w", h.URL, loc, err)
+}
 
 // Lookup returns the document covering a product. The bool is false when the
 // hub has no document for it, which is the ordinary case and not an error --
