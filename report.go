@@ -190,6 +190,7 @@ func writeCaveats(dst *strings.Builder, res *analyze.Result, pal palette) {
 			strings.Join(w.Severities, ","), w.Count, w.Count+len(res.Findings))
 		fmt.Fprintf(b, "      %s\n", withheldSpread(w))
 	}
+	writeCorrectionsCaveat(b, res)
 	for _, h := range res.VEXHubs {
 		if h.Error == "" {
 			continue
@@ -203,6 +204,42 @@ func writeCaveats(dst *strings.Builder, res *analyze.Result, pal palette) {
 	}
 	writeMetadataCaveat(b, res)
 	writeTriageCaveats(b, res)
+}
+
+// writeCorrectionsCaveat names the advisories the database matched and this
+// scan did not report.
+//
+// Every other caveat here exists because something was lost. This one exists
+// because something was *removed*, on purpose, by this tool -- which is the one
+// thing it must never do quietly. On rancher:v2.15.0 it is 27 findings, and
+// without this the report is indistinguishable from an image the database
+// simply has nothing to say about.
+//
+// So it prints the ids, not just a count. The claim being made is checkable --
+// each of these is one `osv.dev/vulnerability/<id>` away from the ranges quoted
+// -- and a reader who thinks the drop is wrong needs to be able to go and look.
+// Unlike the withheld note it prints even when no findings survived, because
+// that is precisely the case where the reader most needs to know.
+func writeCorrectionsCaveat(b *strings.Builder, res *analyze.Result) {
+	c := res.Corrections
+	if c == nil || c.Count == 0 {
+		return
+	}
+	fmt.Fprintf(b, "NOTE: %d advisory match(es) were not reported. The advisory record itself\n", c.Count)
+	b.WriteString("      carries precise affected ranges that exclude the version installed,\n")
+	b.WriteString("      while the range OSV matched on was left open because the database\n")
+	b.WriteString("      could not express those versions. Nothing else disagreed:\n")
+	// Capped, and the remainder counted rather than dropped: the caveat sits
+	// above the findings, and a hundred lines of it would bury the report it is
+	// annotating. The JSON carries all of them.
+	const shown = 20
+	for i, d := range c.Details {
+		if i == shown {
+			fmt.Fprintf(b, "      ... and %d more (see corrections in --format json)\n", len(c.Details)-shown)
+			break
+		}
+		fmt.Fprintf(b, "      %s\n", d)
+	}
 }
 
 // writeMetadataCaveat says that --rpm or --sbom described the packages rather

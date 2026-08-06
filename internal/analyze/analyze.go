@@ -243,8 +243,33 @@ type Result struct {
 	// not used. Like VEXHubs it is not part of Failed(): see triageOverlay.
 	Triage *TriageResult `json:"triage,omitempty"`
 
+	// Corrections are advisories the database matched but its own precise
+	// ranges exclude, and is nil when there were none. See its doc comment and
+	// internal/osv/customranges.go.
+	Corrections *Corrections `json:"corrections,omitempty"`
+
 	// Descriptor records what produced this report. See its doc comment.
 	Descriptor *Descriptor `json:"descriptor,omitempty"`
+}
+
+// Corrections is what the advisory database offered and the scan did not
+// report, because the record's own precise version ranges exclude the version
+// it was matched against. internal/osv/customranges.go has the mechanism and
+// the conditions.
+//
+// It exists for the reason Withheld does. Setting an advisory aside is the
+// direction this tool must never be wrong in, and a scan that quietly returned
+// 27 fewer findings than the database offered would be indistinguishable from a
+// cleaner image. So the count is carried out to the report and named, and a
+// reader who disagrees with the arithmetic can check it: every dropped id is
+// listed and every one of them is still one OSV lookup away.
+type Corrections struct {
+	Count int `json:"count"`
+	// Advisories are the ids set aside, sorted, so the list is stable between
+	// runs and diffable.
+	Advisories []string `json:"advisories"`
+	// Details spell out, per advisory, the ranges that excluded the version.
+	Details []string `json:"details"`
 }
 
 // Descriptor records what produced a report.
@@ -690,6 +715,7 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	result.Triage = triageOverlay(ctx, opts.Triage, result.Findings, sets.All, logf)
 	llmOverlay(ctx, llmClient, result.Findings, "", logf)
 	sortFindings(result.Findings)
+	result.Corrections = run.resolver.corrections()
 	result.Descriptor = run.resolver.descriptor()
 	return result, nil
 }
@@ -998,6 +1024,7 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 	result.Triage = triageOverlay(ctx, opts.Triage, result.Findings, sets.All, logf)
 	llmOverlay(ctx, llmClient, result.Findings, "source tree", logf)
 	sortFindings(result.Findings)
+	result.Corrections = run.resolver.corrections()
 	result.Descriptor = run.resolver.descriptor()
 	return result, nil
 }
@@ -1063,13 +1090,40 @@ type advisoryResolver struct {
 	// of a report is a property of the data, not of the command, and only this
 	// type sees the moment the data arrived.
 	asOf time.Time
+
+	// corrected accumulates the advisories the client set aside, keyed so the
+	// same record reached through two components is reported once. A module
+	// linked by six binaries is one query and one correction; a reader counting
+	// six would think six separate things had been dropped.
+	corrected map[string]osv.Correction
 }
 
 func newResolver() *advisoryResolver {
-	return &advisoryResolver{
-		client: osv.NewClient(),
-		cache:  map[string]map[string]*osv.Advisory{},
+	r := &advisoryResolver{
+		client:    osv.NewClient(),
+		cache:     map[string]map[string]*osv.Advisory{},
+		corrected: map[string]osv.Correction{},
 	}
+	r.client.OnCorrection = func(c osv.Correction) {
+		r.corrected[c.Advisory+"@"+c.Package+"@"+c.Version] = c
+	}
+	return r
+}
+
+// corrections is what the resolver set aside, or nil if it set aside nothing.
+func (r *advisoryResolver) corrections() *Corrections {
+	if len(r.corrected) == 0 {
+		return nil
+	}
+	out := &Corrections{Count: len(r.corrected)}
+	for _, c := range r.corrected {
+		out.Advisories = append(out.Advisories, c.Advisory)
+		out.Details = append(out.Details, c.String())
+	}
+	sort.Strings(out.Advisories)
+	out.Advisories = slices.Compact(out.Advisories)
+	sort.Strings(out.Details)
+	return out
 }
 
 // answered records that the advisory source has now spoken. Only the first

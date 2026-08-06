@@ -198,6 +198,16 @@ type Client struct {
 	// Concurrency bounds the parallel per-id fetches QueryBatch makes;
 	// defaultConcurrency when zero.
 	Concurrency int
+	// OnCorrection is called once for every advisory a query set aside because
+	// the record's own precise ranges exclude the version asked about; see
+	// customranges.go.
+	//
+	// It is a callback rather than a return value because the corrections are
+	// not the answer to any one caller's question -- they are something the
+	// report has to say about the scan as a whole, and threading them back
+	// through every resolver signature to reach it would be noise. Calls are
+	// sequential: matching happens after hydration, on one goroutine.
+	OnCorrection func(Correction)
 }
 
 // NewClient returns a Client with sane defaults.
@@ -273,35 +283,49 @@ type vuln struct {
 		Score string `json:"score"`
 	} `json:"severity"`
 	// DatabaseSpecific is a free-form object whose contents depend on the
-	// publishing database. Only "severity" is read, and only GitHub sets it.
+	// publishing database. "severity" is set only by GitHub, "review_status"
+	// only by the Go vulnerability database -- see customranges.go.
 	DatabaseSpecific struct {
-		Severity string `json:"severity"`
+		Severity     string `json:"severity"`
+		ReviewStatus string `json:"review_status"`
 	} `json:"database_specific"`
-	Affected []struct {
-		Package struct {
-			Name string `json:"name"`
-			// Ecosystem is the *product* this entry applies to, which for a
-			// bare-family query is finer-grained than the ecosystem asked for:
-			// a "SUSE" query returns entries reading "SUSE:Linux Micro 6.2".
-			Ecosystem string `json:"ecosystem"`
-		} `json:"package"`
-		EcosystemSpecific struct {
-			Imports []struct {
-				Path string `json:"path"`
-			} `json:"imports"`
-		} `json:"ecosystem_specific"`
-		// Ranges carries the version events for this package: an "introduced"
-		// where the flaw begins and a "fixed" where a patch lands. A distro
-		// record almost always has one range with one fixed event, which is
-		// the version to upgrade to.
-		Ranges []struct {
-			Type   string `json:"type"`
-			Events []struct {
-				Introduced string `json:"introduced"`
-				Fixed      string `json:"fixed"`
-			} `json:"events"`
-		} `json:"ranges"`
-	} `json:"affected"`
+	Affected []affected `json:"affected"`
+}
+
+type affected struct {
+	Package struct {
+		Name string `json:"name"`
+		// Ecosystem is the *product* this entry applies to, which for a
+		// bare-family query is finer-grained than the ecosystem asked for:
+		// a "SUSE" query returns entries reading "SUSE:Linux Micro 6.2".
+		Ecosystem string `json:"ecosystem"`
+	} `json:"package"`
+	EcosystemSpecific struct {
+		Imports []struct {
+			Path string `json:"path"`
+		} `json:"imports"`
+		// CustomRanges is where the Go vulnerability database puts the real
+		// affected ranges of a record whose versions it cannot express in the
+		// standard Ranges field. See customranges.go.
+		CustomRanges []versionRange `json:"custom_ranges"`
+	} `json:"ecosystem_specific"`
+	// Ranges carries the version events for this package: an "introduced"
+	// where the flaw begins and a "fixed" where a patch lands. A distro
+	// record almost always has one range with one fixed event, which is
+	// the version to upgrade to.
+	Ranges []versionRange `json:"ranges"`
+}
+
+type versionRange struct {
+	Type   string `json:"type"`
+	Events []struct {
+		Introduced string `json:"introduced"`
+		Fixed      string `json:"fixed"`
+		// LastAffected is the inclusive upper bound a record uses when it
+		// knows what is broken but not what fixed it. Like Fixed it closes a
+		// range, which is all customRanges asks of it.
+		LastAffected string `json:"last_affected"`
+	} `json:"events"`
 }
 
 type queryResponse struct {
@@ -335,7 +359,20 @@ func (c *Client) Query(ctx context.Context, ref Ref) (map[string]*Advisory, erro
 	if err != nil {
 		return nil, err
 	}
-	return buildMap(ref, resp.Vulns), nil
+	advs, corrections := buildMap(ref, resp.Vulns)
+	c.report(corrections)
+	return advs, nil
+}
+
+// report hands the set-aside advisories to OnCorrection, if anyone is
+// listening.
+func (c *Client) report(corrections []Correction) {
+	if c.OnCorrection == nil {
+		return
+	}
+	for _, corr := range corrections {
+		c.OnCorrection(corr)
+	}
 }
 
 // QueryBatch resolves many refs at once. result[i] is what Query(refs[i])
@@ -376,7 +413,9 @@ func (c *Client) QueryBatch(ctx context.Context, refs []Ref) ([]map[string]*Advi
 				vulns = append(vulns, v)
 			}
 		}
-		out[i] = buildMap(ref, vulns)
+		advs, corrections := buildMap(ref, vulns)
+		out[i] = advs
+		c.report(corrections)
 	}
 	return out, nil
 }
@@ -505,11 +544,20 @@ func normalizeVersion(ref Ref) string {
 	return strings.TrimPrefix(v, "go")
 }
 
-func buildMap(ref Ref, vulns []vuln) map[string]*Advisory {
+// buildMap indexes the records OSV returned for one ref. The corrections are
+// records it set aside because the record's own precise ranges exclude the
+// queried version; see customranges.go, and Client.OnCorrection for why they
+// are returned rather than dropped.
+func buildMap(ref Ref, vulns []vuln) (map[string]*Advisory, []Correction) {
 	out := map[string]*Advisory{}
 	kept := make([]*Advisory, 0, len(vulns))
+	var corrections []Correction
 	for _, v := range vulns {
 		if !appliesToRelease(ref, v) {
+			continue
+		}
+		if c, ok := misranged(ref, v, vulns); ok {
+			corrections = append(corrections, c)
 			continue
 		}
 		adv := advisoryFor(ref, v)
@@ -527,7 +575,7 @@ func buildMap(ref Ref, vulns []vuln) map[string]*Advisory {
 	}
 	borrowSeverity(out, kept)
 	indexUpstream(out, kept)
-	return out
+	return out, corrections
 }
 
 // indexUpstream makes a bundle findable by the CVEs it fixes, without letting

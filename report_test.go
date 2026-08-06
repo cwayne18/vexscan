@@ -1023,6 +1023,96 @@ func TestALongReportRepeatsTheVexHubNote(t *testing.T) {
 	}
 }
 
+// A correction is the one caveat about something this tool removed rather than
+// something it lost, so it is the one that must never be quiet.
+
+func correctedReport(t *testing.T, c *analyze.Corrections, findings ...analyze.Finding) string {
+	t.Helper()
+	return renderText(&analyze.Result{
+		SchemaVersion: analyze.SchemaVersion, Target: "rancher/rancher:v2.15.0", Mode: "image",
+		Findings: findings, Corrections: c,
+	}, renderOpts{})
+}
+
+func TestCorrectionsAreNamedNotJustCounted(t *testing.T) {
+	out := correctedReport(t, &analyze.Corrections{
+		Count:      2,
+		Advisories: []string{"GO-2025-3625", "GO-2025-3711"},
+		Details: []string{
+			"GO-2025-3625 does not apply to github.com/rancher/rancher@v2.15.0 (the record's own ranges are 2.10.0-2.10.11)",
+			"GO-2025-3711 does not apply to github.com/rancher/rancher@v2.15.0 (the record's own ranges are 2.11.0-2.11.13)",
+		},
+	}, gccTrio[1])
+
+	if !strings.Contains(out, "NOTE: 2 advisory match(es) were not reported") {
+		t.Errorf("no correction banner in:\n%s", out)
+	}
+	// The ids are the point: the drop is a claim, and a reader who doubts it has
+	// to be able to go and check the record.
+	for _, want := range []string{"GO-2025-3625", "GO-2025-3711", "2.10.0-2.10.11"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
+	}
+}
+
+// The case the caveat exists for. Every advisory was corrected away, so the
+// report is empty -- and an empty report that does not say this is the tool
+// claiming a clean image it never established.
+func TestCorrectionsAreStatedEvenWithNoFindings(t *testing.T) {
+	out := correctedReport(t, &analyze.Corrections{
+		Count:      1,
+		Advisories: []string{"GO-2025-3625"},
+		Details:    []string{"GO-2025-3625 does not apply to github.com/rancher/rancher@v2.15.0 (the record's own ranges are 2.10.0-2.10.11)"},
+	})
+	if !strings.Contains(out, "GO-2025-3625") {
+		t.Errorf("an empty report dropped its correction note:\n%s", out)
+	}
+}
+
+func TestNoCorrectionNoteWithoutCorrections(t *testing.T) {
+	out := report(t, false, gccTrio...)
+	if strings.Contains(out, "were not reported") {
+		t.Errorf("an uncorrected report mentions corrections:\n%s", out)
+	}
+}
+
+// Enough of them to bury the findings, so the list is capped -- but the number
+// hidden is still stated, because a truncated caveat that reads as complete is
+// the failure this whole feature is guarding against.
+func TestALongCorrectionListIsCappedButCounted(t *testing.T) {
+	c := &analyze.Corrections{Count: 26}
+	for i := range 26 {
+		id := fmt.Sprintf("GO-2025-%04d", i)
+		c.Advisories = append(c.Advisories, id)
+		c.Details = append(c.Details, id+" does not apply to github.com/rancher/rancher@v2.15.0 (the record's own ranges are 2.10.0-2.10.11)")
+	}
+	out := correctedReport(t, c, gccTrio[1])
+
+	if !strings.Contains(out, "... and 6 more") {
+		t.Errorf("no truncation count in:\n%s", out)
+	}
+	if strings.Contains(out, "GO-2025-0020") {
+		t.Errorf("the list was not capped:\n%s", out)
+	}
+	if !strings.Contains(out, "NOTE: 26 advisory match(es) were not reported") {
+		t.Errorf("the full count must still be stated:\n%s", out)
+	}
+}
+
+func TestALongReportRepeatsTheCorrectionNote(t *testing.T) {
+	out := longReport(t, 60, func(res *analyze.Result) {
+		res.Corrections = &analyze.Corrections{
+			Count:      1,
+			Advisories: []string{"GO-2025-3625"},
+			Details:    []string{"GO-2025-3625 does not apply to github.com/rancher/rancher@v2.15.0 (the record's own ranges are 2.10.0-2.10.11)"},
+		}
+	})
+	if got := strings.Count(out, "advisory match(es) were not reported"); got != 2 {
+		t.Errorf("correction note appears %d times, want 2 (both ends):\n%s", got, out)
+	}
+}
+
 // Paging must never be able to change a byte, so the renderer cannot know
 // whether it is talking to a terminal. This is the regression test for that:
 // the same result renders identically however it is consumed.

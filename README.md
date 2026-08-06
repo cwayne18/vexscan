@@ -841,6 +841,47 @@ carrying more than half the findings. `home-assistant/core --all --ecosystem
 pypi` is 1,224 packages and `0 / 0 / 26`, because `requirements.txt` declares no
 dev partition at all and 22 of the 26 additionally pin no version.
 
+**Some Go advisories cannot state where the flaw was fixed, and are corrected
+against their own data.** The Go vulnerability database imports records it does
+not curate and marks them `review_status: UNREVIEWED`. When such a record's
+versions are not expressible as Go module versions — the normal case for a v2+
+project whose module path carries no `/v2` suffix, so its only publishable
+versions are `+incompatible` ones — it publishes a range that is open at the
+top:
+
+```json
+"ranges": [{"type": "SEMVER", "events": [{"introduced": "0"}]}]
+```
+
+and parks the versions it could not translate in
+`affected[].ecosystem_specific.custom_ranges`. An open range matches every
+version forever. On `rancher/rancher:v2.15.0` that is 27 advisories against the
+image's own module, every one of them fixed years earlier.
+
+vexscan reads the record's own `custom_ranges` and sets the match aside — but
+only when the query was for Go, the record is `UNREVIEWED`, its standard ranges
+carry no `fixed` or `last_affected`, every version in `custom_ranges` parses,
+the installed version is outside all of them, and no *other* record in the same
+OSV answer corroborates the match. That last gate is what makes it two sources
+rather than one record reinterpreted: OSV returns every record matching the same
+package and version together, so an aliased GHSA that agrees is right there in
+the response. Records in the same degraded shape do not count as corroboration —
+`rancher/rancher` really does have pairs like `GO-2024-2929`/`GO-2024-3220`,
+aliases of each other and both open at the top, which is one importer twice.
+
+**Nothing is set aside quietly.** Every drop is counted, named and printed
+above the findings, and carried in `corrections` in the JSON, because a report
+27 findings shorter than the database offered must never be mistakable for a
+cleaner image. A record with an open range and *no* `custom_ranges` offers
+nothing better and is reported as found — on `rancher:v2.15.0` that is
+`GO-2024-2761`, which is why the count is 27 and not 28.
+
+Trivy solves the same problem by discarding govulndb for everything except
+`stdlib` and `golang.org/x/*` and taking third-party Go modules from GHSA
+instead ([trivy-db#675](https://github.com/aquasecurity/trivy-db/issues/675)).
+That is why trivy reports nothing here. It is also why it reports nothing for a
+module GHSA has no record of.
+
 ## LLM layer (optional, `--llm`)
 
 The LLM is an overlay and never a source of truth. It runs only on findings the
@@ -1605,6 +1646,11 @@ The JSON is `schema_version: 2`:
     "severities": ["CRITICAL", "HIGH"],
     "count": 123,
     "by_severity": { "UNKNOWN": 36, "MEDIUM": 78, "LOW": 9 }
+  },
+  "corrections": {  // only when an advisory's own ranges excluded the version it was matched against
+    "count": 25,
+    "advisories": ["GO-2024-2535", "GO-2024-2537"],
+    "details": ["GO-2024-2535 does not apply to github.com/rancher/rancher@v2.15.0 (the record's own ranges are 2.6.0-2.6.14, 2.7.0-2.7.10, 2.8.0-2.8.2)"]
   },
   "descriptor": {  // what produced this report
     "tool": "vexscan", "version": "v0.6.2",
