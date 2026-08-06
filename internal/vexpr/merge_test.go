@@ -120,3 +120,78 @@ func TestParseDocRoundTrip(t *testing.T) {
 		t.Error("ParseDoc(empty) = ok, want false")
 	}
 }
+
+// TestMergePreservesExistingDocumentFields guards the hazard that appending a
+// statement to a vendor-authored document must not strip OpenVEX fields this
+// package does not model off the statements it already holds.
+func TestMergePreservesExistingDocumentFields(t *testing.T) {
+	existing := []byte(`{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://example.com/vex/original",
+  "author": "Acme Vendor",
+  "role": "Document Creator",
+  "timestamp": "2025-01-01T00:00:00Z",
+  "last_updated": "2025-01-02T00:00:00Z",
+  "version": 7,
+  "tooling": "acme-vexctl 1.0",
+  "statements": [
+    {
+      "@id": "https://example.com/vex/original/stmt-1",
+      "version": 2,
+      "vulnerability": {
+        "name": "CVE-1",
+        "description": "an important vendor description",
+        "@id": "https://nvd.nist.gov/vuln/detail/CVE-1"
+      },
+      "products": [
+        {"@id": "` + testProduct + `", "identifiers": {"purl": "` + testProduct + `"}}
+      ],
+      "status": "affected",
+      "action_statement": "Upgrade to 2.0",
+      "status_notes": "vendor is still investigating scope"
+    }
+  ]
+}`)
+
+	doc, ok := ParseDoc(existing)
+	if !ok {
+		t.Fatal("ParseDoc returned ok=false on a valid document")
+	}
+	prop := ProductProposal{Product: testProduct, Statements: []Statement{
+		{Vulnerability: Vulnerability{Name: "CVE-2"}, Products: []Product{{ID: testProduct, Subcomponents: []Subcomponent{{ID: "pkg:deb/debian/b@1"}}}}, Status: StatusNotAffected},
+	}}
+	if added := mergeStatements(doc, prop, "vexscan", "2026-08-06T11:00:00Z"); added != 1 {
+		t.Fatalf("added = %d, want 1", added)
+	}
+
+	out, err := doc.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(out)
+
+	// Every field the typed model does not carry must survive verbatim.
+	for _, want := range []string{
+		`"role": "Document Creator"`,
+		`"last_updated": "2025-01-02T00:00:00Z"`,
+		`"version": 7`,
+		`"tooling": "acme-vexctl 1.0"`,
+		`"@id": "https://example.com/vex/original"`,
+		`"@id": "https://example.com/vex/original/stmt-1"`,
+		`"description": "an important vendor description"`,
+		`"status_notes": "vendor is still investigating scope"`,
+		`"identifiers"`,
+		`"status": "affected"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("merged document dropped preserved content %s\n---\n%s", want, got)
+		}
+	}
+	// The merge advances only the top-level timestamp and appends the new vuln.
+	if !strings.Contains(got, `"timestamp": "2026-08-06T11:00:00Z"`) {
+		t.Errorf("top-level timestamp not advanced:\n%s", got)
+	}
+	if !strings.Contains(got, `"name": "CVE-2"`) {
+		t.Errorf("new statement not added:\n%s", got)
+	}
+}
