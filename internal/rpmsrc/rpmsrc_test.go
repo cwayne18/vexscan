@@ -44,7 +44,7 @@ func TestReadParsesANamedFile(t *testing.T) {
 	dir := t.TempDir()
 	p := writeRPM(t, dir, "openssl-libs-3.5.5-2.el9_8.x86_64.rpm", fixture(t, "rocky9-openssl-libs"))
 
-	res, err := Read(context.Background(), []string{p}, nil)
+	res, err := Read(context.Background(), []string{p}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestReadWalksADirectory(t *testing.T) {
 	writeRPM(t, sub, "libopenssl3-3.1.4-150600.2.19.x86_64.rpm", fixture(t, "sle15-libopenssl3"))
 
 	var logged []string
-	res, err := Read(context.Background(), []string{dir}, func(f string, a ...any) {
+	res, err := Read(context.Background(), []string{dir}, false, func(f string, a ...any) {
 		logged = append(logged, fmt.Sprintf(f, a...))
 	})
 	if err != nil {
@@ -119,7 +119,7 @@ func TestOneBadPackageDoesNotCostTheOthers(t *testing.T) {
 	writeRPM(t, dir, "cut-short.rpm", fixture(t, "rocky9-rocky-release")[:200])
 	writeRPM(t, dir, "an-error-page.rpm", []byte("<html><body>404 Not Found</body></html>"))
 
-	res, err := Read(context.Background(), []string{dir}, nil)
+	res, err := Read(context.Background(), []string{dir}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestASourcePackageIsSkippedNotScanned(t *testing.T) {
 	writeRPM(t, dir, "openssl-3.5.5-2.el9_8.src.rpm", srcRPM("openssl", "3.5.5", "2.el9_8"))
 	writeRPM(t, dir, "openssl-libs-3.5.5-2.el9_8.x86_64.rpm", fixture(t, "rocky9-openssl-libs"))
 
-	res, err := Read(context.Background(), []string{dir}, nil)
+	res, err := Read(context.Background(), []string{dir}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func TestNothingScannableIsAnErrorNotACleanScan(t *testing.T) {
 	dir := t.TempDir()
 	p := writeRPM(t, dir, "openssl-3.5.5-2.el9_8.src.rpm", srcRPM("openssl", "3.5.5", "2.el9_8"))
 
-	if _, err := Read(context.Background(), []string{p}, nil); err == nil {
+	if _, err := Read(context.Background(), []string{p}, false, nil); err == nil {
 		t.Fatal("a directory of nothing but source packages scanned clean")
 	} else if !strings.Contains(err.Error(), "no rpm packages found") {
 		t.Errorf("err = %v", err)
@@ -188,7 +188,7 @@ func TestPathsThatResolveToNoPackages(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := Read(context.Background(), []string{tt.spec}, nil)
+			_, err := Read(context.Background(), []string{tt.spec}, false, nil)
 			if err == nil {
 				t.Fatal("want an error")
 			}
@@ -241,7 +241,7 @@ func TestReadURLStopsWhenTheHeaderEnds(t *testing.T) {
 	defer srv.Close()
 
 	var logged []string
-	res, err := Read(context.Background(), []string{srv.URL + "/openssl-libs-3.5.5-2.el9_8.x86_64.rpm"}, func(f string, a ...any) {
+	res, err := Read(context.Background(), []string{srv.URL + "/openssl-libs-3.5.5-2.el9_8.x86_64.rpm"}, false, func(f string, a ...any) {
 		logged = append(logged, fmt.Sprintf(f, a...))
 	})
 	if err != nil {
@@ -289,7 +289,7 @@ func TestURLsThatDoNotServeAPackage(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			_, err := Read(context.Background(), []string{srv.URL + "/x.rpm"}, nil)
+			_, err := Read(context.Background(), []string{srv.URL + "/x.rpm"}, false, nil)
 			if err == nil {
 				t.Fatal("want an error")
 			}
@@ -316,7 +316,7 @@ func TestReadURLHonoursContextCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := Read(ctx, []string{srv.URL + "/x.rpm"}, nil); !errors.Is(err, context.Canceled) {
+	if _, err := Read(ctx, []string{srv.URL + "/x.rpm"}, false, nil); !errors.Is(err, context.Canceled) {
 		t.Errorf("err = %v, want context.Canceled", err)
 	}
 }

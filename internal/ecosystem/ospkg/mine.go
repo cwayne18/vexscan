@@ -141,6 +141,16 @@ func (e evaluator) symbols(elfFiles []string) (defined map[string]bool, importer
 		return defined, nil
 	}
 
+	// The importer scan needs the closure, to know which objects are reachable
+	// and what they reference. In metadata-only mode (--rpm-deep) there is no
+	// closure -- the package's own objects were extracted but no tree was
+	// walked -- so there is nothing to scan for importers. The defined set
+	// alone still answers the dynsym-absent question, which is the only one
+	// that mode is entitled to ask.
+	if e.g == nil {
+		return defined, nil
+	}
+
 	importers = map[string][]string{}
 	for _, n := range e.g.Nodes() {
 		if !n.Reachable {

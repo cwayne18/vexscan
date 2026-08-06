@@ -173,7 +173,7 @@ func Inventory(ctx context.Context, opts Options) (*InventoryResult, error) {
 // there".
 func rpmInventory(ctx context.Context, opts Options) (*InventoryResult, error) {
 	logf := opts.Logf
-	rpms, err := readRPMs(ctx, &opts)
+	rpms, err := readRPMs(ctx, &opts, false)
 	if err != nil {
 		return nil, err
 	}

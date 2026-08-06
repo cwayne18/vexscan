@@ -361,6 +361,40 @@ Reading 3 rpm package file(s) from /tmp/rpmdir...
     ! /tmp/rpmdir/broken.rpm: not an rpm package file (bad lead magic)
 ```
 
+### Looking inside the package (`--rpm-deep`)
+
+`--rpm-deep` is the opt-in that trades the header-only read above for one that
+decompresses the cpio payload and writes out the ELF objects the header listed.
+It exists for exactly one verdict the header cannot reach on its own: when an
+advisory names a function and the package's own library is from the right
+software but does not export that function, the row can move from `undetermined`
+to `not_present` on the `elf-dynsym-absent` test — the same per-object test an
+installed scan runs.
+
+```sh
+vexscan --rpm https://.../openssl-libs-3.5.5-2.el9_8.x86_64.rpm \
+        --rpm-deep --mine-advisories --llm --all
+```
+
+Three things are worth being clear about before you reach for it:
+
+- **It needs `--mine-advisories --llm`.** The dynsym test has nothing to look
+  for until a symbol is mined from the advisory text; on its own `--rpm-deep`
+  extracts objects that no test then consults, and `vexscan` warns as much. With
+  no mined symbol every row stays `undetermined`, exactly as without the flag.
+- **It downloads the whole package.** The kilobytes-not-megabytes property in the
+  table above is a property of the header read; deep mode has to read and
+  decompress the payload, so a URL now costs the full file. Decompression is
+  pure-Go (gzip, xz, zstd, bzip2), so there is still no `rpm`, `xz` or `zstd`
+  binary in the loop.
+- **It still cannot run the reachability closure.** There is no entrypoint and no
+  sibling packages, so `DT_NEEDED` has nothing to walk: **nothing becomes
+  `linked` and nothing becomes `not_in_execute_path`, ever.** Deep mode only ever
+  upgrades an `undetermined` row to `not_present`, and only when the function is
+  provably absent from the build. A package that *does* export the vulnerable
+  function stays `undetermined` — that the code is present is not in question;
+  whether it can run is, and no `--rpm` scan can answer it.
+
 ## Scanning a bill of materials (`--sbom`)
 
 `--sbom` scans the components named in a CycloneDX JSON document — the standard
@@ -1724,6 +1758,7 @@ Three properties are deliberate:
 | `--repo` | | Git source repo to analyze: govulncheck source mode for Go, lock file inventory for Python and npm |
 | `--sbom` | | CycloneDX JSON bill of materials to scan — a path, or `-` for stdin. Every finding is `undetermined`; see [`--sbom`](#scanning-a-bill-of-materials---sbom) |
 | `--rpm` | | RPM package file to scan without installing it — a path, a directory of them, or a URL; repeatable. Reads only the header, so a URL costs kilobytes not megabytes — see [`--rpm`](#scanning-package-files---rpm) |
+| `--rpm-deep` | `false` | With `--rpm`, decompress the payload and extract its ELF objects so the `elf-dynsym-absent` test can run. Needs `--mine-advisories --llm`; downloads the whole package; never runs the reachability closure — see [`--rpm-deep`](#looking-inside-the-package---rpm-deep) |
 | `--package` | | Package to check: purl, `ecosystem:name`, or bare name; repeatable |
 | `--cves` | | CVE / GHSA / GO / RHSA / DSA ids; alone, resolved against the whole target |
 | `--all` | `false` | Check everything each ecosystem can enumerate |

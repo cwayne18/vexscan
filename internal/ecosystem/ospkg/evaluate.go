@@ -101,7 +101,7 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 	}
 
 	if e.meta {
-		return e.evaluateMetadata(f)
+		return e.evaluateMetadata(f, req)
 	}
 
 	pkg := e.st.pkg
@@ -196,24 +196,27 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 // evaluateMetadata decides one advisory against an inventory handed in from
 // outside, with no filesystem behind it.
 //
-// At most two answers are available and the third one is not. A package whose
-// header lists no ELF object installs no code that could execute, and that is
-// the same evidence MethodNoCode rests on when it is read out of an image --
-// so it is reused verbatim rather than given a weaker name for having come
-// from a file. Everything else is undetermined.
+// Up to three answers are available and one is not. A package whose header
+// lists no ELF object installs no code that could execute, and that is the same
+// evidence MethodNoCode rests on when it is read out of an image -- so it is
+// reused verbatim rather than given a weaker name for having come from a file.
+// Under --rpm-deep a second not_present is reachable: the package's objects were
+// extracted, so the dynsym-absent test can find that the vulnerable function is
+// exported by none of them. Everything else is undetermined.
 //
-// Whether even that first answer is available depends on the source. An rpm
+// Whether even the first answer is available depends on the source. An rpm
 // header carries FILECLASS, so it earns not_present; a description that lists
 // no files at all -- an SBOM component, say -- has not established that the
 // package ships no code, only that nobody looked. Meta.CanRuleOutCode is where
 // those two part company, and it is deliberately the conservative test: the
 // cost of the wrong answer here is a package declared clean that is not.
 //
-// It is never linked and never not_in_path. Both of those are claims about
-// what the dynamic linker would load, no closure ran, and there is nothing to
-// have run one over. An honest undetermined is the whole reason this mode can
-// be trusted at all: what it cannot see, it says it cannot see.
-func (e evaluator) evaluateMetadata(f ecosystem.Finding) ecosystem.Finding {
+// It is never linked and never not_in_path, even under --rpm-deep. Both of
+// those are claims about what the dynamic linker would load, no closure ran, and
+// there is nothing to have run one over. An honest undetermined is the whole
+// reason this mode can be trusted at all: what it cannot see, it says it cannot
+// see.
+func (e evaluator) evaluateMetadata(f ecosystem.Finding, req ecosystem.Request) ecosystem.Finding {
 	pkg, meta := e.st.pkg, e.st.meta
 
 	if meta.CanRuleOutCode() {
@@ -226,6 +229,28 @@ func (e evaluator) evaluateMetadata(f ecosystem.Finding) ecosystem.Finding {
 				pkg.Name, len(pkg.Files)),
 		}}
 		return f
+	}
+
+	// Under --rpm-deep the package's ELF objects were extracted, so the same
+	// dynsym-absent test an installed scan runs is available here: if the
+	// vulnerable function the advisory names shares a namespace with what this
+	// package exports but is itself exported by none of its objects, the
+	// vulnerable code is not in this build. It needs a symbol to look for,
+	// which only --mine-advisories supplies, so this fires only when both flags
+	// are set and the header listed ELF objects to read. It can reach
+	// not_present and nothing stronger: no closure ran, so nothing is ever
+	// linked or ruled out as unreachable.
+	if len(meta.ELF) > 0 {
+		if sym := e.checkSymbols(req.Advisory, req.Hints, meta.ELF); sym.Usable && len(sym.Defined) == 0 {
+			f.Status = ecosystem.StatusNotPresent
+			f.Justification = "vulnerable_code_not_present"
+			f.Method = MethodDynsymAbsent
+			f.Evidence = []ecosystem.Evidence{
+				{Origin: e.metaOrigin(), Detail: metadataDetail(pkg, meta)},
+				{Origin: MethodDynsymAbsent, Detail: sym.Why},
+			}
+			return f
+		}
 	}
 
 	f.Status = ecosystem.StatusUndetermined

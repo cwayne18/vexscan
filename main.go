@@ -61,6 +61,7 @@ func main() {
 		dynamic    = flag.String("dynamic-import-policy", "taint", "what an import of a computed name does to a language import graph: taint (block conclusions) or assume-none; these are far more common than dlopen, so assume-none discards much more")
 		triageOn   = flag.Bool("triage", false, "order findings by exploitation evidence: EPSS scores and CISA's known-exploited catalog. Adds two columns and sorts known-exploited first, then by EPSS percentile; nothing is hidden, and no severity changes. Downloads two public feeds (~4 MB, cached under VEXSCAN_TRIAGE_CACHE)")
 		mine       = flag.Bool("mine-advisories", false, "with --llm, let the model read each advisory's prose for symbols to check against the image")
+		rpmDeep    = flag.Bool("rpm-deep", false, "with --rpm, decompress each package's payload and extract its ELF objects so the dynsym-absent test can run (needs --mine-advisories to have a symbol to look for; costs the whole download, and still cannot run the reachability closure)")
 		trustAbs   = flag.Bool("trust-import-absence", false, "let a missing dynamic import of the vulnerable symbol conclude not_in_execute_path (see README: this is weaker than it looks)")
 		useLLM     = flag.Bool("llm", false, "consult a chat model on genuinely-affected CVEs for exploitability (needs a provider: --llm-endpoint or --llm-command)")
 		llmURL     = flag.String("llm-endpoint", "", "OpenAI-compatible chat/completions URL for --llm -- an API provider, or a local Ollama (env: VEXSCAN_LLM_ENDPOINT; credential: VEXSCAN_LLM_TOKEN)")
@@ -116,6 +117,18 @@ func main() {
 	}
 	if named != 1 {
 		fail("set exactly one of --image, --rootfs, --repo, --rpm or --sbom")
+	}
+	if *rpmDeep {
+		if len(rpms) == 0 {
+			fail("--rpm-deep only applies to --rpm")
+		}
+		if !*mine {
+			// Not fatal: deep extraction still populates the tree, and a future
+			// per-object test might use it. But the one test it enables today
+			// needs a symbol to look for, and only mining supplies one, so
+			// without it the extra download buys nothing.
+			fmt.Fprintln(os.Stderr, "warning: --rpm-deep has no effect without --mine-advisories, which supplies the symbol its dynsym test looks for")
+		}
 	}
 	switch *format {
 	case "text", "json", "fixplan", "inventory":
@@ -211,6 +224,7 @@ func main() {
 		RootFS:             *rootfs,
 		Repo:               *repo,
 		RPM:                rpms,
+		RPMDeep:            *rpmDeep,
 		SBOM:               *sbom,
 		Ref:                *ref,
 		Path:               *repoPath,
