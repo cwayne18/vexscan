@@ -120,7 +120,7 @@ func (s Statement) MarshalJSON() ([]byte, error) {
 	if s.raw != nil {
 		return s.raw, nil
 	}
-	return json.Marshal(statementShape{
+	return marshalNoEscape(statementShape{
 		Vulnerability:   s.Vulnerability,
 		Products:        s.Products,
 		Status:          s.Status,
@@ -129,6 +129,19 @@ func (s Statement) MarshalJSON() ([]byte, error) {
 		ActionStatement: s.ActionStatement,
 		Timestamp:       s.Timestamp,
 	})
+}
+
+// marshalNoEscape renders v as compact JSON without HTML-escaping &, < and >, so
+// preserved bytes and URLs round-trip unchanged instead of turning into \u00xx
+// escapes that would show up as spurious diff noise on untouched vendor lines.
+func marshalNoEscape(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
 // Vulnerability is the id a statement is filed under plus every alias it is also
@@ -216,7 +229,7 @@ func (d *Doc) MarshalJSON() ([]byte, error) {
 		if ctx == "" {
 			ctx = openVEXContext
 		}
-		return json.Marshal(docShape{
+		return marshalNoEscape(docShape{
 			Context:    ctx,
 			ID:         d.ID,
 			Author:     d.Author,
@@ -232,20 +245,20 @@ func (d *Doc) MarshalJSON() ([]byte, error) {
 	}
 	order := append([]string(nil), d.order...)
 
-	stmts, err := json.Marshal(d.Statements)
+	stmts, err := marshalNoEscape(d.Statements)
 	if err != nil {
 		return nil, err
 	}
 	order = setRawField(order, fields, "statements", stmts)
 
-	ts, err := json.Marshal(d.Timestamp)
+	ts, err := marshalNoEscape(d.Timestamp)
 	if err != nil {
 		return nil, err
 	}
 	order = setRawField(order, fields, "timestamp", ts)
 
 	if _, ok := fields["@context"]; !ok {
-		ctx, err := json.Marshal(openVEXContext)
+		ctx, err := marshalNoEscape(openVEXContext)
 		if err != nil {
 			return nil, err
 		}
@@ -258,7 +271,7 @@ func (d *Doc) MarshalJSON() ([]byte, error) {
 // Marshal renders the document as the pretty-printed JSON a hub stores, with a
 // trailing newline so the committed file matches what an editor would save.
 func (d *Doc) Marshal() ([]byte, error) {
-	compact, err := json.Marshal(d)
+	compact, err := marshalNoEscape(d)
 	if err != nil {
 		return nil, fmt.Errorf("vexpr: marshal document: %w", err)
 	}

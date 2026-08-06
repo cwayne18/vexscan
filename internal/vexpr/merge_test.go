@@ -148,7 +148,8 @@ func TestMergePreservesExistingDocumentFields(t *testing.T) {
       ],
       "status": "affected",
       "action_statement": "Upgrade to 2.0",
-      "status_notes": "vendor is still investigating scope"
+      "status_notes": "vendor is still investigating scope",
+      "references": ["https://nvd.example/detail?vulnId=CVE-1&source=nvd<mirror>"]
     }
   ]
 }`)
@@ -193,5 +194,13 @@ func TestMergePreservesExistingDocumentFields(t *testing.T) {
 	}
 	if !strings.Contains(got, `"name": "CVE-2"`) {
 		t.Errorf("new statement not added:\n%s", got)
+	}
+	// Preserved bytes must not be HTML-escaped: an untouched vendor reference
+	// URL with & and <> stays byte-for-byte so it does not show as a diff.
+	if !strings.Contains(got, `https://nvd.example/detail?vulnId=CVE-1&source=nvd<mirror>`) {
+		t.Errorf("preserved reference URL was escaped:\n%s", got)
+	}
+	if strings.Contains(got, `\u0026`) || strings.Contains(got, `\u003c`) {
+		t.Errorf("output contains HTML escapes:\n%s", got)
 	}
 }
