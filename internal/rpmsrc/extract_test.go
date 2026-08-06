@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -136,5 +137,26 @@ func TestNormalizeCpioNameAgreesAcrossHeaderAndPayload(t *testing.T) {
 		if got := normalizeCpioName(tc.in); got != tc.want {
 			t.Errorf("normalizeCpioName(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// A hostile mirror can set the header's name-length field to any uint32. The
+// reader must reject an implausible length rather than make([]byte, namesize)
+// on a multi-gigabyte value it will never be able to fill -- a corrupt-input
+// OOM is still a denial of service.
+func TestReadCpioHeaderRejectsHugeNameSize(t *testing.T) {
+	// A 110-byte newc header whose only meaningful field is a 4 GB namesize.
+	hdr := make([]byte, 110)
+	for i := range hdr {
+		hdr[i] = '0'
+	}
+	copy(hdr[0:6], cpioMagic)
+	copy(hdr[94:102], "ffffffff") // namesize
+	_, err := readCpioHeader(bytes.NewReader(hdr))
+	if err == nil {
+		t.Fatal("readCpioHeader accepted a 4 GB name length")
+	}
+	if !strings.Contains(err.Error(), "implausible cpio name length") {
+		t.Errorf("error = %v, want implausible-name-length rejection", err)
 	}
 }

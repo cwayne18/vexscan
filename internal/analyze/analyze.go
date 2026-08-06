@@ -625,6 +625,22 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// readRPMs may have created a temp extraction tree under --rpm-deep. The
+	// cleanup that removes it belongs to openTree, but that defer is not armed
+	// until openTree returns further down -- and plan() or newLLM() can fail in
+	// between. Remove the tree here on any early return, and disarm once
+	// openTree has taken ownership of it.
+	openTreeOwnsExtract := false
+	if opts.rpmExtractRoot != "" {
+		extractRoot := opts.rpmExtractRoot
+		defer func() {
+			if !openTreeOwnsExtract {
+				os.RemoveAll(extractRoot)
+			}
+		}()
+	}
+
 	bom, err := readSBOM(&opts)
 	if err != nil {
 		return nil, err
@@ -646,6 +662,7 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	openTreeOwnsExtract = true
 	defer cleanup()
 
 	analyzers := ecosystem.ImageAnalyzers(plugins)

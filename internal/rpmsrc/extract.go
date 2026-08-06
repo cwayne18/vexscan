@@ -72,6 +72,11 @@ func extractELF(payload io.Reader, want []string, root string) error {
 	if err != nil {
 		return fmt.Errorf("decompress payload: %w", err)
 	}
+	// zstd's streaming decoder holds background goroutines until it is closed,
+	// and writeWanted returns the moment the last wanted object is written --
+	// often long before the payload ends -- so closing here is what keeps a
+	// directory scan of hundreds of packages from leaking a decoder each.
+	defer dr.Close()
 	return writeWanted(dr, wanted, root)
 }
 
@@ -82,7 +87,7 @@ func extractELF(payload io.Reader, want []string, root string) error {
 // The five formats are the ones rpm has shipped: gzip and bzip2 on older
 // packages, xz across the RPM distributions for a decade, zstd on Fedora and
 // current SUSE, and raw lzma on a few old SUSE builds.
-func decompress(r io.Reader) (io.Reader, error) {
+func decompress(r io.Reader) (io.ReadCloser, error) {
 	br := bufio.NewReader(r)
 	magic, err := br.Peek(6)
 	if err != nil && err != io.EOF {
@@ -92,7 +97,11 @@ func decompress(r io.Reader) (io.Reader, error) {
 	case bytes.HasPrefix(magic, []byte{0x1f, 0x8b}):
 		return gzip.NewReader(br)
 	case bytes.HasPrefix(magic, []byte{0xfd, '7', 'z', 'X', 'Z', 0x00}):
-		return xz.NewReader(br)
+		xr, err := xz.NewReader(br)
+		if err != nil {
+			return nil, err
+		}
+		return io.NopCloser(xr), nil
 	case bytes.HasPrefix(magic, []byte{0x28, 0xb5, 0x2f, 0xfd}):
 		d, err := zstd.NewReader(br)
 		if err != nil {
@@ -100,12 +109,16 @@ func decompress(r io.Reader) (io.Reader, error) {
 		}
 		return d.IOReadCloser(), nil
 	case bytes.HasPrefix(magic, []byte{'B', 'Z', 'h'}):
-		return bzip2.NewReader(br), nil
+		return io.NopCloser(bzip2.NewReader(br)), nil
 	case bytes.HasPrefix(magic, []byte{0x5d, 0x00, 0x00}):
 		// Raw lzma, no container. ulikunitz/xz reads it through its lzma
 		// subpackage; the 13-byte lzma header it needs has not been consumed,
 		// because Peek does not advance the reader.
-		return lzma.NewReader(br)
+		lr, err := lzma.NewReader(br)
+		if err != nil {
+			return nil, err
+		}
+		return io.NopCloser(lr), nil
 	default:
 		return nil, fmt.Errorf("unrecognized payload compression (magic %x)", magic)
 	}
@@ -176,6 +189,13 @@ const (
 	cpioTrailer = "TRAILER!!!"
 	cpioFmtMask = 0o170000
 	cpioFmtReg  = 0o100000
+
+	// maxCpioName bounds the name length read from a header before it is
+	// allocated. namesize is an attacker-controlled uint32 that can claim up to
+	// 4 GB; a real path is bounded by PATH_MAX, so a value past a few kilobytes
+	// is a corrupt or hostile payload, not a filename, and must not drive an
+	// allocation.
+	maxCpioName = 64 << 10
 )
 
 type cpioHeader struct {
@@ -212,6 +232,9 @@ func readCpioHeader(r io.Reader) (cpioHeader, error) {
 	namesize, err := hexField(raw[94:102])
 	if err != nil {
 		return cpioHeader{}, err
+	}
+	if namesize == 0 || namesize > maxCpioName {
+		return cpioHeader{}, fmt.Errorf("implausible cpio name length %d", namesize)
 	}
 
 	nameBuf := make([]byte, namesize)
