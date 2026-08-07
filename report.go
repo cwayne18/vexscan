@@ -203,13 +203,27 @@ func writeCaveats(dst *strings.Builder, res *analyze.Result, pal palette) {
 		fmt.Fprintf(b, "NOTE: VEX hub %s could not be read, so nothing was moved to ALREADY VEXED - %s\n", h.URL, h.Error)
 	}
 	for _, d := range res.DistroFeeds {
-		if d.Error == "" {
+		if d.Error != "" {
+			// Same reasoning as the VEX hub note above: the scan is complete, but
+			// a feed that could not be read leaves OS-package false positives it
+			// would have cleared still sitting in AFFECTED, and that has to be
+			// said.
+			fmt.Fprintf(b, "NOTE: distro feed %s could not be read, so nothing was moved to ALREADY VEXED - %s\n", d.Name, d.Error)
 			continue
 		}
-		// Same reasoning as the VEX hub note above: the scan is complete, but a
-		// feed that could not be read leaves OS-package false positives it would
-		// have cleared still sitting in AFFECTED, and that has to be said.
-		fmt.Fprintf(b, "NOTE: distro feed %s could not be read, so nothing was moved to ALREADY VEXED - %s\n", d.Name, d.Error)
+		if d.Matched == 0 {
+			// A feed that was asked and answered about nothing at all. The scan is
+			// sound and the report over-reports at worst, so this is a NOTE and
+			// not an INCOMPLETE banner -- but it has to be said, because it is the
+			// one feed outcome that is indistinguishable from success. A feed that
+			// joined and found every package still affected also clears nothing,
+			// and prints exactly the same report; the difference is whether the
+			// vendor was consulted at all. Matched, not Cleared, is the test: on
+			// Debian:12 a healthy join matches every OS finding and honestly
+			// clears none of them.
+			fmt.Fprintf(b, "NOTE: distro feed %s matched none of the OS findings, so it cleared nothing.\n", d.Name)
+			fmt.Fprintf(b, "      Either the vendor has published nothing about these packages, or the join failed; treat the OS rows as unreviewed by %s either way.\n", d.Name)
+		}
 	}
 	writeMetadataCaveat(b, res)
 	writeGovulncheckCaveat(b, res)
