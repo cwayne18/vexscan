@@ -86,7 +86,7 @@ func main() {
 			"auto colours only a terminal, and never a file (--out), a gist (--gist), JSON output, or a run with NO_COLOR set")
 		quiet       = flag.Bool("quiet", false, "suppress progress logging on stderr")
 		noPager     = flag.Bool("no-pager", false, "never page the output, even when stdout is a terminal (VEXSCAN_PAGER picks the pager; setting it empty turns paging off for good)")
-		distroFeeds = flag.Bool("distro-feeds", false, "clear OS-package false positives with the distribution's own security feed: a vendor <not-affected> or an already-shipped fix moves a row to ALREADY VEXED, and like --vexhub never changes a status. Debian's security tracker today; network, off by default")
+		distroFeeds = flag.Bool("distro-feeds", false, "clear OS-package false positives with the distribution's own security feed: a vendor <not-affected> or an already-shipped fix moves a row to ALREADY VEXED, and like --vexhub never changes a status. Debian's security tracker and SUSE's CSAF-VEX today; network, off by default")
 	)
 	flag.Usage = usage
 	flag.Parse()
