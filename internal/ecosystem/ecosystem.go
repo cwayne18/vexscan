@@ -716,6 +716,23 @@ type VEXHubResult struct {
 	Error string `json:"error,omitempty"`
 }
 
+// DistroFeedResult records how one distribution feed fared, for the same reason
+// VEXHubResult does: a feed that could not be read must not be indistinguishable
+// from one that had nothing to say. Cleared counts the findings it moved out of
+// AFFECTED with an exculpatory statement.
+type DistroFeedResult struct {
+	// Name is the feed's own name, e.g. "Debian Security Tracker".
+	Name string `json:"name"`
+	// Cleared is how many findings the feed's exculpatory statements moved out
+	// of AFFECTED. Matched is how many it spoke to at all, exculpatory or not.
+	Matched int `json:"matched"`
+	Cleared int `json:"cleared"`
+	// Error is why the feed contributed nothing, and like a hub's error does
+	// not make the run incomplete: a feed that could not clear a false positive
+	// only leaves a row in AFFECTED, never invents a clean.
+	Error string `json:"error,omitempty"`
+}
+
 // osPURLTypes are the purl types whose namespace is a distribution rather than
 // part of the package's name.
 var osPURLTypes = map[string]bool{"deb": true, "rpm": true, "apk": true}

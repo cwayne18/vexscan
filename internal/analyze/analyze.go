@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/cwayne18/vexscan/internal/cvss"
+	"github.com/cwayne18/vexscan/internal/distrofeed"
 	"github.com/cwayne18/vexscan/internal/ecosystem"
 	"github.com/cwayne18/vexscan/internal/ecosystem/golang"
 	"github.com/cwayne18/vexscan/internal/ecosystem/maven"
@@ -193,6 +194,17 @@ type Options struct {
 	// changes is which of the answers a reader looks at first.
 	Triage *triage.Loader
 
+	// DistroFeeds are the distribution security feeds to check OS-package
+	// findings against (--distro-feeds), empty to skip them. They are concrete
+	// providers rather than a bool so a test can inject one pointed at a served
+	// fixture, and so the caller decides which distributions to consult.
+	//
+	// Like VEXHubs and Triage they never change a finding's status: a feed is a
+	// vendor's published second opinion, recorded as evidence, that can move a
+	// row out of AFFECTED for the reader but never invent a clean the local
+	// analysis did not reach.
+	DistroFeeds []distrofeed.Provider
+
 	// GoVersion optionally pins the Go toolchain for repo-mode analysis
 	// (e.g. "1.24.0"). Mainly useful with --module stdlib, whose findings depend
 	// on the toolchain version.
@@ -256,6 +268,11 @@ type Result struct {
 	// not be read. It is not part of Failed(): see vexOverlay for why a hub
 	// failure is not the same kind of incompleteness as an ecosystem failure.
 	VEXHubs []ecosystem.VEXHubResult `json:"vex_hubs,omitempty"`
+
+	// DistroFeeds records what each --distro-feeds source contributed, and like
+	// VEXHubs is not part of Failed(): a feed that could not clear a false
+	// positive only leaves a row in AFFECTED, never invents a clean.
+	DistroFeeds []ecosystem.DistroFeedResult `json:"distro_feeds,omitempty"`
 
 	// Withheld is what --severity removed from Findings, and is nil when the
 	// flag was not used or hid nothing. See severityFilter: a filtered result
@@ -763,6 +780,12 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	upstreamOverlay(result.Findings, sets.Upstream)
 	fixedOverlay(result.Findings, run.resolver.fixedVersions())
 	result.VEXHubs = vexOverlay(ctx, opts.VEXHubs, result.Findings, run.resolver.aliases(), logf)
+	if len(opts.DistroFeeds) > 0 {
+		// After vexOverlay so a user's --vexhub outranks an automatic feed, and
+		// read from the tree the plugins already walked. The os-release read is
+		// cheap and only happens when a feed was actually requested.
+		result.DistroFeeds = distroOverlay(ctx, opts.DistroFeeds, readOSInfo(img.FS, logf), result.Findings, run.resolver.aliases(), logf)
+	}
 	result.Triage = triageOverlay(ctx, opts.Triage, result.Findings, sets.All, logf)
 	llmOverlay(ctx, llmClient, result.Findings, "", logf)
 	sortFindings(result.Findings)

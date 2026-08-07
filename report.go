@@ -202,6 +202,15 @@ func writeCaveats(dst *strings.Builder, res *analyze.Result, pal palette) {
 		// reached looks exactly like one with nothing to say.
 		fmt.Fprintf(b, "NOTE: VEX hub %s could not be read, so nothing was moved to ALREADY VEXED - %s\n", h.URL, h.Error)
 	}
+	for _, d := range res.DistroFeeds {
+		if d.Error == "" {
+			continue
+		}
+		// Same reasoning as the VEX hub note above: the scan is complete, but a
+		// feed that could not be read leaves OS-package false positives it would
+		// have cleared still sitting in AFFECTED, and that has to be said.
+		fmt.Fprintf(b, "NOTE: distro feed %s could not be read, so nothing was moved to ALREADY VEXED - %s\n", d.Name, d.Error)
+	}
 	writeMetadataCaveat(b, res)
 	writeGovulncheckCaveat(b, res)
 	writeTriageCaveats(b, res)
@@ -691,6 +700,13 @@ func vexAuthors(res *analyze.Result) string {
 		}
 		seen[name] = true
 		names = append(names, name)
+	}
+	for _, d := range res.DistroFeeds {
+		if d.Cleared == 0 || seen[d.Name] {
+			continue
+		}
+		seen[d.Name] = true
+		names = append(names, d.Name)
 	}
 	if len(names) == 0 {
 		return "a published VEX statement"

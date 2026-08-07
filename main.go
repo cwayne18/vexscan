@@ -17,6 +17,8 @@ import (
 	"github.com/cwayne18/vexscan/internal/analyze"
 	"github.com/cwayne18/vexscan/internal/buildinfo"
 	"github.com/cwayne18/vexscan/internal/cvss"
+	"github.com/cwayne18/vexscan/internal/distrofeed"
+	"github.com/cwayne18/vexscan/internal/distrofeed/debian"
 	"github.com/cwayne18/vexscan/internal/elfgraph"
 	"github.com/cwayne18/vexscan/internal/gist"
 	"github.com/cwayne18/vexscan/internal/modgraph"
@@ -81,8 +83,9 @@ func main() {
 			"which is the gate no version-matching scanner can offer)")
 		colorMode = flag.String("color", "auto", "colourise the text report: auto, always, never. "+
 			"auto colours only a terminal, and never a file (--out), a gist (--gist), JSON output, or a run with NO_COLOR set")
-		quiet   = flag.Bool("quiet", false, "suppress progress logging on stderr")
-		noPager = flag.Bool("no-pager", false, "never page the output, even when stdout is a terminal (VEXSCAN_PAGER picks the pager; setting it empty turns paging off for good)")
+		quiet       = flag.Bool("quiet", false, "suppress progress logging on stderr")
+		noPager     = flag.Bool("no-pager", false, "never page the output, even when stdout is a terminal (VEXSCAN_PAGER picks the pager; setting it empty turns paging off for good)")
+		distroFeeds = flag.Bool("distro-feeds", false, "clear OS-package false positives with the distribution's own security feed: a vendor <not-affected> or an already-shipped fix moves a row to ALREADY VEXED, and like --vexhub never changes a status. Debian's security tracker today; network, off by default")
 	)
 	flag.Usage = usage
 	flag.Parse()
@@ -241,6 +244,7 @@ func main() {
 		Roots:              roots,
 		VEXHubs:            vexhubs,
 		Triage:             triageLoader(*triageOn),
+		DistroFeeds:        distroProviders(*distroFeeds),
 		DlopenPolicy:       dlopenPolicy,
 		DynamicPolicy:      dynamicPolicy,
 		GoVersion:          *goVersion,
@@ -432,6 +436,17 @@ func triageLoader(on bool) *triage.Loader {
 		return nil
 	}
 	return triage.New()
+}
+
+// distroProviders is the distribution feeds --distro-feeds turns on. Debian's
+// tracker is the only one so far; the rest of the family (Red Hat CSAF, Alpine
+// secdb) will join the slice as they land, each keyed to the os-release it
+// Handles so an image only ever consults the feed that speaks for it.
+func distroProviders(on bool) []distrofeed.Provider {
+	if !on {
+		return nil
+	}
+	return []distrofeed.Provider{debian.New()}
 }
 
 // fail prints a usage error and exits 2.

@@ -1690,6 +1690,68 @@ examined, while an unreachable hub only leaves rows in `AFFECTED` that a vendor
 had already answered. The first under-reports, which is the way this tool must
 never be wrong; the second over-reports, which is merely tiring.
 
+### Distribution security feeds (`--distro-feeds`)
+
+A VEX hub is a vendor publishing statements about *their own images*. A
+distribution publishes the same kind of judgement about *its packages*, in its
+own security feed, and `--distro-feeds` reads it the same way — as a second
+opinion that can move a row out of `AFFECTED`, never as a verdict that rewrites a
+`status`.
+
+The question it answers is the one the reachability closure cannot: whether the
+distribution built the vulnerable code into the package at all. Debian routinely
+marks a CVE not-affected for a source package because the flaw is in a code path
+they do not compile, or fixed it in a point release whose version an upstream OSV
+range does not know about. Both are false positives that a version match — and
+vexscan's own OSV lookup — still flags.
+
+```sh
+vexscan --image debian:12 --all --distro-feeds
+```
+
+Today this reads the [Debian security
+tracker](https://security-tracker.debian.org/tracker/) and speaks only for
+Debian images (`ID=debian`); Ubuntu and the rpm distributions track security in
+separate databases and will be separate feeds. Two verdicts, and only two, move a
+row:
+
+- **not-affected** — the tracker's `fixed_version: "0"` for the image's release,
+  meaning Debian's build never contained the flaw.
+- **already fixed** — a `resolved` advisory whose fix landed at or below the
+  installed version, compared with Debian's own version rules
+  (`internal/debver`). A fix *newer* than what is installed leaves the finding
+  standing.
+
+Everything else — an `open` advisory, an `undetermined` release, a `nodsa` note
+(Debian is affected but will not issue an update), or a release the image's
+`VERSION_ID` cannot be mapped to a codename — clears nothing. When the release
+cannot be named the feed declines rather than guess, because a verdict read off
+the wrong release is exactly the kind of wrong answer this tool must not produce.
+
+**It never rewrites `status`,** exactly like `--vexhub`, and it runs *after* it,
+so an explicit `--vexhub` statement always outranks the automatic feed. A cleared
+row moves to `ALREADY VEXED`, carries `Evidence{Origin: "distro-feed"}`, and
+keeps the local verdict it had. An unreachable feed prints a `NOTE:` and does not
+fail the run, for the same reason an unreachable hub does not: it can only leave a
+false positive sitting in `AFFECTED`, never invent a clean.
+
+The tracker's bulk JSON is large, so the feed is streamed and filtered to the
+handful of source packages the scan actually asked about rather than held in
+memory whole. If the download is truncated or malformed the whole feed is
+rejected — a short read never partially clears findings. It is off by default
+because it is a network fetch; `--distro-feeds` turns it on.
+
+**Known limitation: package provenance.** The feed is keyed by the image's
+`VERSION_ID` (e.g. Debian 12 → bookworm), so a verdict is read from that
+release's column. A package installed from `bookworm-backports`, `testing`, or a
+third-party repository is a different build than the one the tracker describes,
+so its not-affected or fixed verdict may not apply. This is the same trust model
+`--vexhub` already uses — and the same assumption the base OS scan makes, since
+the OSV lookup keys off the release too — and because a distro feed never
+rewrites `status`, a wrong verdict can only misfile a row into `ALREADY VEXED`
+for triage, never publish it as clean. A strict publication path keys off
+`status`, not the vexed bucket.
+
 ### Contributing ruled-out findings back (`--vex-out`)
 
 `--vexhub` *reads* a hub. `--vex-out` *writes* the other direction: it turns
@@ -1773,6 +1835,7 @@ The JSON is `schema_version: 2`:
   "ecosystems": [ { "id": "os", "components": 65, "error": "" } ],
   "unreadable": { "count": 3, "paths": ["/opt/vendor"] },  // omitted when nothing was skipped
   "vex_hubs": [ { "url": "...", "author": "...", "products": 1082, "matched": 3 } ],  // only with --vexhub
+  "distro_feeds": [ { "name": "Debian Security Tracker", "matched": 4, "cleared": 4 } ],  // only with --distro-feeds
   "triage": {  // only with --triage
     "epss_date": "2026-08-04", "kev_date": "2026.08.04",  // the feeds' own dates, not today's
     "epss_stale": true, "kev_stale": true,   // a cached copy was used; omitted when false
@@ -1962,6 +2025,7 @@ Three properties are deliberate:
 | `--osv-ecosystem` | *(auto)* | Override the OSV ecosystem derived from os-release, from the `VENDOR`/`DISTRIBUTION` headers under `--rpm`, or from the `distro=` purl qualifier under `--sbom`, e.g. `Debian:12` |
 | `--roots` | | Extra entrypoints for the closures — shared libraries and language imports; repeatable |
 | `--vexhub` | | VEX Repository to check findings against, e.g. `https://github.com/rancher/vexhub` (also a raw base URL or a local directory); repeatable, earliest wins — see [VEX hubs](#vex-hubs---vexhub) |
+| `--distro-feeds` | off | Clear OS-package false positives with the distribution's own security feed: a vendor not-affected or an already-shipped fix moves a row to `ALREADY VEXED`, and like `--vexhub` never changes a `status`. Debian's security tracker today; network — see [Distribution security feeds](#distribution-security-feeds---distro-feeds) |
 | `--vex-out` | | Write OpenVEX `not_affected` documents for the findings ruled out into this directory, laid out as a VEX hub; with `--vexhub` they are merged into what that hub publishes, so it can be a clone of it — see [Contributing ruled-out findings back](#contributing-ruled-out-findings-back---vex-out) |
 | `--vex-author` | | With `--vex-out`, the OpenVEX `author` to record on the statements — **required**, and an error without `--vex-out` |
 | `--severity` | *(all)* | Only report findings at these severities: `CRITICAL`, `HIGH`, `UNKNOWN`, `MEDIUM`, `LOW`, `NONE`; comma-separated or repeatable. `UNKNOWN` must be named to be shown — see [Filtering by severity](#filtering-by-severity---severity) |
