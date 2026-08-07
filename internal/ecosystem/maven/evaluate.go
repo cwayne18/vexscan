@@ -129,13 +129,13 @@ func (e evaluator) absent(f ecosystem.Finding, c ecosystem.Component) ecosystem.
 	// asked about are the same obstacle: "no archive here is X" is not a claim
 	// this scan is entitled to make while one of them is on the disk. An
 	// unreadable archive is opaque and always counts; an unidentified one counts
-	// only when it could plausibly be X -- a jar positively identified as some
-	// other artifact, or one that ships no code at all, no longer stands in the
-	// way of an answer it cannot be the subject of.
-	group, artifact := splitCoord(c.Name)
+	// whenever it carries code, since without a package-to-artifact database it
+	// cannot be ruled out as a stripped or shaded copy of X. Only a codeless
+	// archive no longer stands in the way of an answer it cannot be the subject
+	// of.
 	blocked := append([]string(nil), e.st.unreadable...)
 	for _, u := range e.st.unidentified {
-		if couldBe(u, group, artifact) {
+		if couldBe(u) {
 			blocked = append(blocked, u.Path)
 		}
 	}
@@ -160,58 +160,22 @@ func (e evaluator) absent(f ecosystem.Finding, c ecosystem.Component) ecosystem.
 	return f
 }
 
-// splitCoord separates a Maven coordinate into its groupId and artifactId. A
-// bare artifactId with no colon leaves the group empty.
-func splitCoord(name string) (group, artifact string) {
-	if g, a, ok := strings.Cut(name, ":"); ok {
-		return g, a
-	}
-	return "", name
-}
-
-// couldBe reports whether an unidentified archive could be the artifact named by
-// group and artifact -- the only case in which it may block a claim of absence.
+// couldBe reports whether an unidentified archive could be the artifact whose
+// absence is being decided, and so must keep blocking that claim.
 //
-// The conclusion is only ever narrowed toward "yes, it could", so a false clean
-// cannot slip through here: the archive stops blocking only on positive evidence
-// that it is something else.
-//
-//   - A codeless archive ships no class, so it cannot hold the vulnerable class
-//     of any artifact and cannot be the one asked about.
-//   - An archive whose file name names a different artifact, and whose classes
-//     live under none of the asked-about group's packages, has said what it is
-//     twice over. A repackaged copy that lied about its name would still carry
-//     the artifact's classes, and those are checked regardless of the name.
-//   - Anything else -- an anonymous jar, or one whose classes could belong to
-//     the artifact -- still blocks.
-func couldBe(u langdb.UnidentifiedArchive, group, artifact string) bool {
-	if !u.HasClasses {
-		return false
-	}
-	if u.FileArtifact != "" && artifact != "" && u.FileArtifact != artifact &&
-		group != "" && !packagesUnder(u.ClassPackages, group) {
-		return false
-	}
-	return true
-}
-
-// packagesUnder reports whether any of the archive's class packages could belong
-// to the given groupId, comparing the group as a package path against each class
-// package in either direction so a class deeper than the group, or a group
-// deeper than the package root, both count.
-func packagesUnder(classPackages []string, group string) bool {
-	root := strings.ReplaceAll(group, ".", "/")
-	if root == "" {
-		return true
-	}
-	for _, p := range classPackages {
-		if p == root ||
-			strings.HasPrefix(p+"/", root+"/") ||
-			strings.HasPrefix(root+"/", p+"/") {
-			return true
-		}
-	}
-	return false
+// The conclusion only ever narrows toward "yes, it could", so a false clean
+// cannot slip through. Without a package-to-artifact database, any archive that
+// carries compiled classes could be a coordinate-stripped or shaded copy of the
+// artifact: an archive's own class packages cannot rule it out, because an
+// artifact's classes routinely do not live under its groupId path (Guava's
+// com.google.guava ships com/google/common, MongoDB's org.mongodb:bson ships
+// org/bson) and a shaded uber-jar carries many artifacts' classes under a file
+// name that names none of them. The one archive that can be ruled out is a
+// codeless one -- a resources, sources or javadoc jar with no class at all --
+// since it cannot hold any artifact's vulnerable class. Everything else blocks:
+// over-reporting an undetermined here is safe, a wrongly cleared absence is not.
+func couldBe(u langdb.UnidentifiedArchive) bool {
+	return u.HasClasses
 }
 
 // coordinateTaint records that this artifact's identity was reconstructed

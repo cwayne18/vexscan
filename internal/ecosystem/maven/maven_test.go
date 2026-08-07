@@ -265,21 +265,26 @@ func TestCodelessArchiveDoesNotBlockAbsence(t *testing.T) {
 	}
 }
 
-// A jar whose classes span two unrelated roots yields no coordinate, but its
-// file name names a different artifact and its classes belong to none of the
-// asked-about group's packages. It has said what it is; it is not what is being
-// asked about.
-func TestDifferentlyNamedArchiveDoesNotBlockAbsence(t *testing.T) {
+// An artifact's classes routinely do not live under its groupId path: Guava's
+// com.google.guava ships com/google/common. A differently-named, coordinate-less
+// jar that carries those classes could be a shaded or repackaged copy of the
+// asked-about artifact, so it must still block the claim of absence. Deciding
+// otherwise from the groupId path alone is the false clean this must never wave
+// through.
+func TestArtifactClassesOutsideGroupPathStillBlockAbsence(t *testing.T) {
 	img := javaImage(t, map[string]string{
-		"/opt/lib/spring-aop-6.1.14.jar": jarBytes(t, map[string]string{
-			"org/springframework/aop/Advisor.class": "\xca\xfe\xba\xbe",
-			"org/aopalliance/aop/Advice.class":      "\xca\xfe\xba\xbe",
+		// Classes span two unrelated roots, so no coordinate is offered and the
+		// jar is unidentified -- but one of those roots is guava's own
+		// (com/google/common, not the com/google/guava its groupId would
+		// suggest), so this jar could be carrying it and must still block.
+		"/opt/lib/app-shaded-1.0.jar": jarBytes(t, map[string]string{
+			"com/google/common/collect/ImmutableList.class": "\xca\xfe\xba\xbe",
+			"org/example/app/Main.class":                    "\xca\xfe\xba\xbe",
 		}),
 	})
-	f := absenceOf(t, img, "maven:org.apache.logging.log4j:log4j-core")
-	if f.Status != ecosystem.StatusNotPresent || f.Justification != "component_not_present" {
-		t.Errorf("status=%s justification=%q, want not_present/component_not_present",
-			f.Status, f.Justification)
+	f := absenceOf(t, img, "maven:com.google.guava:guava")
+	if f.Status != ecosystem.StatusUndetermined || f.Reason != "unidentified_archive" {
+		t.Errorf("status=%s reason=%q, want undetermined/unidentified_archive", f.Status, f.Reason)
 	}
 }
 
