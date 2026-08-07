@@ -419,6 +419,55 @@ func TestLocationColumnNamesTheBinaryForGoFindings(t *testing.T) {
 	}
 }
 
+// maxTableWidth is how wide a default findings row may print.
+//
+// Not a style rule. The pager wraps rather than chops (see pager.go), so a row
+// past the terminal folds onto a second line and the alignment that makes the
+// table legible is gone -- the report looks broken. v0.8.1 added LOCATION at
+// the same 40 the other columns carried, took the Go table from 143 columns to
+// 180, and nothing here noticed, because the banked regression scan is
+// debian:12 and an OS scan sets no Location so the column never appeared.
+//
+// The number is the sum of the column budgets plus the fixed columns and their
+// gaps, rounded up. It is a ceiling to be argued with, not a target: raising it
+// is a decision to make a table that fits fewer terminals, and the point of the
+// test is that the decision gets made rather than discovered in a release.
+const maxTableWidth = 155
+
+func TestAFindingsRowFitsATerminal(t *testing.T) {
+	// Every budgeted cell over its cap and every optional column switched on,
+	// so the row prints at the full width the budgets allow.
+	wide := func(cve, bin string) analyze.Finding {
+		return analyze.Finding{
+			CVE: cve, ID: cve,
+			Package:      "github.com/kube-logging/logging-operator/pkg/resources",
+			Version:      "v0.0.0-20250424202944-7e1f9d3a1c2b4e5f6a7b8c9d",
+			Binary:       bin,
+			Location:     "var/lib/rancher/k3s/agent/containerd/state/bin/" + bin,
+			FixedVersion: "0.0.0-20260608145523-cf437db9e1a2b3c4d5e6f7a8",
+			Status:       analyze.StatusLinked, Severity: "CRITICAL",
+			Method: "elf-needed-closure",
+		}
+	}
+	// Two binaries so LOCATION earns its place; FIXED IN comes with the fix.
+	out := report(t, false, wide("CVE-1", "docker-machine-driver-harvester"), wide("CVE-2", "docker-machine-driver-linode"))
+
+	header := sectionOf(t, out, "AFFECTED")[0]
+	for _, col := range []string{"LOCATION", "FIXED IN"} {
+		if !strings.Contains(header, col) {
+			t.Fatalf("%s column missing, so this is not the widest shape:\n%s", col, header)
+		}
+	}
+	for _, line := range strings.Split(out, "\n") {
+		// Runes, not bytes: the truncation ellipsis is three bytes wide and one
+		// column, and counting bytes would fail a row that fits perfectly well.
+		if w := len([]rune(line)); w > maxTableWidth {
+			t.Errorf("row is %d columns, over the %d budget -- it will wrap in a pager:\n%s",
+				w, maxTableWidth, line)
+		}
+	}
+}
+
 // An advisory that patched three maintained branches offers three upgrades,
 // and only one of them is the small one. The table still names a single target
 // -- a cell holding three versions is not scannable -- so --details is where
