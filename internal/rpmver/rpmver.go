@@ -31,6 +31,11 @@ import "strings"
 // Release is compared last, and only when both strings carry one: a fix quoted
 // without a release ("1.1.1l") is a statement about the version line, and pinning
 // it to a release it never named would be a comparison the vendor did not make.
+//
+// The epoch rule above is asymmetric, and deliberately so: it fails closed for
+// Compare(installed, fix) and open for the operands the other way round. Callers
+// asking "has the installed package reached the fix?" should use
+// CompareInstalledToFix, which names the direction and closes both.
 func Compare(a, b string) int {
 	pa, ea, va, ra := splitEVR(a)
 	pb, eb, vb, rb := splitEVR(b)
@@ -60,6 +65,35 @@ func Compare(a, b string) int {
 		return 0
 	}
 	return rpmvercmp(ra, rb)
+}
+
+// CompareInstalledToFix orders an installed EVR against a vendor's fixed EVR,
+// returning -1, 0 or 1 exactly as Compare does. Callers deciding "has this
+// package already reached the fix?" should use this and not Compare.
+//
+// Compare's epoch rule fails closed in one direction only. It is written for the
+// case the rpm database produces -- an installed version that always carries an
+// epoch, against a CSAF fixed version quoted without one -- and there an
+// unprovable epoch sorts the installed side below the fix, leaving the finding
+// affected. Reverse the operands and the same rule inverts: a bare installed
+// version against a fix quoted "1:1.1.1l" returns 1, reading as "already past the
+// fix", and clears a package that has not reached it. That is the one failure
+// this package exists to prevent, and it is a plausible accident -- the two
+// arguments are both version strings and the compiler cannot tell them apart.
+//
+// So this function names the direction in its signature and makes both
+// asymmetries fail the same way: whenever exactly one side states an epoch and
+// that epoch is non-zero, the ordering against the unknown cannot be proven and
+// the answer is -1, below the fix, still affected. An epoch of 0 on the stated
+// side proves nothing either way and falls through to the version, which is the
+// ordinary case and the same thing Compare does.
+func CompareInstalledToFix(installed, fix string) int {
+	hasI, epochI, _, _ := splitEVR(installed)
+	hasF, epochF, _, _ := splitEVR(fix)
+	if hasI != hasF && ((hasI && epochI != 0) || (hasF && epochF != 0)) {
+		return -1
+	}
+	return Compare(installed, fix)
 }
 
 // splitEVR breaks an EVR into whether an epoch was present, its integer value (0

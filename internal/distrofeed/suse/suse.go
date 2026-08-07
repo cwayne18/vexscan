@@ -236,7 +236,7 @@ func (a *advisory) classifyProduct(vs *vulnStatus, product, name, installed stri
 		return distrofeed.StatusNotAffected, "", "SUSE marks " + name + " not affected in " + product
 	}
 	if fv := vs.fixed[product][name]; fv != "" {
-		if installed != "" && rpmver.Compare(installed, fv) >= 0 {
+		if installed != "" && rpmver.CompareInstalledToFix(installed, fv) >= 0 {
 			return distrofeed.StatusFixed, fv, "SUSE fixed " + name + " in " + fv
 		}
 		return distrofeed.StatusAffected, fv, "SUSE fix for " + name + " is " + fv + ", newer than what is installed"

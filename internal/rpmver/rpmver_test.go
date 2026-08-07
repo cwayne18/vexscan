@@ -185,3 +185,59 @@ func TestCompareFixThreshold(t *testing.T) {
 		}
 	}
 }
+
+// CompareInstalledToFix is Compare with the operand order fixed by its name, and
+// the point of it is that the epoch rule no longer depends on getting that order
+// right. Compare's asymmetry is real -- {"2.0-1", "1:1.0-1", 1} above is the same
+// unprovable epoch comparison as {"1:1.0-1", "2.0-1", -1}, answered the opposite
+// way -- and in a clearing decision the two directions are not equally wrong. One
+// leaves a false positive in the report; the other clears a package that has not
+// reached the fix, which is a real CVE waved through.
+func TestCompareInstalledToFixClosesBothEpochDirections(t *testing.T) {
+	// Every one of these must refuse to clear. The installed version is not
+	// provably at or above the fix in any of them.
+	unprovable := []struct{ installed, fix string }{
+		// The database stamps an epoch, SUSE's CSAF quotes the fix without one.
+		{"1:1.0-1", "2.0-1"},
+		// The mirror image, which raw Compare answers 1 -- "already fixed".
+		{"2.0-1", "1:1.0-1"},
+		// And where the version alone would clear it, so only the epoch rule
+		// stands between this and a wrongly-cleared finding.
+		{"9.9-9", "1:1.0-1"},
+	}
+	for _, c := range unprovable {
+		if got := CompareInstalledToFix(c.installed, c.fix); got >= 0 {
+			t.Errorf("CompareInstalledToFix(%q, %q) = %d, want < 0: exactly one side states an epoch, "+
+				"so the ordering is unprovable and must not clear", c.installed, c.fix, got)
+		}
+	}
+
+	// An epoch of 0 on one side proves nothing either way, so it falls through to
+	// the version -- the ordinary shape, and it must still clear normally.
+	same := []struct{ installed, fix string }{
+		{"0:1.1.1l-150500.15.4", "1.1.1l-150500.15.4"}, // equal
+		{"0:1.1.1w-150500.17.1", "1.1.1l-150500.15.4"}, // past the fix
+		{"1.1.1w-150500.17.1", "0:1.1.1l-150500.15.4"},
+	}
+	for _, c := range same {
+		if got := CompareInstalledToFix(c.installed, c.fix); got < 0 {
+			t.Errorf("CompareInstalledToFix(%q, %q) = %d, want >= 0: an epoch of 0 is not a reason to withhold a clear",
+				c.installed, c.fix, got)
+		}
+	}
+
+	// With no epoch in play, or with one on both sides, it is Compare exactly.
+	agree := []struct{ installed, fix string }{
+		{"1.1.1l-150500.15.4", "1.1.1l-150500.15.4"},
+		{"1.1.1k-150500.15.4", "1.1.1l-150500.15.4"},
+		{"1.1.1w-150500.17.1", "1.1.1l-150500.15.4"},
+		{"2:1.0-1", "1:9.9-9"},
+		{"1:1.0-1", "1:2.0-1"},
+	}
+	for _, c := range agree {
+		if got, want := CompareInstalledToFix(c.installed, c.fix), Compare(c.installed, c.fix); got != want {
+			t.Errorf("CompareInstalledToFix(%q, %q) = %d, want %d (Compare): with no mixed epoch the two must agree",
+				c.installed, c.fix, got, want)
+		}
+	}
+}
