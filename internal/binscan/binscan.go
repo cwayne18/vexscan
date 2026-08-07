@@ -210,6 +210,16 @@ type openVEXDoc struct {
 	} `json:"statements"`
 }
 
+// GovulncheckAvailable reports whether the govulncheck binary is on PATH. When
+// it is not, the binary-mode reachability test below is skipped and a linked,
+// package-granularity, non-stripped finding stays linked when it might have been
+// ruled not_in_execute_path. The caller surfaces that so a skipped test is never
+// mistaken for a run that had nothing to rule out.
+func GovulncheckAvailable() bool {
+	_, err := exec.LookPath("govulncheck")
+	return err == nil
+}
+
 // GovulncheckNotAffected runs govulncheck in binary mode and returns the set of
 // vulnerability ids it marks not_affected. Best effort: returns an empty set if
 // govulncheck is unavailable or errors.

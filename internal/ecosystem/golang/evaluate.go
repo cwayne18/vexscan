@@ -24,8 +24,19 @@ type evalCtx struct {
 	// govuln returns the ids govulncheck binary mode marked not_affected. It is
 	// a function so the subprocess is only paid for when a verdict depends on it.
 	govuln func() map[string]struct{}
-	logf   func(string, ...any)
+	// govulnAvailable is whether the govulncheck binary was found on PATH. When
+	// it is not, a linked package-granularity finding on a non-stripped binary
+	// could not be tested for reachability, and evaluate records that on the
+	// finding so a skipped test is distinguishable from one that ruled nothing
+	// out.
+	govulnAvailable bool
+	logf            func(string, ...any)
 }
+
+// OriginGovulncheckUnavailable marks a linked finding whose reachability could
+// not be tested because the govulncheck binary was not on PATH. It aliases the
+// canonical constant in the ecosystem package, where the report reads it.
+const OriginGovulncheckUnavailable = ecosystem.OriginGovulncheckUnavailable
 
 // evaluate classifies one advisory against one binary.
 //
@@ -78,13 +89,28 @@ func evaluate(_ context.Context, ec evalCtx, id string, adv *osv.Advisory) ecosy
 		} else {
 			f.Method = "pclntab"
 		}
-	case f.Granularity == "package" && !ec.stripped && inNotAffected(ec.govuln(), id, adv.ID):
+	case f.Granularity == "package" && !ec.stripped && ec.govulnAvailable && inNotAffected(ec.govuln(), id, adv.ID):
 		f.Status = ecosystem.StatusNotInPath
 		f.Justification = "vulnerable_code_not_in_execute_path"
 		f.Method = "govulncheck"
 	default:
 		f.Status = ecosystem.StatusLinked
 		f.Reachability = reachability(ec.stripped)
+		// A linked, package-granularity finding on a non-stripped binary is
+		// exactly the shape govulncheck could have narrowed to
+		// not_in_execute_path. When the binary is missing there is no verdict
+		// to consult, and the finding stays linked for want of the test rather
+		// than because the test ran and found the code reachable. Record that
+		// on the finding so the report can warn, and so the JSON does not read
+		// as a reachability test that had nothing to rule out.
+		if f.Granularity == "package" && !ec.stripped && !ec.govulnAvailable {
+			f.Reachability = "linked (govulncheck not found; reachability not tested)"
+			f.Evidence = append(f.Evidence, ecosystem.Evidence{
+				Origin: OriginGovulncheckUnavailable,
+				Detail: "govulncheck is not on PATH, so binary-mode reachability was not tested; " +
+					"install govulncheck to let this finding be ruled not_in_execute_path when its code is unreachable",
+			})
+		}
 	}
 	return f
 }

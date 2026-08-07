@@ -67,7 +67,7 @@ func main() {
 		llmURL     = flag.String("llm-endpoint", "", "OpenAI-compatible chat/completions URL for --llm -- an API provider, or a local Ollama (env: VEXSCAN_LLM_ENDPOINT; credential: VEXSCAN_LLM_TOKEN)")
 		llmModel   = flag.String("llm-model", "", "model id for --llm-endpoint (env: VEXSCAN_LLM_MODEL; default gpt-4o)")
 		llmCommand = flag.String("llm-command", "", "for --llm, run this installed CLI instead of calling an endpoint, e.g. 'claude -p'; the prompt arrives on its stdin (env: VEXSCAN_LLM_COMMAND)")
-		format     = flag.String("format", "text", "output format: text, json, fixplan (a remediation-first view of the fixable findings), or inventory (list the image's OS packages and exit)")
+		format     = flag.String("format", "text", "output format: text, json, sarif (SARIF 2.1.0 for code-scanning dashboards), fixplan (a remediation-first view of the fixable findings), or inventory (list the image's OS packages and exit)")
 		details    = flag.Bool("details", false, "with --format text, print the full evidence block under each row instead of the table alone")
 		out        = flag.String("out", "", "write output to this file instead of stdout")
 		gistFlag   = flag.Bool("gist", false, "also upload the output to a public GitHub gist and print its URL (needs GITHUB_TOKEN/GH_TOKEN with gist scope)")
@@ -131,9 +131,9 @@ func main() {
 		}
 	}
 	switch *format {
-	case "text", "json", "fixplan", "inventory":
+	case "text", "json", "sarif", "fixplan", "inventory":
 	default:
-		fail("unknown --format %q; want text, json, fixplan, or inventory", *format)
+		fail("unknown --format %q; want text, json, sarif, fixplan, or inventory", *format)
 	}
 	// Caught here so a missing author is a command-line error before the scan,
 	// not after it.
@@ -271,7 +271,7 @@ func main() {
 	// Resolved here and not in the writers, because the escapes have to be in
 	// the string before emit decides where it goes -- and where it goes is half
 	// of what decides whether they belong in it.
-	pal := colors.palette(destination{file: *out != "", gist: *gistFlag, json: *format == "json"})
+	pal := colors.palette(destination{file: *out != "", gist: *gistFlag, json: *format == "json" || *format == "sarif"})
 
 	var rendered string
 	switch *format {
@@ -282,6 +282,13 @@ func main() {
 			os.Exit(1)
 		}
 		rendered = string(b) + "\n"
+	case "sarif":
+		b, err := renderSARIF(res)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		rendered = b
 	case "fixplan":
 		rendered = renderFixPlan(res, renderOpts{pal: pal})
 	default: // --format was validated up front; inventory returned earlier
@@ -545,8 +552,11 @@ func uploadGist(ctx context.Context, res *analyze.Result, rendered, format strin
 		return "", err
 	}
 	filename := "vexscan-report.txt"
-	if format == "json" {
+	switch format {
+	case "json":
 		filename = "vexscan-report.json"
+	case "sarif":
+		filename = "vexscan-report.sarif"
 	}
 	desc := fmt.Sprintf("vexscan %s report for %s", res.Mode, res.Target)
 	if res.Module != "" {
@@ -691,6 +701,9 @@ Examples:
   # A remediation-first view: which packages to upgrade, and to what
   # (a current debian:12 is fully patched, so pick a tag that is behind)
   vexscan --image debian:bookworm-20230919 --all --format fixplan
+
+  # SARIF for a code-scanning dashboard; ruled-out findings arrive suppressed
+  vexscan --image myorg/app:latest --all --format sarif --out results.sarif
 
   # With an exploitability overlay, from a model running locally
   vexscan --image myorg/app:latest --all --llm \

@@ -193,7 +193,7 @@ func parseColor(mode string) (colorPolicy, error) {
 type destination struct {
 	file bool // --out was given
 	gist bool // --gist was given
-	json bool // --format json
+	json bool // --format json or sarif (both are JSON documents color would corrupt)
 }
 
 // palette resolves the policy against where the output is going.

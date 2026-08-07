@@ -382,6 +382,43 @@ func TestFixedInColumnAppearsOnlyWithData(t *testing.T) {
 	}
 }
 
+// The LOCATION column names the specific binary a linked finding lives in. One
+// module can be linked into several binaries at the same version, so without it
+// those rows are identical. An OS scan sets no binary, so the column must not
+// appear there.
+func TestLocationColumnNamesTheBinaryForGoFindings(t *testing.T) {
+	// Two Go findings, same module and version, different binaries: the column
+	// appears and tells the rows apart.
+	go2 := report(t, false,
+		analyze.Finding{
+			CVE: "CVE-1", Package: "golang.org/x/net", Version: "0.1.0",
+			Binary: "usr/bin/api", Location: "usr/bin/api",
+			Status: analyze.StatusLinked, Severity: "HIGH", Method: "govulncheck",
+		},
+		analyze.Finding{
+			CVE: "CVE-1", Package: "golang.org/x/net", Version: "0.1.0",
+			Binary: "usr/bin/worker", Location: "usr/bin/worker",
+			Status: analyze.StatusLinked, Severity: "HIGH", Method: "govulncheck",
+		},
+	)
+	rows := sectionOf(t, go2, "AFFECTED")
+	if !strings.Contains(rows[0], "LOCATION") {
+		t.Fatalf("LOCATION header missing:\n%s", go2)
+	}
+	if !strings.Contains(lineWith(t, go2, "usr/bin/api"), "usr/bin/api") ||
+		!strings.Contains(lineWith(t, go2, "usr/bin/worker"), "usr/bin/worker") {
+		t.Errorf("each binary should identify its own row:\n%s", go2)
+	}
+
+	// An OS finding has no binary: the column must not appear.
+	os := report(t, false,
+		analyze.Finding{CVE: "CVE-2", Package: "libc6", Version: "2.36", Status: analyze.StatusLinked, Severity: "HIGH", Method: "elf-needed-closure"},
+	)
+	if strings.Contains(os, "LOCATION") {
+		t.Errorf("LOCATION column appeared for an OS scan that sets no binary:\n%s", os)
+	}
+}
+
 // An advisory that patched three maintained branches offers three upgrades,
 // and only one of them is the small one. The table still names a single target
 // -- a cell holding three versions is not scannable -- so --details is where
@@ -1494,6 +1531,44 @@ func TestTheMetadataCaveatIsPrintedTwice(t *testing.T) {
 func TestTheMetadataCaveatIsForDescribedPackagesOnly(t *testing.T) {
 	if out := report(t, false, gccTrio...); strings.Contains(out, "not an installed system") {
 		t.Errorf("an image report carried the metadata caveat:\n%s", out)
+	}
+}
+
+// A linked Go finding carrying the govulncheck-unavailable evidence must make
+// the report say the reachability test was skipped, and count how many findings
+// it could not narrow. Without this a report from a box with no govulncheck is
+// byte-identical to one where govulncheck ran and ruled nothing out.
+func TestTheGovulncheckCaveatCountsSkippedFindings(t *testing.T) {
+	skipped := func(cve string) analyze.Finding {
+		return analyze.Finding{
+			Ecosystem: "golang", CVE: cve, ID: cve,
+			Module: "golang.org/x/net", Version: "v0.17.0",
+			Status: analyze.StatusLinked,
+			Evidence: []ecosystem.Evidence{{
+				Origin: ecosystem.OriginGovulncheckUnavailable,
+				Detail: "govulncheck is not on PATH",
+			}},
+		}
+	}
+	out := report(t, false, skipped("CVE-2023-39325"), skipped("CVE-2023-44487"))
+
+	if !strings.Contains(out, "govulncheck was not found") {
+		t.Errorf("the report does not warn that govulncheck was missing:\n%s", out)
+	}
+	if !strings.Contains(out, "2 linked Go finding(s) could not be") {
+		t.Errorf("the caveat does not count the findings it explains:\n%s", out)
+	}
+	if !strings.Contains(out, "go install golang.org/x/vuln/cmd/govulncheck@latest") {
+		t.Errorf("the caveat does not say how to fix it:\n%s", out)
+	}
+}
+
+// A scan where govulncheck ran must not carry the caveat: the absence of the
+// evidence is the whole signal, and a false warning would tell a user to
+// install a tool they already have.
+func TestTheGovulncheckCaveatIsAbsentWhenGovulncheckRan(t *testing.T) {
+	if out := report(t, false, gccTrio...); strings.Contains(out, "govulncheck was not found") {
+		t.Errorf("a report with no skipped findings carried the govulncheck caveat:\n%s", out)
 	}
 }
 

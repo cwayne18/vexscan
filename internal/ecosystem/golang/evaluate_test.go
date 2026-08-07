@@ -77,6 +77,9 @@ func TestEvaluate(t *testing.T) {
 		blob     string
 		stripped bool
 		notAff   map[string]struct{}
+		// govulnUnavailable models the govulncheck binary being absent from
+		// PATH. The default (false) is the ordinary case where it ran.
+		govulnUnavailable bool
 
 		want Finding
 		// wantGovulnCalled pins the laziness of the govulncheck call: it is
@@ -154,6 +157,32 @@ func TestEvaluate(t *testing.T) {
 			wantGovulnCalled: true,
 		},
 		{
+			name:              "package granularity, linked, govulncheck unavailable",
+			adv:               &osv.Advisory{ID: goID, Pkgs: []string{"golang.org/x/net/http2"}},
+			blob:              linkedBlob,
+			govulnUnavailable: true,
+			// The candidate is exactly the shape govulncheck could narrow, and
+			// the binary is missing: the finding stays linked but records why,
+			// so the report can warn and the JSON does not read as a test that
+			// ruled nothing out.
+			want: Finding{
+				Binary: binRel, Module: module, Version: version, CVE: cve, GoID: goID,
+				Packages:     []string{"golang.org/x/net/http2"},
+				Granularity:  "package",
+				Status:       StatusLinked,
+				Reachability: "linked (govulncheck not found; reachability not tested)",
+				Evidence: []ecosystem.Evidence{{
+					Origin: OriginGovulncheckUnavailable,
+					Detail: "govulncheck is not on PATH, so binary-mode reachability was not tested; " +
+						"install govulncheck to let this finding be ruled not_in_execute_path when its code is unreachable",
+				}},
+			},
+			// Still lazily consulted: the plugin skips the subprocess when it
+			// knows the binary is absent, but evaluate itself only branches on
+			// govulnAvailable, so the guarded call is never reached here.
+			wantGovulnCalled: false,
+		},
+		{
 			name:     "stripped binary skips govulncheck entirely",
 			adv:      &osv.Advisory{ID: goID, Pkgs: []string{"golang.org/x/net/http2"}},
 			blob:     linkedBlob,
@@ -221,11 +250,12 @@ func TestEvaluate(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			govulnCalled := false
 			ec := evalCtx{
-				binaryRel: binRel,
-				module:    module,
-				version:   version,
-				stripped:  tt.stripped,
-				syms:      symbolsFor(t, tt.blob),
+				binaryRel:       binRel,
+				module:          module,
+				version:         version,
+				stripped:        tt.stripped,
+				syms:            symbolsFor(t, tt.blob),
+				govulnAvailable: !tt.govulnUnavailable,
 				govuln: func() map[string]struct{} {
 					govulnCalled = true
 					if tt.notAff == nil {
