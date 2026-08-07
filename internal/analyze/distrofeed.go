@@ -43,13 +43,20 @@ func distroOverlay(ctx context.Context, providers []distrofeed.Provider, os *OSI
 			continue
 		}
 		res := ecosystem.DistroFeedResult{Name: p.Name()}
-		stmts, err := p.Lookup(ctx, distrofeed.Query{OSID: os.ID, Release: os.VersionID, Packages: refs})
+		stmts, err := p.Lookup(ctx, distrofeed.Query{OSID: os.ID, Release: os.VersionID, CPE: os.CPEName, Packages: refs})
 		if err != nil {
+			// An error is recorded and warned about but never discards the
+			// statements that did come back. A bulk-file feed like Debian
+			// returns no statements on failure, so this applies nothing extra;
+			// a per-CVE feed like SUSE can fetch most advisories and fail one,
+			// and the ones it read are still a valid second opinion. This is
+			// safe because a finding's several ids are aliases of one
+			// vulnerability and a clear is only recorded from an advisory that
+			// was actually read: an unread advisory leaves its finding in
+			// AFFECTED and can never, by its absence, invent a clean.
 			res.Error = err.Error()
-			logf("  ! distro feed %s could not be read: %v", p.Name(), err)
-			logf("    (OS-package false positives it would have cleared are still reported as affected)")
-			out = append(out, res)
-			continue
+			logf("  ! distro feed %s: %v", p.Name(), err)
+			logf("    (any OS-package false positive it could not read is still reported as affected)")
 		}
 		for _, st := range stmts {
 			matched, cleared := applyStatement(index, st)

@@ -19,6 +19,7 @@ import (
 	"github.com/cwayne18/vexscan/internal/cvss"
 	"github.com/cwayne18/vexscan/internal/distrofeed"
 	"github.com/cwayne18/vexscan/internal/distrofeed/debian"
+	"github.com/cwayne18/vexscan/internal/distrofeed/suse"
 	"github.com/cwayne18/vexscan/internal/elfgraph"
 	"github.com/cwayne18/vexscan/internal/gist"
 	"github.com/cwayne18/vexscan/internal/modgraph"
@@ -438,15 +439,16 @@ func triageLoader(on bool) *triage.Loader {
 	return triage.New()
 }
 
-// distroProviders is the distribution feeds --distro-feeds turns on. Debian's
-// tracker is the only one so far; the rest of the family (Red Hat CSAF, Alpine
-// secdb) will join the slice as they land, each keyed to the os-release it
-// Handles so an image only ever consults the feed that speaks for it.
+// distroProviders is the distribution feeds --distro-feeds turns on. Each is
+// keyed to the os-release it Handles, so an image only ever consults the feed
+// that speaks for it: Debian's security tracker for Debian, SUSE's CSAF-VEX for
+// the SUSE Linux Enterprise family (including SLE BCI container images). The rest
+// (Red Hat CSAF, Alpine secdb) will join the slice as they land.
 func distroProviders(on bool) []distrofeed.Provider {
 	if !on {
 		return nil
 	}
-	return []distrofeed.Provider{debian.New()}
+	return []distrofeed.Provider{debian.New(), suse.New()}
 }
 
 // fail prints a usage error and exits 2.

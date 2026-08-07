@@ -83,6 +83,12 @@ type Query struct {
 	// scan could not read one, in which case a release-scoped feed must decline
 	// to clear rather than guess.
 	Release string
+	// CPE is the image's CPE_NAME from os-release, e.g.
+	// "cpe:/o:suse:sles:15:sp5". A CSAF feed joins on it exactly: it names the
+	// vendor's product line and service pack unambiguously, where Release alone
+	// ("15.5") cannot tell a SUSE Server from a Desktop. Empty when os-release
+	// carried none, in which case a CPE-scoped feed declines rather than guess.
+	CPE string
 	// Packages are the OS-package findings to speak to, one per (package, CVE)
 	// the scan is carrying.
 	Packages []PkgRef

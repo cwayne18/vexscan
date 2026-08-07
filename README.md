@@ -1710,10 +1710,11 @@ vexscan --image debian:12 --all --distro-feeds
 ```
 
 Today this reads the [Debian security
-tracker](https://security-tracker.debian.org/tracker/) and speaks only for
-Debian images (`ID=debian`); Ubuntu and the rpm distributions track security in
-separate databases and will be separate feeds. Two verdicts, and only two, move a
-row:
+tracker](https://security-tracker.debian.org/tracker/) for Debian images
+(`ID=debian`) and SUSE's CSAF-VEX feed for the SUSE Linux Enterprise family
+including BCI (`ID=sles` and kin — see below); Ubuntu, Alpine and Red Hat track
+security in separate databases and will be separate feeds. Two verdicts, and only
+two, move a row:
 
 - **not-affected** — the tracker's `fixed_version: "0"` for the image's release,
   meaning Debian's build never contained the flaw.
@@ -1751,6 +1752,43 @@ the OSV lookup keys off the release too — and because a distro feed never
 rewrites `status`, a wrong verdict can only misfile a row into `ALREADY VEXED`
 for triage, never publish it as clean. A strict publication path keys off
 `status`, not the vexed bucket.
+
+#### SUSE / BCI (CSAF-VEX)
+
+The SUSE Linux Enterprise family — including the SLE BCI base images the RKE2 and
+K3s hardened builds sit on — is covered by a second provider that reads [SUSE's
+CSAF-VEX feed](https://ftp.suse.com/pub/projects/security/csaf-vex/). It handles
+`ID=sles`, `sled`, `sles_sap`, `sle_hpc`, `sle-micro` and `sle-micro-rt`.
+(openSUSE Leap and Tumbleweed track separately and are left to a future provider
+rather than answered for with enterprise verdicts.)
+
+SUSE publishes **one CSAF document per CVE** at a stable URL, so unlike Debian's
+one bulk file this provider fetches exactly the advisories the scan found — the
+CVE ids on the findings — and nothing else. A `404` means SUSE has no record for
+that CVE, which is a silent decline, not a failure.
+
+The join key is **CPE**, read from the image's own `os-release` `CPE_NAME`
+(a BCI base image reports `cpe:/o:suse:sles:15:sp5`). A CSAF document names dozens
+of products — Server, Desktop, HPC, the SLE modules, SUSE Micro, several service
+packs — whose verdicts differ, and the image's exact CPE selects the one product
+whose column applies. This is what keeps a Desktop not-affected off a Server
+image. When `os-release` carries no CPE, or the document names no product with
+it, the provider declines rather than guess — the same fail-closed rule the
+Debian feed uses for an unmappable release. Should one CPE name several products
+with conflicting verdicts, an `affected` product wins over a `not-affected` one.
+
+The same two verdicts move a row: **not-affected** (SUSE did not build the
+vulnerable code into that binary package) and **already fixed** (a `recommended`
+update whose version the installed one has reached, compared with rpm's own
+version rules in `internal/rpmver`). A fix *newer* than what is installed, or a
+package SUSE lists as plain `known_affected`, leaves the finding standing.
+Matching is by **binary** package name only — never the source — because one SUSE
+source builds several binaries with opposite verdicts (`libopenssl1_1`
+not-affected while `libopenssl1_0_0` is affected by the same CVE), so matching a
+source name against a binary list would clear the wrong package. Installed rpm
+versions always carry an epoch the CSAF fix omits; the comparison fails closed on
+that mismatch so a non-zero epoch can never clear a package whose version is below
+the fix.
 
 ### Contributing ruled-out findings back (`--vex-out`)
 
