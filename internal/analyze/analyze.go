@@ -740,6 +740,7 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	result.Unreadable = noteRPMFailures(result.Unreadable, rpms, logf)
 	result.Unreadable = noteSBOMFailures(result.Unreadable, bom, logf)
 
+	guardCleanStatuses(result.Findings, logf)
 	severityOverlay(result.Findings, run.resolver.severities())
 	// Filtering here, rather than in the renderer, is what keeps every count
 	// downstream honest: the LLM is never billed for a row nobody will read,
@@ -1055,6 +1056,7 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 	}
 	result.Findings = append(result.Findings, unmapped(opts.CVEs, result.Findings)...)
 
+	guardCleanStatuses(result.Findings, logf)
 	severityOverlay(result.Findings, run.resolver.severities())
 	// See runTree for why the filter runs before the overlays rather than in
 	// the renderer. Repo mode is the path where it bites hardest: govulncheck's
@@ -1673,6 +1675,27 @@ func llmOverlay(ctx context.Context, client *llm.Client, findings []Finding, loc
 			continue
 		}
 		f.LLM = v
+	}
+}
+
+// guardCleanStatuses runs Finding.Validate over every finding, enforcing the
+// false-clean invariant as a final net beneath the plugins' own call-site
+// discipline. A correction is logged rather than swallowed: a demotion the
+// guard had to make means a plugin emitted a clean it could not support, which
+// is a bug to be seen, not hidden.
+//
+// It runs before every other overlay and before the fail-on gate, so that the
+// severity filter, the VEX and triage overlays, and the exit gate all see the
+// corrected status. A finding the guard demotes from a clean to linked must be
+// gated on and reported as the real finding it now is.
+func guardCleanStatuses(findings []Finding, logf func(string, ...any)) {
+	for i := range findings {
+		if corrected, reason := findings[i].Validate(); reason != "" {
+			findings[i] = corrected
+			if logf != nil {
+				logf("  ! false-clean guard: %s", reason)
+			}
+		}
 	}
 }
 
