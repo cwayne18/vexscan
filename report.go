@@ -829,8 +829,8 @@ func writeSection(b *strings.Builder, s section, o renderOpts) {
 		cells := []string{
 			o.pal.severity(displaySeverity(f)),
 			shortAdvisory(f),
-			truncate(f.Component(), 40),
-			truncate(f.Version, 28),
+			truncate(f.Component(), colPackage),
+			truncate(f.Version, colVersion),
 		}
 		if showLocation {
 			cells = append(cells, displayLocation(f))
@@ -848,7 +848,7 @@ func writeSection(b *strings.Builder, s section, o renderOpts) {
 			cells = append(cells, o.pal.status(f.Status, string(f.Status)))
 		}
 		if s.vex {
-			cells = append(cells, f.VEX.Status, truncate(vexReason(f.VEX), 44))
+			cells = append(cells, f.VEX.Status, truncate(vexReason(f.VEX), colVEXReason))
 		} else {
 			cells = append(cells, f.Method)
 		}
@@ -992,7 +992,7 @@ func displayLocation(f analyze.Finding) string {
 	if f.Location == "" {
 		return ""
 	}
-	return truncateLeft(f.Location, 40)
+	return truncateLeft(f.Location, colLocation)
 }
 
 // fixedColumn reports whether any row in the section has a published fix, which
@@ -1016,7 +1016,7 @@ func displayFixed(f analyze.Finding) string {
 	if f.FixedVersion == "" {
 		return "no fix"
 	}
-	return truncate(f.FixedVersion, 28)
+	return truncate(f.FixedVersion, colFixed)
 }
 
 // otherFixes is the published fixes the row is not recommending: the branches
@@ -1175,6 +1175,45 @@ func writeTable(b *strings.Builder, rows [][]string) {
 		b.WriteString("\n")
 	}
 }
+
+// Column budgets: the widest each variable-length cell may print.
+//
+// These are a width budget and not four independent choices. A findings table
+// is the fixed columns -- SEVERITY, ADVISORY, BASIS and the two-space gaps,
+// about 55 together -- plus these, so their sum is what decides whether a row
+// fits a terminal. Adding a column means taking the room from somewhere.
+//
+// That is not a cosmetic concern. The pager wraps rather than chops (see
+// pager.go), so a row wider than the terminal folds onto a second line and the
+// alignment that makes the table readable is gone. v0.8.1 added LOCATION at the
+// same 40 the other columns had and took the Go table to 180 columns, which
+// wrapped on any terminal anyone actually uses.
+//
+// The budgets are deliberately not derived from the terminal. writeFooter
+// explains why: a report has to be the same bytes whether it is paged,
+// redirected into a file, or uploaded to a gist, because those get diffed
+// against each other.
+const (
+	// colPackage is a module path or package name. Right-truncated: an OS
+	// package name is short enough to survive, and a module path's head is what
+	// says which project it is.
+	colPackage = 30
+	// colVersion is the installed version. Right-truncated because the head is
+	// the semver; what a Go pseudo-version loses off the end is the commit
+	// stamp, which no reader is comparing by eye.
+	colVersion = 20
+	// colLocation is the binary a finding lives in, left-truncated (see
+	// truncateLeft) so the basename survives. The narrowest of the four because
+	// the leading directories it drops are identical across every row.
+	colLocation = 22
+	// colFixed is the version to upgrade to. Kept wider than colLocation: it is
+	// the one cell a reader retypes, and a truncated target is a cell they have
+	// to go look up somewhere else.
+	colFixed = 22
+	// colVEXReason is a justification in the ALREADY VEXED table, which carries
+	// no LOCATION and so has the room.
+	colVEXReason = 44
+)
 
 // truncate caps a cell so one pathological name cannot widen every row.
 func truncate(s string, max int) string {

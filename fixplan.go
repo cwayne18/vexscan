@@ -298,9 +298,9 @@ func writeUpgradePlan(b *strings.Builder, plan []upgrade, pal palette) {
 			cells = append(cells, u.ecosystem)
 		}
 		cells = append(cells,
-			truncate(u.pkg, 40),
-			truncate(u.current, 28),
-			truncate(u.fixedIn, 28),
+			truncate(u.pkg, colPackage),
+			truncate(u.current, colVersion),
+			truncate(u.fixedIn, colFixed),
 			fmt.Sprintf("%d", len(u.advisories)),
 			pal.severity(cvss.Display(u.topLabel)),
 		)
@@ -343,8 +343,8 @@ func writeNoFix(b *strings.Builder, rows []analyze.Finding, pal palette) {
 		cells := []string{
 			pal.severity(displaySeverity(f)),
 			shortAdvisory(f),
-			truncate(f.Component(), 40),
-			truncate(f.Version, 28),
+			truncate(f.Component(), colPackage),
+			truncate(f.Version, colVersion),
 		}
 		if showEPSS {
 			cells = append(cells, displayEPSS(f))
