@@ -126,12 +126,14 @@ func TestColouredAndPlainTablesAlignIdentically(t *testing.T) {
 // gets noticed -- and which also proves nothing outside the palette started
 // writing escapes of its own.
 func TestAColouredReportStripsBackToThePlainOne(t *testing.T) {
-	res := &analyze.Result{
-		SchemaVersion: analyze.SchemaVersion,
-		Target:        "debian:12",
-		Mode:          "image",
-		Findings:      gccTrio,
-		Unreadable:    &target.Unreadable{Count: 1, Paths: []string{"/root/.ssh"}},
+	res := []*analyze.Result{
+		{
+			SchemaVersion: analyze.SchemaVersion,
+			Target:        "debian:12",
+			Mode:          "image",
+			Findings:      gccTrio,
+			Unreadable:    &target.Unreadable{Count: 1, Paths: []string{"/root/.ssh"}},
+		},
 	}
 	plain := renderText(res, renderOpts{details: true})
 	coloured := renderText(res, renderOpts{details: true, pal: palette{on: true}})
@@ -150,12 +152,14 @@ func TestAColouredReportStripsBackToThePlainOne(t *testing.T) {
 // The fix plan is a second document over the same findings, and its tables are
 // coloured by the same palette, so it gets the same guard.
 func TestAColouredFixPlanStripsBackToThePlainOne(t *testing.T) {
-	res := &analyze.Result{
-		SchemaVersion: analyze.SchemaVersion,
-		Target:        "debian:12",
-		Mode:          "image",
-		Ecosystems:    []ecosystem.EcosystemResult{{ID: "os", Ecosystems: []string{"Debian:12"}}},
-		Findings:      fixableTrio(),
+	res := []*analyze.Result{
+		{
+			SchemaVersion: analyze.SchemaVersion,
+			Target:        "debian:12",
+			Mode:          "image",
+			Ecosystems:    []ecosystem.EcosystemResult{{ID: "os", Ecosystems: []string{"Debian:12"}}},
+			Findings:      fixableTrio(),
+		},
 	}
 	plain := renderFixPlan(res, renderOpts{})
 	coloured := renderFixPlan(res, renderOpts{pal: palette{on: true}})

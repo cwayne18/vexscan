@@ -85,9 +85,11 @@ func TestRenderersSayWhenPartOfTheTreeWasNotRead(t *testing.T) {
 	inv := renderInventory(&analyze.InventoryResult{
 		Target: "/mnt/rootfs", Mode: "rootfs", Unreadable: unreadable,
 	})
-	res := renderText(&analyze.Result{
-		SchemaVersion: analyze.SchemaVersion, Target: "/mnt/rootfs", Mode: "rootfs",
-		Unreadable: unreadable,
+	res := renderText([]*analyze.Result{
+		{
+			SchemaVersion: analyze.SchemaVersion, Target: "/mnt/rootfs", Mode: "rootfs",
+			Unreadable: unreadable,
+		},
 	}, renderOpts{})
 
 	for name, got := range map[string]string{"inventory": inv, "report": res} {

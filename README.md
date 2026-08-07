@@ -267,7 +267,7 @@ vexscan --rpm https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/Packages/o/
 vexscan --rpm ./repo/x86_64/ --format inventory
 ```
 
-The flag is repeatable and mutually exclusive with `--image`, `--rootfs`,
+The flag is repeatable and mutually exclusive with `--image`, `--image-file`, `--rootfs`,
 `--repo` and `--sbom`. A directory is walked for `*.rpm`, sorted, so a repeated scan queries
 in the same order. The report says `"mode": "rpm"`.
 

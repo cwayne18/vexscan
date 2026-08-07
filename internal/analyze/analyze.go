@@ -11,6 +11,7 @@ package analyze
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -59,7 +60,8 @@ const (
 
 // Options configure a run. Set exactly one of Image, RootFS or Repo.
 type Options struct {
-	Image string
+	Image  string
+	Images []string
 	// RootFS is a filesystem tree already on disk -- an unpacked image, a
 	// mounted volume, a machine's own /. It runs the image analyzers against a
 	// tree nobody extracted, so it skips the pull but also arrives without an
@@ -370,7 +372,7 @@ func Validate(opts Options) error {
 
 // Run dispatches to filesystem analysis -- an image or a rootfs -- or to
 // source-repo analysis.
-func Run(ctx context.Context, opts Options) (*Result, error) {
+func Run(ctx context.Context, opts Options) ([]*Result, error) {
 	if opts.Logf == nil {
 		opts.Logf = func(string, ...any) {}
 	}
@@ -382,9 +384,41 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		return nil, err
 	}
 	if opts.Repo != "" {
-		return runRepo(ctx, opts)
+		res, err := runRepo(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+		return []*Result{res}, nil
 	}
-	return runTree(ctx, opts)
+
+	if opts.mode() != "image" {
+		res, err := runTree(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+		return []*Result{res}, nil
+	}
+
+	// handling images
+	var (
+		results []*Result
+		errs    error
+	)
+	targets, err := opts.imageTargets()
+	if err != nil {
+		return nil, err
+	}
+	for _, target := range targets {
+		clone := opts
+		clone.Image = target
+		res, err := runTree(ctx, clone)
+		if err != nil {
+			errs = errors.Join(errs, err)
+			continue
+		}
+		results = append(results, res)
+	}
+	return results, errs
 }
 
 // checkTarget reports whether exactly one target was named.
@@ -394,8 +428,11 @@ func (o Options) checkTarget() error {
 		flag string
 		set  bool
 	}{
-		{"--image", o.Image != ""}, {"--rootfs", o.RootFS != ""},
-		{"--repo", o.Repo != ""}, {"--rpm", len(o.RPM) > 0},
+		{"--image", o.Image != ""},
+		{"--image-file", len(o.Images) > 0},
+		{"--rootfs", o.RootFS != ""},
+		{"--repo", o.Repo != ""},
+		{"--rpm", len(o.RPM) > 0},
 		{"--sbom", o.SBOM != ""},
 	} {
 		if t.set {
@@ -406,7 +443,7 @@ func (o Options) checkTarget() error {
 	case 1:
 		return nil
 	case 0:
-		return fmt.Errorf("one of --image, --rootfs, --repo, --rpm or --sbom is required")
+		return fmt.Errorf("one of --image, --image-file, --rootfs, --repo, --rpm or --sbom is required")
 	default:
 		return fmt.Errorf("set only one of %s", strings.Join(named, ", "))
 	}
@@ -525,6 +562,18 @@ func (o Options) mode() string {
 	default:
 		return "image"
 	}
+}
+
+// imageTargets converts the user-provided target value into a consistent
+// internal form used by runTree.
+func (o Options) imageTargets() ([]string, error) {
+	switch {
+	case o.Image != "":
+		return []string{o.Image}, nil
+	case len(o.Images) > 0:
+		return o.Images, nil
+	}
+	return nil, fmt.Errorf("unsupported image target type")
 }
 
 // openTree produces the tree the image analyzers run against, and a cleanup to

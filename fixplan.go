@@ -25,64 +25,66 @@ import (
 // would read as complete. The population is exactly the one the text summary's
 // remediation line counts -- affected, and not already answered by a published
 // VEX statement -- so the two never disagree.
-func renderFixPlan(res *analyze.Result, o renderOpts) string {
+func renderFixPlan(results []*analyze.Result, o renderOpts) string {
 	var b strings.Builder
-	writeHeader(&b, res, o.pal)
+	for _, res := range results {
+		writeHeader(&b, res, o.pal)
 
-	if len(res.Findings) == 0 {
-		writeNoFindings(&b, res)
-		return b.String()
-	}
+		if len(res.Findings) == 0 {
+			writeNoFindings(&b, res)
+			continue
+		}
 
-	// Same population as writeRemediation: affected, not already vexed. Split
-	// by whether a fix exists so the actionable rows lead and the rest are
-	// still accounted for.
-	var fixable, noFix []analyze.Finding
-	var s fixSummary
-	for _, f := range res.Findings {
-		if !f.Affected() {
-			if f.Status != analyze.StatusNotPresent && f.Status != analyze.StatusNotInPath {
-				s.undetermined++
+		// Same population as writeRemediation: affected, not already vexed. Split
+		// by whether a fix exists so the actionable rows lead and the rest are
+		// still accounted for.
+		var fixable, noFix []analyze.Finding
+		var s fixSummary
+		for _, f := range res.Findings {
+			if !f.Affected() {
+				if f.Status != analyze.StatusNotPresent && f.Status != analyze.StatusNotInPath {
+					s.undetermined++
+				}
+				continue
 			}
-			continue
+			if alreadyVexed(f) {
+				s.vexed++
+				continue
+			}
+			if f.FixedVersion != "" {
+				fixable = append(fixable, f)
+			} else {
+				noFix = append(noFix, f)
+			}
 		}
-		if alreadyVexed(f) {
-			s.vexed++
-			continue
-		}
-		if f.FixedVersion != "" {
-			fixable = append(fixable, f)
-		} else {
-			noFix = append(noFix, f)
-		}
-	}
 
-	plan := groupUpgrades(fixable, dpkgPlugins(res))
-	s.fixable, s.noFix = len(fixable), len(noFix)
-	s.upgrades, s.cleared = len(plan), uniqueAdvisories(fixable)
+		plan := groupUpgrades(fixable, dpkgPlugins(res))
+		s.fixable, s.noFix = len(fixable), len(noFix)
+		s.upgrades, s.cleared = len(plan), uniqueAdvisories(fixable)
 
-	writeFixSummary(&b, s)
-	if s.fixable+s.noFix == 0 {
-		return b.String()
-	}
-	b.WriteString("\n")
-
-	if len(plan) > 0 {
-		writeUpgradePlan(&b, plan, o.pal)
-	}
-	if len(noFix) > 0 {
-		writeNoFix(&b, noFix, o.pal)
-	}
-
-	// The footer is the fix plan's own, not renderText's. writeFooter repeats
-	// the main report's summary and its section index, which here would name
-	// AFFECTED and RULED OUT under a document whose only headings are UPGRADE
-	// and NO FIX YET -- an index of sections the reader cannot find. The
-	// caveats still repeat verbatim, because that promise is about the scan
-	// and not about the view.
-	if strings.Count(b.String(), "\n") > footerThreshold {
-		writeCaveats(&b, res, o.pal)
 		writeFixSummary(&b, s)
+		if s.fixable+s.noFix == 0 {
+			continue
+		}
+		b.WriteString("\n")
+
+		if len(plan) > 0 {
+			writeUpgradePlan(&b, plan, o.pal)
+		}
+		if len(noFix) > 0 {
+			writeNoFix(&b, noFix, o.pal)
+		}
+
+		// The footer is the fix plan's own, not renderText's. writeFooter repeats
+		// the main report's summary and its section index, which here would name
+		// AFFECTED and RULED OUT under a document whose only headings are UPGRADE
+		// and NO FIX YET -- an index of sections the reader cannot find. The
+		// caveats still repeat verbatim, because that promise is about the scan
+		// and not about the view.
+		if strings.Count(b.String(), "\n") > footerThreshold {
+			writeCaveats(&b, res, o.pal)
+			writeFixSummary(&b, s)
+		}
 	}
 	return b.String()
 }

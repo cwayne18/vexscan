@@ -17,11 +17,13 @@ import (
 // report renders a result from a bare list of findings.
 func report(t *testing.T, details bool, findings ...analyze.Finding) string {
 	t.Helper()
-	return renderText(&analyze.Result{
-		SchemaVersion: analyze.SchemaVersion,
-		Target:        "debian:12",
-		Mode:          "image",
-		Findings:      findings,
+	return renderText([]*analyze.Result{
+		{
+			SchemaVersion: analyze.SchemaVersion,
+			Target:        "debian:12",
+			Mode:          "image",
+			Findings:      findings,
+		},
 	}, renderOpts{details: details})
 }
 
@@ -165,7 +167,8 @@ func TestVerdictColumnOnlyAppearsWhenItSaysSomething(t *testing.T) {
 // simply the severity scale. A rating nobody published must not be dismissible
 // by scrolling past it.
 func TestUnknownSeveritySortsAboveMedium(t *testing.T) {
-	out := report(t, false,
+	out := report(
+		t, false,
 		analyze.Finding{CVE: "CVE-LOW", Package: "a", Status: analyze.StatusLinked, Severity: "LOW"},
 		analyze.Finding{CVE: "CVE-MED", Package: "b", Status: analyze.StatusLinked, Severity: "MEDIUM"},
 		analyze.Finding{CVE: "CVE-UNK", Package: "c", Status: analyze.StatusLinked, Severity: "UNKNOWN"},
@@ -186,7 +189,8 @@ func TestUnknownSeveritySortsAboveMedium(t *testing.T) {
 // render as UNKNOWN rather than as a blank cell that sorts to the bottom. This
 // is the Go repo-mode case.
 func TestAnUnratedFindingRendersAsUnknown(t *testing.T) {
-	out := report(t, false,
+	out := report(
+		t, false,
 		analyze.Finding{CVE: "CVE-MED", Package: "a", Status: analyze.StatusLinked, Severity: "MEDIUM"},
 		analyze.Finding{CVE: "CVE-NONE", Package: "b", Status: analyze.StatusLinked},
 	)
@@ -231,14 +235,16 @@ func TestAdvisoryIdIsShortenedOnlyWhenItIsACVE(t *testing.T) {
 // TestIncompleteBannersComeFirst: these are the "never silently report nothing"
 // guarantee, and no amount of table below them may push them out of sight.
 func TestIncompleteBannersComeFirst(t *testing.T) {
-	out := renderText(&analyze.Result{
-		SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
-		Ecosystems: []ecosystem.EcosystemResult{
-			{ID: "npm", Error: "could not read /usr/lib/node_modules"},
-		},
-		Unreadable: &target.Unreadable{Count: 12, Paths: []string{"/opt/vendor", "/srv/data"}},
-		Findings: []analyze.Finding{
-			{CVE: "CVE-1", Package: "a", Status: analyze.StatusLinked, Severity: "CRITICAL"},
+	out := renderText([]*analyze.Result{
+		{
+			SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
+			Ecosystems: []ecosystem.EcosystemResult{
+				{ID: "npm", Error: "could not read /usr/lib/node_modules"},
+			},
+			Unreadable: &target.Unreadable{Count: 12, Paths: []string{"/opt/vendor", "/srv/data"}},
+			Findings: []analyze.Finding{
+				{CVE: "CVE-1", Package: "a", Status: analyze.StatusLinked, Severity: "CRITICAL"},
+			},
 		},
 	}, renderOpts{})
 
@@ -271,9 +277,11 @@ func TestEmptyReportDistinguishesCleanFromIncomplete(t *testing.T) {
 		t.Errorf("a clean report claimed to be incomplete:\n%s", clean)
 	}
 
-	incomplete := renderText(&analyze.Result{
-		SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
-		Ecosystems: []ecosystem.EcosystemResult{{ID: "os", Error: "no package database"}},
+	incomplete := renderText([]*analyze.Result{
+		{
+			SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
+			Ecosystems: []ecosystem.EcosystemResult{{ID: "os", Error: "no package database"}},
+		},
 	}, renderOpts{})
 	if !strings.Contains(incomplete, "This is not a clean result.") {
 		t.Errorf("an incomplete empty report reads as clean:\n%s", incomplete)
@@ -611,17 +619,19 @@ func TestComponentWithNothingMatched(t *testing.T) {
 
 // The summary counts what a reader is deciding about: the affected rows.
 func TestSummaryCountsAffectedBySeverity(t *testing.T) {
-	out := renderText(&analyze.Result{
-		SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
-		Ecosystems: []ecosystem.EcosystemResult{
-			{ID: "os", Ecosystems: []string{"Debian:12"}, Components: 88},
-		},
-		Findings: []analyze.Finding{
-			{Ecosystem: "os", CVE: "CVE-1", Package: "a", Status: analyze.StatusLinked, Severity: "CRITICAL"},
-			{Ecosystem: "os", CVE: "CVE-2", Package: "b", Status: analyze.StatusLinked, Severity: "CRITICAL"},
-			{Ecosystem: "os", CVE: "CVE-3", Package: "c", Status: analyze.StatusLinked, Severity: "LOW"},
-			// Ruled out, so not part of what has to be acted on.
-			{Ecosystem: "os", CVE: "CVE-4", Package: "d", Status: analyze.StatusNotPresent, Severity: "CRITICAL"},
+	out := renderText([]*analyze.Result{
+		{
+			SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
+			Ecosystems: []ecosystem.EcosystemResult{
+				{ID: "os", Ecosystems: []string{"Debian:12"}, Components: 88},
+			},
+			Findings: []analyze.Finding{
+				{Ecosystem: "os", CVE: "CVE-1", Package: "a", Status: analyze.StatusLinked, Severity: "CRITICAL"},
+				{Ecosystem: "os", CVE: "CVE-2", Package: "b", Status: analyze.StatusLinked, Severity: "CRITICAL"},
+				{Ecosystem: "os", CVE: "CVE-3", Package: "c", Status: analyze.StatusLinked, Severity: "LOW"},
+				// Ruled out, so not part of what has to be acted on.
+				{Ecosystem: "os", CVE: "CVE-4", Package: "d", Status: analyze.StatusNotPresent, Severity: "CRITICAL"},
+			},
 		},
 	}, renderOpts{})
 
@@ -640,13 +650,15 @@ func TestSummaryCountsAffectedBySeverity(t *testing.T) {
 
 // A plugin whose ecosystem is just its own name is not worth saying twice.
 func TestSummaryDoesNotRepeatTheEcosystemName(t *testing.T) {
-	out := renderText(&analyze.Result{
-		SchemaVersion: analyze.SchemaVersion, Target: "node:22-slim", Mode: "image",
-		Ecosystems: []ecosystem.EcosystemResult{
-			{ID: "npm", Ecosystems: []string{"npm"}, Components: 186},
-		},
-		Findings: []analyze.Finding{
-			{Ecosystem: "npm", CVE: "CVE-1", Package: "a", Status: analyze.StatusLinked},
+	out := renderText([]*analyze.Result{
+		{
+			SchemaVersion: analyze.SchemaVersion, Target: "node:22-slim", Mode: "image",
+			Ecosystems: []ecosystem.EcosystemResult{
+				{ID: "npm", Ecosystems: []string{"npm"}, Components: 186},
+			},
+			Findings: []analyze.Finding{
+				{Ecosystem: "npm", CVE: "CVE-1", Package: "a", Status: analyze.StatusLinked},
+			},
 		},
 	}, renderOpts{})
 	if strings.Contains(out, "npm      npm") {
@@ -677,9 +689,11 @@ func vexedFinding(status string) analyze.Finding {
 
 func vexReport(t *testing.T, details bool, hubs []ecosystem.VEXHubResult, findings ...analyze.Finding) string {
 	t.Helper()
-	return renderText(&analyze.Result{
-		SchemaVersion: analyze.SchemaVersion, Target: "rancher/hardened-kubernetes:v1.30.1", Mode: "image",
-		Findings: findings, VEXHubs: hubs,
+	return renderText([]*analyze.Result{
+		{
+			SchemaVersion: analyze.SchemaVersion, Target: "rancher/hardened-kubernetes:v1.30.1", Mode: "image",
+			Findings: findings, VEXHubs: hubs,
+		},
 	}, renderOpts{details: details})
 }
 
@@ -838,9 +852,11 @@ func TestOnlyAffectedFindingsCanBeVexed(t *testing.T) {
 
 func filteredReport(t *testing.T, w *analyze.Withheld, findings ...analyze.Finding) string {
 	t.Helper()
-	return renderText(&analyze.Result{
-		SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
-		Findings: findings, Withheld: w,
+	return renderText([]*analyze.Result{
+		{
+			SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
+			Findings: findings, Withheld: w,
+		},
 	}, renderOpts{})
 }
 
@@ -894,12 +910,14 @@ func TestNoBannerWithoutTheFlag(t *testing.T) {
 // there is. Printing the ordinary "no findings" line would be a clean bill of
 // health for a scan that found twelve things.
 func TestFilteringEverythingIsNotACleanResult(t *testing.T) {
-	out := renderText(&analyze.Result{
-		SchemaVersion: analyze.SchemaVersion, Target: "github.com/cwayne18/vexscan", Mode: "repo",
-		Withheld: &analyze.Withheld{
-			Severities: []string{"HIGH", "CRITICAL"},
-			Count:      12,
-			BySeverity: map[string]int{"UNKNOWN": 12},
+	out := renderText([]*analyze.Result{
+		{
+			SchemaVersion: analyze.SchemaVersion, Target: "github.com/cwayne18/vexscan", Mode: "repo",
+			Withheld: &analyze.Withheld{
+				Severities: []string{"HIGH", "CRITICAL"},
+				Count:      12,
+				BySeverity: map[string]int{"UNKNOWN": 12},
+			},
 		},
 	}, renderOpts{})
 
@@ -923,8 +941,10 @@ func TestFilteringEverythingIsNotACleanResult(t *testing.T) {
 // A genuinely clean scan still reads as clean. The filter's wording only
 // applies when the filter is what emptied the report.
 func TestAnEmptyUnfilteredReportIsUnchanged(t *testing.T) {
-	out := renderText(&analyze.Result{
-		SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
+	out := renderText([]*analyze.Result{
+		{
+			SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
+		},
 	}, renderOpts{})
 	if !strings.Contains(out, "No findings: nothing selected was found") {
 		t.Errorf("want the plain empty wording, got:\n%s", out)
@@ -937,10 +957,12 @@ func TestAnEmptyUnfilteredReportIsUnchanged(t *testing.T) {
 // An incomplete scan outranks a filter: the reader needs to know the tool could
 // not read something before they are told what they chose to hide.
 func TestIncompletenessOutranksTheFilterWhenBothEmptyTheReport(t *testing.T) {
-	out := renderText(&analyze.Result{
-		SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
-		Ecosystems: []ecosystem.EcosystemResult{{ID: "os", Error: "dpkg status unreadable"}},
-		Withheld:   &analyze.Withheld{Severities: []string{"HIGH"}, Count: 3, BySeverity: map[string]int{"LOW": 3}},
+	out := renderText([]*analyze.Result{
+		{
+			SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
+			Ecosystems: []ecosystem.EcosystemResult{{ID: "os", Error: "dpkg status unreadable"}},
+			Withheld:   &analyze.Withheld{Severities: []string{"HIGH"}, Count: 3, BySeverity: map[string]int{"LOW": 3}},
+		},
 	}, renderOpts{})
 	if !strings.Contains(out, "This is not a clean result.") {
 		t.Errorf("want the incomplete-scan wording, got:\n%s", out)
@@ -984,15 +1006,17 @@ func longReport(t *testing.T, n int, mutate func(*analyze.Result)) string {
 			Severity: "HIGH",
 		})
 	}
-	res := &analyze.Result{
-		SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
-		Ecosystems: []ecosystem.EcosystemResult{
-			{ID: "os", Ecosystems: []string{"Debian:12"}, Components: 88},
+	res := []*analyze.Result{
+		{
+			SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
+			Ecosystems: []ecosystem.EcosystemResult{
+				{ID: "os", Ecosystems: []string{"Debian:12"}, Components: 88},
+			},
+			Findings: findings,
 		},
-		Findings: findings,
 	}
 	if mutate != nil {
-		mutate(res)
+		mutate(res[0])
 	}
 	return renderText(res, renderOpts{})
 }
@@ -1114,9 +1138,11 @@ func TestALongReportRepeatsTheVexHubNote(t *testing.T) {
 
 func correctedReport(t *testing.T, c *analyze.Corrections, findings ...analyze.Finding) string {
 	t.Helper()
-	return renderText(&analyze.Result{
-		SchemaVersion: analyze.SchemaVersion, Target: "rancher/rancher:v2.15.0", Mode: "image",
-		Findings: findings, Corrections: c,
+	return renderText([]*analyze.Result{
+		{
+			SchemaVersion: analyze.SchemaVersion, Target: "rancher/rancher:v2.15.0", Mode: "image",
+			Findings: findings, Corrections: c,
+		},
 	}, renderOpts{})
 }
 
@@ -1215,12 +1241,14 @@ func TestRenderingDoesNotDependOnTheEnvironment(t *testing.T) {
 // triaged renders a result with --triage evidence attached.
 func triaged(t *testing.T, tr *analyze.TriageResult, details bool, findings ...analyze.Finding) string {
 	t.Helper()
-	return renderText(&analyze.Result{
-		SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
-		Ecosystems: []ecosystem.EcosystemResult{
-			{ID: "os", Ecosystems: []string{"Debian:12"}, Components: 88},
+	return renderText([]*analyze.Result{
+		{
+			SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
+			Ecosystems: []ecosystem.EcosystemResult{
+				{ID: "os", Ecosystems: []string{"Debian:12"}, Components: 88},
+			},
+			Findings: findings, Triage: tr,
 		},
-		Findings: findings, Triage: tr,
 	}, renderOpts{details: details})
 }
 
@@ -1532,14 +1560,16 @@ func TestTheFixesLineDoesNotNeedTriage(t *testing.T) {
 // rpmReport renders a metadata-only result, the shape --rpm produces.
 func rpmReport(t *testing.T, tr *analyze.TriageResult, findings ...analyze.Finding) string {
 	t.Helper()
-	return renderText(&analyze.Result{
-		SchemaVersion: analyze.SchemaVersion,
-		Target:        "/tmp/libopenssl3-3.1.4-150600.2.19.x86_64.rpm",
-		Mode:          "rpm",
-		Ecosystems: []ecosystem.EcosystemResult{
-			{ID: "os", Ecosystems: []string{"SUSE"}, Components: 1},
+	return renderText([]*analyze.Result{
+		{
+			SchemaVersion: analyze.SchemaVersion,
+			Target:        "/tmp/libopenssl3-3.1.4-150600.2.19.x86_64.rpm",
+			Mode:          "rpm",
+			Ecosystems: []ecosystem.EcosystemResult{
+				{ID: "os", Ecosystems: []string{"SUSE"}, Components: 1},
+			},
+			Findings: findings, Triage: tr,
 		},
-		Findings: findings, Triage: tr,
 	}, renderOpts{})
 }
 
@@ -1624,14 +1654,16 @@ func TestTheGovulncheckCaveatIsAbsentWhenGovulncheckRan(t *testing.T) {
 // sbomReport renders the shape --sbom produces.
 func sbomReport(t *testing.T, findings ...analyze.Finding) string {
 	t.Helper()
-	return renderText(&analyze.Result{
-		SchemaVersion: analyze.SchemaVersion,
-		Target:        "bom.json",
-		Mode:          "sbom",
-		Ecosystems: []ecosystem.EcosystemResult{
-			{ID: "os", Ecosystems: []string{"Debian:12"}, Components: 1},
+	return renderText([]*analyze.Result{
+		{
+			SchemaVersion: analyze.SchemaVersion,
+			Target:        "bom.json",
+			Mode:          "sbom",
+			Ecosystems: []ecosystem.EcosystemResult{
+				{ID: "os", Ecosystems: []string{"Debian:12"}, Components: 1},
+			},
+			Findings: findings,
 		},
-		Findings: findings,
 	}, renderOpts{})
 }
 
@@ -1848,12 +1880,14 @@ func withDescriptor(t *testing.T, d *analyze.Descriptor, n int) string {
 			findings = append(findings, f)
 		}
 	}
-	return renderText(&analyze.Result{
-		SchemaVersion: analyze.SchemaVersion,
-		Target:        "debian:12",
-		Mode:          "image",
-		Findings:      findings,
-		Descriptor:    d,
+	return renderText([]*analyze.Result{
+		{
+			SchemaVersion: analyze.SchemaVersion,
+			Target:        "debian:12",
+			Mode:          "image",
+			Findings:      findings,
+			Descriptor:    d,
+		},
 	}, renderOpts{})
 }
 
@@ -1939,14 +1973,15 @@ func TestProvenanceOmitsWhatItDoesNotKnow(t *testing.T) {
 // distroReport renders a scan with one OS finding and the given feed outcomes.
 func distroReport(t *testing.T, feeds ...ecosystem.DistroFeedResult) string {
 	t.Helper()
-	return renderText(&analyze.Result{
+	return renderText([]*analyze.Result{
+		{
 		SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
 		Findings: []analyze.Finding{{
 			Ecosystem: "os", ID: "DEBIAN-CVE-2023-0464", CVE: "CVE-2023-0464",
 			Package: "openssl", Version: "3.0.11-1", Status: ecosystem.StatusLinked,
 		}},
 		DistroFeeds: feeds,
-	}, renderOpts{})
+	}}, renderOpts{})
 }
 
 // The failure mode this note exists for: --distro-feeds ran, joined nothing, and

@@ -4,10 +4,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -15,6 +18,7 @@ import (
 	"time"
 
 	"github.com/cwayne18/vexscan/internal/analyze"
+	"github.com/cwayne18/vexscan/internal/archive"
 	"github.com/cwayne18/vexscan/internal/buildinfo"
 	"github.com/cwayne18/vexscan/internal/cvss"
 	"github.com/cwayne18/vexscan/internal/distrofeed"
@@ -36,17 +40,18 @@ func main() {
 	flag.Var(&ecosystems, "ecosystem", "restrict the scan to these ecosystems (golang, os, pypi, npm, maven, or a distro family like debian); repeatable, default all")
 	flag.Var(&roots, "roots", "extra entrypoints for the reachability closures (shared libraries and language imports), for an image whose real command comes from outside its config; repeatable")
 	flag.Var(&rpms, "rpm", "rpm package file to scan without installing it -- a path, a directory of them, or a URL; repeatable "+
-		"(mutually exclusive with --image, --rootfs and --repo; reads only the header, so a URL costs kilobytes not megabytes)")
+		"(mutually exclusive with --image, --image-file, --rootfs and --repo; reads only the header, so a URL costs kilobytes not megabytes)")
 	flag.Var(&vexhubs, "vexhub", "VEX Hub repository to check findings against, e.g. https://github.com/rancher/vexhub (also accepts a raw base URL or a local directory); repeatable, earliest wins")
 	flag.Var(&severities, "severity", "only report findings at these severities: "+
 		strings.Join(cvss.Labels, ", ")+"; comma-separated or repeatable "+
 		"(UNKNOWN means no rating was published, and must be named to be shown -- "+
 		"every --repo finding is UNKNOWN, because govulncheck's OpenVEX carries no severity)")
 	var (
-		image  = flag.String("image", "", "container image reference to inspect (mutually exclusive with --rootfs and --repo)")
-		rootfs = flag.String("rootfs", "", "filesystem tree already on disk to inspect -- an unpacked image, a mounted volume, a machine's own / (mutually exclusive with --image and --repo)")
-		repo   = flag.String("repo", "", "git source repo to analyze via govulncheck source mode, e.g. github.com/rancher/rancher (mutually exclusive with --image and --rootfs)")
-		sbom   = flag.String("sbom", "", "CycloneDX JSON bill of materials to scan -- a path, or '-' for stdin "+
+		image     = flag.String("image", "", "container image reference to inspect (mutually exclusive with --image-file, --rootfs and --repo)")
+		imageFile = flag.String("image-file", "", "image file containing a list of images to scan -- a path or a URL (mutually exclusive with --image, --rootfs and --repo)")
+		rootfs    = flag.String("rootfs", "", "filesystem tree already on disk to inspect -- an unpacked image, a mounted volume, a machine's own / (mutually exclusive with --image, --image-file and --repo)")
+		repo      = flag.String("repo", "", "git source repo to analyze via govulncheck source mode, e.g. github.com/rancher/rancher (mutually exclusive with --image and --rootfs)")
+		sbom      = flag.String("sbom", "", "CycloneDX JSON bill of materials to scan -- a path, or '-' for stdin "+
 			"(mutually exclusive with the other targets; a component names a package and nothing else, so every finding is undetermined)")
 		ref        = flag.String("ref", "", "branch, tag, or commit to check out for --repo (default: repo default branch)")
 		repoPath   = flag.String("repo-path", ".", "module subdirectory within --repo to scan")
@@ -115,12 +120,12 @@ func main() {
 	// needs no subject and no advisory lookup.
 	inventoryMode := *format == "inventory"
 
-	named := countNamed(*image, *rootfs, *repo, *sbom)
+	named := countNamed(*image, *rootfs, *repo, *sbom, *imageFile)
 	if len(rpms) > 0 {
 		named++
 	}
 	if named != 1 {
-		fail("set exactly one of --image, --rootfs, --repo, --rpm or --sbom")
+		fail("set exactly one of --image, --image-file, --rootfs, --repo, --rpm or --sbom")
 	}
 	if *rpmDeep {
 		if len(rpms) == 0 {
@@ -208,9 +213,19 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	var images []string
+	if *imageFile != "" {
+		var err error
+		images, err = imageList(ctx, *imageFile, logf)
+		if err != nil {
+			fail("%v", err)
+		}
+	}
+
 	if inventoryMode {
 		runInventory(ctx, analyze.Options{
 			Image:        *image,
+			Images:       images,
 			RootFS:       *rootfs,
 			Repo:         *repo,
 			RPM:          rpms,
@@ -225,6 +240,7 @@ func main() {
 
 	opts := analyze.Options{
 		Image:              *image,
+		Images:             images,
 		RootFS:             *rootfs,
 		Repo:               *repo,
 		RPM:                rpms,
@@ -266,12 +282,20 @@ func main() {
 	// The command owns the clock; see analyze.Descriptor for why the package
 	// does not read one.
 	started := time.Now().UTC()
-	res, err := analyze.Run(ctx, opts)
+	results, err := analyze.Run(ctx, opts)
+	incomplete := false
 	if err != nil {
+		// print any errors to stderr but don't discard any partial results
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		if len(results) == 0 {
+			os.Exit(1)
+		}
+		incomplete = true
 	}
-	stampDescriptor(res, started, time.Since(started))
+
+	for _, res := range results {
+		stampDescriptor(res, started, time.Since(started))
+	}
 
 	// Resolved here and not in the writers, because the escapes have to be in
 	// the string before emit decides where it goes -- and where it goes is half
@@ -281,29 +305,29 @@ func main() {
 	var rendered string
 	switch *format {
 	case "json":
-		b, err := json.MarshalIndent(res, "", "  ")
+		b, err := json.MarshalIndent(results, "", "  ")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
 		rendered = string(b) + "\n"
 	case "sarif":
-		b, err := renderSARIF(res)
+		b, err := renderSARIF(results)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
 		rendered = b
 	case "fixplan":
-		rendered = renderFixPlan(res, renderOpts{pal: pal})
+		rendered = renderFixPlan(results, renderOpts{pal: pal})
 	default: // --format was validated up front; inventory returned earlier
-		rendered = renderText(res, renderOpts{details: *details, pal: pal})
+		rendered = renderText(results, renderOpts{details: *details, pal: pal})
 	}
 
 	emit(rendered, *out, *noPager, logf)
 
 	if *gistFlag {
-		url, err := uploadGist(ctx, res, rendered, *format, !*gistSecret)
+		url, err := uploadGist(ctx, results, rendered, *format, !*gistSecret)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: gist upload failed: %v\n", err)
 			os.Exit(1)
@@ -316,59 +340,67 @@ func main() {
 	// incomplete report is still worth having -- but it must never exit 0. A
 	// zero status on a scan that could not read a package database is how a
 	// broken CI job passes.
-	if res.Failed() {
-		for _, e := range res.Ecosystems {
-			if e.Error != "" {
-				fmt.Fprintf(os.Stderr, "error: ecosystem %s did not complete: %s\n", e.ID, e.Error)
+	var failed bool
+	for _, res := range results {
+		if res.Failed() {
+			failed = true
+			for _, e := range res.Ecosystems {
+				if e.Error != "" {
+					fmt.Fprintf(os.Stderr, "error: ecosystem %s did not complete: %s\n", e.ID, e.Error)
+				}
+			}
+			if u := res.Unreadable; u != nil && u.Any() {
+				fmt.Fprintf(os.Stderr, "error: %d path(s) in the target could not be read: %s\n",
+					u.Count, strings.Join(u.Paths, ", "))
+			}
+			// The scan losing an ecosystem outranks the gate, and the gate is not
+			// even consulted: a finding count from a partial scan is not a number
+			// worth deciding a build on, and a clean gate over it would be the
+			// scan's own hole reported as a pass.
+			if gate.on {
+				fmt.Fprintln(os.Stderr, "error: --fail-on was not evaluated, because the scan did not complete")
+			}
+			continue
+		}
+
+		// --vex-out only runs on a complete scan: an incomplete one might have
+		// missed the very component that would have kept a finding out of RULED OUT,
+		// and a not_affected statement written from a partial scan is exactly the
+		// kind of wrong this tool must never be. It runs before the gate because the
+		// gate decides a build's fate, which is unrelated to whether a hub should
+		// learn what was ruled out.
+		if *vexOut != "" {
+			if err := runVexOut(ctx, res, vexOutOptions{
+				dir:       *vexOut,
+				author:    *vexAuthor,
+				hubs:      vexhubs,
+				timestamp: started.UTC().Format(time.RFC3339),
+				logf:      logf,
+			}); err != nil {
+				fmt.Fprintf(os.Stderr, "error: vex-out: %v\n", err)
+				os.Exit(1)
 			}
 		}
-		if u := res.Unreadable; u != nil && u.Any() {
-			fmt.Fprintf(os.Stderr, "error: %d path(s) in the target could not be read: %s\n",
-				u.Count, strings.Join(u.Paths, ", "))
-		}
-		// The scan losing an ecosystem outranks the gate, and the gate is not
-		// even consulted: a finding count from a partial scan is not a number
-		// worth deciding a build on, and a clean gate over it would be the
-		// scan's own hole reported as a pass.
+
 		if gate.on {
-			fmt.Fprintln(os.Stderr, "error: --fail-on was not evaluated, because the scan did not complete")
+			g := gate.evaluate(res)
+			if g.unweighable > 0 {
+				// Not gated on --quiet. A gate that passed because it could not
+				// read a number has to say so whatever the logging setting, or the
+				// silence is indistinguishable from a clean result.
+				fmt.Fprintf(os.Stderr,
+					"note: %d counted finding(s) have no published severity and could not be weighed against %s.\n"+
+						"      Use --fail-on any to gate on their presence.\n", g.unweighable, gate.label)
+			}
+			if g.tripped > 0 {
+				fmt.Fprintln(os.Stderr, gate.describe(g))
+				os.Exit(exitGate)
+			}
 		}
+	}
+
+	if failed || incomplete {
 		os.Exit(1)
-	}
-
-	// --vex-out only runs on a complete scan: an incomplete one might have
-	// missed the very component that would have kept a finding out of RULED OUT,
-	// and a not_affected statement written from a partial scan is exactly the
-	// kind of wrong this tool must never be. It runs before the gate because the
-	// gate decides a build's fate, which is unrelated to whether a hub should
-	// learn what was ruled out.
-	if *vexOut != "" {
-		if err := runVexOut(ctx, res, vexOutOptions{
-			dir:       *vexOut,
-			author:    *vexAuthor,
-			hubs:      vexhubs,
-			timestamp: started.UTC().Format(time.RFC3339),
-			logf:      logf,
-		}); err != nil {
-			fmt.Fprintf(os.Stderr, "error: vex-out: %v\n", err)
-			os.Exit(1)
-		}
-	}
-
-	if gate.on {
-		g := gate.evaluate(res)
-		if g.unweighable > 0 {
-			// Not gated on --quiet. A gate that passed because it could not
-			// read a number has to say so whatever the logging setting, or the
-			// silence is indistinguishable from a clean result.
-			fmt.Fprintf(os.Stderr,
-				"note: %d counted finding(s) have no published severity and could not be weighed against %s.\n"+
-					"      Use --fail-on any to gate on their presence.\n", g.unweighable, gate.label)
-		}
-		if g.tripped > 0 {
-			fmt.Fprintln(os.Stderr, gate.describe(g))
-			os.Exit(exitGate)
-		}
 	}
 }
 
@@ -382,21 +414,21 @@ func main() {
 // empty pager setting, and whenever stdout is not a character device -- a pipe,
 // a redirect, a CI log. The bytes are identical in every case; the only
 // question here is whether less gets to hold them first.
-func emit(rendered, out string, noPager bool, logf func(string, ...any)) {
+func emit(rendered, out string, noPager bool, logf func(string, ...any)) error {
 	if out != "" {
 		if err := os.WriteFile(out, []byte(rendered), 0o644); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
+			return err
 		}
 		logf("Wrote %s", out)
-		return
+		return nil
 	}
 	// page reports false for every failure it can have, including a $PAGER
 	// naming something that is not installed, so the report is still printed.
 	if !noPager && stdoutIsTerminal() && page(rendered) {
-		return
+		return nil
 	}
 	fmt.Print(rendered)
+	return nil
 }
 
 // stampDescriptor fills in the half of the report's provenance that only the
@@ -461,18 +493,31 @@ func fail(format string, args ...any) {
 // runInventory handles --format inventory, which lists the target's OS packages
 // and exits without resolving a single advisory.
 func runInventory(ctx context.Context, opts analyze.Options, out string, noPager bool, logf func(string, ...any)) {
-	inv, err := analyze.Inventory(ctx, opts)
+	invs, err := analyze.Inventory(ctx, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	emit(renderInventory(inv), out, noPager, logf)
 
-	// Written first, then failed: an inventory with holes in it is still worth
-	// reading, and still not something a CI job should treat as the list.
-	if u := inv.Unreadable; u != nil && u.Any() {
-		fmt.Fprintf(os.Stderr, "error: %d path(s) could not be read: %s\n",
-			u.Count, strings.Join(u.Paths, ", "))
+	var failed bool
+	for _, inv := range invs {
+		if err := emit(renderInventory(inv), out, noPager, logf); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			failed = true
+			continue
+		}
+
+		// Written first, then failed: an inventory with holes in it is still worth
+		// reading, and still not something a CI job should treat as the list.
+		if u := inv.Unreadable; u != nil && u.Any() {
+			fmt.Fprintf(os.Stderr, "error: %d path(s) could not be read: %s\n",
+				u.Count, strings.Join(u.Paths, ", "))
+			failed = true
+			continue
+		}
+	}
+
+	if failed {
 		os.Exit(1)
 	}
 }
@@ -563,7 +608,7 @@ func renderInventory(inv *analyze.InventoryResult) string {
 }
 
 // uploadGist pushes the rendered report to a GitHub gist and returns its URL.
-func uploadGist(ctx context.Context, res *analyze.Result, rendered, format string, public bool) (string, error) {
+func uploadGist(ctx context.Context, results []*analyze.Result, rendered, format string, public bool) (string, error) {
 	client, err := gist.NewClient("")
 	if err != nil {
 		return "", err
@@ -575,9 +620,21 @@ func uploadGist(ctx context.Context, res *analyze.Result, rendered, format strin
 	case "sarif":
 		filename = "vexscan-report.sarif"
 	}
-	desc := fmt.Sprintf("vexscan %s report for %s", res.Mode, res.Target)
-	if res.Module != "" {
-		desc += fmt.Sprintf(" (module %s)", res.Module)
+
+	var (
+		mode, module string
+		targets      []string
+	)
+	for i, res := range results {
+		if i == 0 {
+			mode = res.Mode
+			module = res.Module
+		}
+		targets = append(targets, res.Target)
+	}
+	desc := fmt.Sprintf("vexscan %s report for %s", mode, strings.Join(targets, ", "))
+	if module != "" {
+		desc += fmt.Sprintf(" (module %s)", module)
 	}
 	return client.Create(ctx, filename, desc, rendered, public)
 }
@@ -788,4 +845,69 @@ Exit status:
 Flags:
 `)
 	flag.PrintDefaults()
+}
+
+// imageList returns a list of images to analyze, from the --image-file flag.
+// Lines starting with '#' are treated as comments and ignored. Empty lines are
+// also ignored.
+func imageList(ctx context.Context, imageFile string, logf func(string, ...any)) ([]string, error) {
+	normalize := func(buf *bytes.Buffer) ([]string, error) {
+		var imageList []string
+
+		decompressed, err := archive.EnsureDecompressed(buf)
+		if err != nil {
+			return nil, err
+		}
+
+		d, err := io.ReadAll(decompressed)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, image := range strings.Split(string(d), "\n") {
+			trimmed := strings.TrimSpace(image)
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+				continue // skip empty lines and comments
+			}
+			imageList = append(imageList, trimmed)
+		}
+
+		if len(imageList) == 0 {
+			return nil, fmt.Errorf("no images found in %s", imageFile)
+		}
+		return imageList, nil
+	}
+
+	logf("Fetching image list from %s", imageFile)
+	if isHTTPURL(imageFile) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, imageFile, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create http request for %s: %w", imageFile, err)
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed http get %s: %w", imageFile, err)
+		}
+		//nolint:errcheck
+		defer resp.Body.Close()
+
+		// any non-200 response is treated as error because the body won't have the image list.
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("failed http get %s: %s", imageFile, resp.Status)
+		}
+
+		buf := &bytes.Buffer{}
+		if _, err := buf.ReadFrom(resp.Body); err != nil {
+			return nil, fmt.Errorf("failed reading from http response body: %w", err)
+		}
+		return normalize(buf)
+	}
+
+	content, err := os.ReadFile(imageFile)
+	if err != nil {
+		return nil, fmt.Errorf("read file %s: %w", imageFile, err)
+	}
+	buf := bytes.NewBuffer(content)
+	return normalize(buf)
 }

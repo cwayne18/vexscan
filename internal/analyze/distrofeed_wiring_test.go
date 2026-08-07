@@ -141,7 +141,7 @@ func runWithFeed(t *testing.T, feeds ...distrofeed.Provider) *Result {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	return res
+	return res[0]
 }
 
 // The contract: a feed must be handed the CVE the advisory fixes, not only the

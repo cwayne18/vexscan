@@ -87,7 +87,7 @@ func (r *InventoryResult) LanguagePackages() int {
 // It deliberately does not require a subject: "what is in this tree" is a
 // question worth answering on its own, and it is the one output that can be
 // checked against `dpkg -l` or `rpm -qa` run inside the same tree.
-func Inventory(ctx context.Context, opts Options) (*InventoryResult, error) {
+func Inventory(ctx context.Context, opts Options) ([]*InventoryResult, error) {
 	if opts.Logf == nil {
 		opts.Logf = func(string, ...any) {}
 	}
@@ -104,69 +104,107 @@ func Inventory(ctx context.Context, opts Options) (*InventoryResult, error) {
 	// --rpm and --sbom have no tree, and opening the empty one would only lead
 	// every reader below to correctly report that it found nothing.
 	if len(opts.RPM) > 0 {
-		return rpmInventory(ctx, opts)
+		res, err := rpmInventory(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+		return []*InventoryResult{res}, nil
 	}
 	if opts.SBOM != "" {
-		return sbomInventory(opts)
+		res, err := sbomInventory(opts)
+		if err != nil {
+			return nil, err
+		}
+		return []*InventoryResult{res}, nil
 	}
 
-	img, cleanup, err := openTree(ctx, &opts)
+	processTree := func(opts Options) (*InventoryResult, error) {
+		img, cleanup, err := openTree(ctx, &opts)
+		if err != nil {
+			return nil, err
+		}
+		defer cleanup()
+
+		res := &InventoryResult{Target: img.Ref, Mode: opts.mode()}
+		res.OS = readOSInfo(img.FS, logf)
+
+		dbs, err := pkgdb.Read(img.FS)
+		if err != nil {
+			// A detected-but-unreadable database is fatal here. Printing the
+			// databases that did parse would render as a complete inventory of the
+			// image, and every package in the one that failed would look absent.
+			return nil, fmt.Errorf("reading package databases: %w", err)
+		}
+		res.Databases = dbs
+
+		if len(dbs) == 0 {
+			logf("  ! no dpkg, apk or rpm database found in %s", img.Ref)
+		}
+		for _, db := range dbs {
+			logf("  %s: %d packages from %s", db.Format, len(db.Packages), db.DB)
+		}
+
+		langs, err := langdb.Scan(img.FS)
+		if err != nil {
+			// Same reasoning as above: a site-packages directory that was found and
+			// could not be listed would render as an image with no Python in it.
+			return nil, fmt.Errorf("reading language packages: %w", err)
+		}
+		res.Languages = langs
+
+		for _, l := range langs {
+			logf("  %s: %d packages from %d %s", l.Format, len(l.Packages), len(l.Roots), rootWord(l.Format))
+			for _, m := range l.Unreadable {
+				// Not fatal, but never silent: a distribution whose manifest would
+				// not parse is one whose absence must not be asserted later.
+				logf("    ! unreadable manifest %s", m)
+			}
+			for _, m := range l.Unidentified {
+				logf("    ! archive declares no coordinates %s", m.Path)
+			}
+			for _, m := range l.Platform {
+				logf("    - runtime jar, not a queryable artifact: %s", m)
+			}
+		}
+
+		// Last, because it accumulates across both scans above.
+		if u := img.FS.Unreadable(); u.Any() {
+			res.Unreadable = &u
+			logf("  ! %d path(s) could not be read; this inventory does not account for them", u.Count)
+			for _, m := range u.Paths {
+				logf("    ! %s", m)
+			}
+		}
+		return res, nil
+	}
+
+	if opts.mode() != "image" {
+		ires, err := processTree(opts)
+		if err != nil {
+			return nil, err
+		}
+		return []*InventoryResult{ires}, nil
+	}
+
+	var (
+		results []*InventoryResult
+		errs    error
+	)
+	targets, err := opts.imageTargets()
 	if err != nil {
 		return nil, err
 	}
-	defer cleanup()
-
-	res := &InventoryResult{Target: img.Ref, Mode: opts.mode()}
-	res.OS = readOSInfo(img.FS, logf)
-
-	dbs, err := pkgdb.Read(img.FS)
-	if err != nil {
-		// A detected-but-unreadable database is fatal here. Printing the
-		// databases that did parse would render as a complete inventory of the
-		// image, and every package in the one that failed would look absent.
-		return nil, fmt.Errorf("reading package databases: %w", err)
-	}
-	res.Databases = dbs
-
-	if len(dbs) == 0 {
-		logf("  ! no dpkg, apk or rpm database found in %s", img.Ref)
-	}
-	for _, db := range dbs {
-		logf("  %s: %d packages from %s", db.Format, len(db.Packages), db.DB)
-	}
-
-	langs, err := langdb.Scan(img.FS)
-	if err != nil {
-		// Same reasoning as above: a site-packages directory that was found and
-		// could not be listed would render as an image with no Python in it.
-		return nil, fmt.Errorf("reading language packages: %w", err)
-	}
-	res.Languages = langs
-
-	for _, l := range langs {
-		logf("  %s: %d packages from %d %s", l.Format, len(l.Packages), len(l.Roots), rootWord(l.Format))
-		for _, m := range l.Unreadable {
-			// Not fatal, but never silent: a distribution whose manifest would
-			// not parse is one whose absence must not be asserted later.
-			logf("    ! unreadable manifest %s", m)
+	for _, target := range targets {
+		clone := opts
+		clone.Image = target
+		res, err := processTree(clone)
+		if err != nil {
+			errs = errors.Join(errs, fmt.Errorf("%s: %w", target, err))
+			continue
 		}
-		for _, m := range l.Unidentified {
-			logf("    ! archive declares no coordinates %s", m.Path)
-		}
-		for _, m := range l.Platform {
-			logf("    - runtime jar, not a queryable artifact: %s", m)
-		}
+		results = append(results, res)
 	}
-
-	// Last, because it accumulates across both scans above.
-	if u := img.FS.Unreadable(); u.Any() {
-		res.Unreadable = &u
-		logf("  ! %d path(s) could not be read; this inventory does not account for them", u.Count)
-		for _, m := range u.Paths {
-			logf("    ! %s", m)
-		}
-	}
-	return res, nil
+	return results, errs
 }
 
 // rpmInventory lists what --rpm resolved to, which is the cheapest way to

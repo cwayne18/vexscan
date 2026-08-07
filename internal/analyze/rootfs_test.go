@@ -142,10 +142,11 @@ func TestInventoryOfARootFSLeavesItOnDisk(t *testing.T) {
 		"/usr/lib/os-release-copy": "x",
 	})
 
-	inv, err := Inventory(context.Background(), Options{RootFS: root, Logf: discard})
+	invs, err := Inventory(context.Background(), Options{RootFS: root, Logf: discard})
 	if err != nil {
 		t.Fatalf("Inventory: %v", err)
 	}
+	inv := invs[0]
 	if inv.Mode != "rootfs" {
 		t.Errorf("Mode = %q, want rootfs", inv.Mode)
 	}
@@ -185,10 +186,11 @@ func TestInventoryReportsWhatItCouldNotEnter(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(closed, 0o755) })
 
-	inv, err := Inventory(context.Background(), Options{RootFS: root, Logf: discard})
+	invs, err := Inventory(context.Background(), Options{RootFS: root, Logf: discard})
 	if err != nil {
 		t.Fatalf("Inventory: %v", err)
 	}
+	inv := invs[0]
 	// Not fatal: the databases that did read are still worth printing. But the
 	// document has to say it is missing an unknown number of entries, because
 	// a site-packages directory nobody listed reports no packages, exactly as

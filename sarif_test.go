@@ -11,12 +11,14 @@ import (
 // parseSARIF renders a result to SARIF and decodes it, failing on invalid JSON.
 func parseSARIF(t *testing.T, findings ...analyze.Finding) map[string]any {
 	t.Helper()
-	res := &analyze.Result{
-		SchemaVersion: analyze.SchemaVersion,
-		Target:        "debian:12",
-		Mode:          "image",
-		Findings:      findings,
-		Descriptor:    &analyze.Descriptor{Version: "v9.9.9"},
+	res := []*analyze.Result{
+		{
+			SchemaVersion: analyze.SchemaVersion,
+			Target:        "debian:12",
+			Mode:          "image",
+			Findings:      findings,
+			Descriptor:    &analyze.Descriptor{Version: "v9.9.9"},
+		},
 	}
 	out, err := renderSARIF(res)
 	if err != nil {

@@ -19,12 +19,14 @@ func fixplan(t *testing.T, ecosystems map[string][]string, findings ...analyze.F
 	for id, names := range ecosystems {
 		ecos = append(ecos, ecosystem.EcosystemResult{ID: id, Ecosystems: names, Components: 1})
 	}
-	return renderFixPlan(&analyze.Result{
-		SchemaVersion: analyze.SchemaVersion,
-		Target:        "debian:12",
-		Mode:          "image",
-		Ecosystems:    ecos,
-		Findings:      findings,
+	return renderFixPlan([]*analyze.Result{
+		{
+			SchemaVersion: analyze.SchemaVersion,
+			Target:        "debian:12",
+			Mode:          "image",
+			Ecosystems:    ecos,
+			Findings:      findings,
+		},
 	}, renderOpts{})
 }
 
@@ -159,13 +161,15 @@ func TestTheFixPlanFooterRepeatsTheCaveats(t *testing.T) {
 			fmt.Sprintf("CVE-2023-%04d", i), fmt.Sprintf("pkg%02d", i),
 			"1.0-1", "1.0-2", "HIGH"))
 	}
-	out := renderFixPlan(&analyze.Result{
-		SchemaVersion: analyze.SchemaVersion,
-		Target:        "debian:12",
-		Mode:          "image",
-		Ecosystems:    []ecosystem.EcosystemResult{{ID: "os", Ecosystems: []string{"Debian:12"}, Components: 1}},
-		Findings:      findings,
-		Unreadable:    &target.Unreadable{Count: 3, Paths: []string{"/var/lib/private"}},
+	out := renderFixPlan([]*analyze.Result{
+		{
+			SchemaVersion: analyze.SchemaVersion,
+			Target:        "debian:12",
+			Mode:          "image",
+			Ecosystems:    []ecosystem.EcosystemResult{{ID: "os", Ecosystems: []string{"Debian:12"}, Components: 1}},
+			Findings:      findings,
+			Unreadable:    &target.Unreadable{Count: 3, Paths: []string{"/var/lib/private"}},
+		},
 	}, renderOpts{})
 	if n := strings.Count(out, "INCOMPLETE: 3 path(s) could not be read"); n != 2 {
 		t.Errorf("want the INCOMPLETE banner at both ends, got %d:\n%s", n, out)

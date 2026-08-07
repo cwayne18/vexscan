@@ -99,40 +99,45 @@ type sarifArtifact struct {
 }
 
 // renderSARIF turns a scan result into a SARIF 2.1.0 document.
-func renderSARIF(res *analyze.Result) (string, error) {
-	var version string
-	if res.Descriptor != nil {
-		version = res.Descriptor.Version
-	}
-
-	// One rule per advisory id, in first-seen order so the document is stable.
-	ruleIndex := map[string]int{}
-	var rules []sarifRule
-	var results []sarifResult
-
-	for _, f := range res.Findings {
-		id := ruleID(f)
-		idx, ok := ruleIndex[id]
-		if !ok {
-			idx = len(rules)
-			ruleIndex[id] = idx
-			rules = append(rules, ruleFor(f, id))
+func renderSARIF(r []*analyze.Result) (string, error) {
+	var (
+		version   string
+		sarifRuns []sarifRun
+	)
+	for _, res := range r {
+		if res.Descriptor != nil {
+			version = res.Descriptor.Version
 		}
-		results = append(results, resultFor(f, id, idx))
+
+		// One rule per advisory id, in first-seen order so the document is stable.
+		ruleIndex := map[string]int{}
+		var rules []sarifRule
+		var results []sarifResult
+
+		for _, f := range res.Findings {
+			id := ruleID(f)
+			idx, ok := ruleIndex[id]
+			if !ok {
+				idx = len(rules)
+				ruleIndex[id] = idx
+				rules = append(rules, ruleFor(f, id))
+			}
+			results = append(results, resultFor(f, id, idx))
+		}
+
+		sarifRuns = append(sarifRuns, sarifRun{
+			Tool: sarifTool{Driver: sarifDriver{
+				Name:           "vexscan",
+				Version:        version,
+				InformationURI: sarifInfoURI,
+				Rules:          rules,
+			}},
+			Results: results,
+			Props:   runProperties(res),
+		})
 	}
 
-	run := sarifRun{
-		Tool: sarifTool{Driver: sarifDriver{
-			Name:           "vexscan",
-			Version:        version,
-			InformationURI: sarifInfoURI,
-			Rules:          rules,
-		}},
-		Results: results,
-		Props:   runProperties(res),
-	}
-	doc := sarifLog{Schema: sarifSchema, Version: sarifVersion, Runs: []sarifRun{run}}
-
+	doc := sarifLog{Schema: sarifSchema, Version: sarifVersion, Runs: sarifRuns}
 	b, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("sarif: %w", err)

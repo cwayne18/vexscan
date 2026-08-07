@@ -1,6 +1,9 @@
 package main
 
-import "strings"
+import (
+	"net/url"
+	"strings"
+)
 
 // stringList is a repeatable flag that also accepts a comma-separated value,
 // so `--package a --package b` and `--package a,b` mean the same thing.
@@ -15,4 +18,9 @@ func (l *stringList) Set(v string) error {
 		}
 	}
 	return nil
+}
+
+func isHTTPURL(path string) bool {
+	u, err := url.Parse(path)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
 }

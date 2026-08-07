@@ -185,10 +185,11 @@ func TestOpenSBOMTreeIsAnEmptyTree(t *testing.T) {
 func TestSBOMInventoryShowsTheQueriedNames(t *testing.T) {
 	opts := Options{SBOM: writeBill(t, mixedBill), Logf: func(string, ...any) {}}
 
-	inv, err := Inventory(context.Background(), opts)
+	invs, err := Inventory(context.Background(), opts)
 	if err != nil {
 		t.Fatalf("Inventory: %v", err)
 	}
+	inv := invs[0]
 	if inv.Mode != "sbom" || inv.Target != opts.SBOM {
 		t.Errorf("inventory = %s/%s, want sbom/%s", inv.Mode, inv.Target, opts.SBOM)
 	}
@@ -231,10 +232,11 @@ func TestSBOMInventoryWithNoOSPackages(t *testing.T) {
 	}`
 	opts := Options{SBOM: writeBill(t, langOnly), Logf: func(string, ...any) {}}
 
-	inv, err := Inventory(context.Background(), opts)
+	invs, err := Inventory(context.Background(), opts)
 	if err != nil {
 		t.Fatalf("Inventory: %v", err)
 	}
+	inv := invs[0]
 	if inv.OS != nil {
 		t.Errorf("os = %+v, want nothing said about a distribution that was never named", inv.OS)
 	}

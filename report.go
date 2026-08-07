@@ -45,25 +45,27 @@ type renderOpts struct {
 }
 
 // renderText renders a scan result for humans.
-func renderText(res *analyze.Result, o renderOpts) string {
+func renderText(results []*analyze.Result, o renderOpts) string {
 	var b strings.Builder
-	writeHeader(&b, res, o.pal)
+	for _, res := range results {
+		writeHeader(&b, res, o.pal)
 
-	if len(res.Findings) == 0 {
-		writeNoFindings(&b, res)
-		return b.String()
-	}
+		if len(res.Findings) == 0 {
+			writeNoFindings(&b, res)
+			continue
+		}
 
-	writeSummary(&b, res, false)
-	for _, s := range sections(res) {
-		writeSection(&b, s, o)
-	}
+		writeSummary(&b, res, false)
+		for _, s := range sections(res) {
+			writeSection(&b, s, o)
+		}
 
-	// Long enough that the header is gone: say it all again. Measured on the
-	// report rather than on the terminal, so a file, a gist and a paged
-	// terminal all get the same bytes.
-	if strings.Count(b.String(), "\n") > footerThreshold {
-		writeFooter(&b, res, o.pal)
+		// Long enough that the header is gone: say it all again. Measured on the
+		// report rather than on the terminal, so a file, a gist and a paged
+		// terminal all get the same bytes.
+		if strings.Count(b.String(), "\n") > footerThreshold {
+			writeFooter(&b, res, o.pal)
+		}
 	}
 	return b.String()
 }

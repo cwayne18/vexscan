@@ -42,7 +42,7 @@ func TestFalseNegativeCorpus_Hermetic(t *testing.T) {
 			srv := corpusOSV(t, tc.advisories)
 			root := writeTree(t, tc.tree)
 
-			res, err := Run(context.Background(), Options{
+			results, err := Run(context.Background(), Options{
 				RootFS:     root,
 				All:        true,
 				Ecosystems: tc.ecosystems,
@@ -53,6 +53,7 @@ func TestFalseNegativeCorpus_Hermetic(t *testing.T) {
 				t.Fatalf("Run: %v", err)
 			}
 
+			res := results[0]
 			matched := 0
 			for _, f := range res.Findings {
 				if f.CVE != tc.cve {
@@ -192,7 +193,7 @@ func TestFalseNegativeCorpus_Live(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			res, err := Run(context.Background(), Options{
+			results, err := Run(context.Background(), Options{
 				Image:      tc.image,
 				All:        true,
 				Ecosystems: []string{tc.ecosystem},
@@ -201,6 +202,7 @@ func TestFalseNegativeCorpus_Live(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Run(%s): %v", tc.image, err)
 			}
+			res := results[0]
 			matched := 0
 			for _, f := range res.Findings {
 				if f.CVE != tc.cve {
