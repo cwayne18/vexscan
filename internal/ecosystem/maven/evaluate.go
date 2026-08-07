@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/cwayne18/vexscan/internal/ecosystem"
+	"github.com/cwayne18/vexscan/internal/langdb"
 )
 
 // Methods name the deterministic test behind a status, and appear in the
@@ -124,11 +125,21 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 
 // absent decides a component the user named that no archive declares.
 func (e evaluator) absent(f ecosystem.Finding, c ecosystem.Component) ecosystem.Finding {
-	// An archive that would not open and an archive that names nothing are the
-	// same obstacle: "no archive here is X" is not a claim this scan is
-	// entitled to make while one of them is on the disk, because the one it
-	// could not identify could be X.
-	if blocked := append(append([]string(nil), e.st.unreadable...), e.st.unidentified...); len(blocked) > 0 {
+	// An archive that would not open and an archive that could be the artifact
+	// asked about are the same obstacle: "no archive here is X" is not a claim
+	// this scan is entitled to make while one of them is on the disk. An
+	// unreadable archive is opaque and always counts; an unidentified one counts
+	// whenever it carries code, since without a package-to-artifact database it
+	// cannot be ruled out as a stripped or shaded copy of X. Only a codeless
+	// archive no longer stands in the way of an answer it cannot be the subject
+	// of.
+	blocked := append([]string(nil), e.st.unreadable...)
+	for _, u := range e.st.unidentified {
+		if couldBe(u) {
+			blocked = append(blocked, u.Path)
+		}
+	}
+	if len(blocked) > 0 {
 		f.Status = ecosystem.StatusUndetermined
 		f.Reason = "unidentified_archive"
 		f.Evidence = []ecosystem.Evidence{{
@@ -147,6 +158,24 @@ func (e evaluator) absent(f ecosystem.Finding, c ecosystem.Component) ecosystem.
 		Detail: fmt.Sprintf("no jar, war or ear in this image declares %s", c.Name),
 	}}
 	return f
+}
+
+// couldBe reports whether an unidentified archive could be the artifact whose
+// absence is being decided, and so must keep blocking that claim.
+//
+// The conclusion only ever narrows toward "yes, it could", so a false clean
+// cannot slip through. Without a package-to-artifact database, any archive that
+// carries compiled classes could be a coordinate-stripped or shaded copy of the
+// artifact: an archive's own class packages cannot rule it out, because an
+// artifact's classes routinely do not live under its groupId path (Guava's
+// com.google.guava ships com/google/common, MongoDB's org.mongodb:bson ships
+// org/bson) and a shaded uber-jar carries many artifacts' classes under a file
+// name that names none of them. The one archive that can be ruled out is a
+// codeless one -- a resources, sources or javadoc jar with no class at all --
+// since it cannot hold any artifact's vulnerable class. Everything else blocks:
+// over-reporting an undetermined here is safe, a wrongly cleared absence is not.
+func couldBe(u langdb.UnidentifiedArchive) bool {
+	return u.HasClasses
 }
 
 // coordinateTaint records that this artifact's identity was reconstructed

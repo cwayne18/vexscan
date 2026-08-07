@@ -301,8 +301,12 @@ func TestUnnameableAndUnreadableArchivesAreReported(t *testing.T) {
 		"/opt/lib/broken.jar": "not a zip at all",
 	})
 
-	if want := []string{"/opt/lib/plugin.jar"}; !reflect.DeepEqual(res.Unidentified, want) {
-		t.Errorf("Unidentified = %v, want %v", res.Unidentified, want)
+	if len(res.Unidentified) != 1 || res.Unidentified[0].Path != "/opt/lib/plugin.jar" {
+		t.Errorf("Unidentified = %v, want one entry for /opt/lib/plugin.jar", res.Unidentified)
+	}
+	if u := res.Unidentified[0]; !u.HasClasses ||
+		!reflect.DeepEqual(u.ClassPackages, []string{"org/example/plugin"}) {
+		t.Errorf("partial identity not captured: %+v", u)
 	}
 	if want := []string{"/opt/lib/broken.jar"}; !reflect.DeepEqual(res.Unreadable, want) {
 		t.Errorf("Unreadable = %v, want %v", res.Unreadable, want)
@@ -312,8 +316,65 @@ func TestUnnameableAndUnreadableArchivesAreReported(t *testing.T) {
 	}
 }
 
-// A jar of sources or javadoc ships no executable code at all, which is a
-// not_present conclusion the plugin can reach without any advisory detail.
+// The Java runtime's own jars carry no coordinates and never will. Naming them
+// keeps a JDK base image from drowning every absence claim in unidentified
+// archives, so they land in Platform rather than Unidentified.
+func TestPlatformRuntimeJarsAreNamedNotUnidentified(t *testing.T) {
+	res := readMaven(t, map[string]string{
+		// The runtime, by well-known name, wherever it sits.
+		"/usr/lib/jvm/java-8/jre/lib/rt.jar": jarBytes(t, map[string]string{
+			"java/lang/Object.class": "\xca\xfe\xba\xbe",
+		}),
+		"/usr/lib/jvm/java-8/jre/lib/ext/sunjce_provider.jar": jarBytes(t, map[string]string{
+			"com/sun/crypto/provider/SunJCE.class": "\xca\xfe\xba\xbe",
+		}),
+		// A project jar that merely happens to be codeless, left alone.
+		"/opt/lib/mystery.jar": jarBytes(t, map[string]string{
+			"a/B.class": "",
+		}),
+	})
+
+	want := []string{
+		"/usr/lib/jvm/java-8/jre/lib/ext/sunjce_provider.jar",
+		"/usr/lib/jvm/java-8/jre/lib/rt.jar",
+	}
+	if !reflect.DeepEqual(res.Platform, want) {
+		t.Errorf("Platform = %v, want %v", res.Platform, want)
+	}
+	if len(res.Unidentified) != 1 || res.Unidentified[0].Path != "/opt/lib/mystery.jar" {
+		t.Errorf("Unidentified = %v, want only /opt/lib/mystery.jar", res.Unidentified)
+	}
+}
+
+// An unidentified archive keeps the partial identity that could still be read:
+// the artifactId from its file name and the packages its classes declare. That
+// is what lets a later absence test ask whether this archive could be the
+// artifact in question rather than refusing every answer.
+func TestUnidentifiedArchiveKeepsPartialIdentity(t *testing.T) {
+	res := readMaven(t, map[string]string{
+		// spring-aop's classes span two unrelated roots, so no coordinate can
+		// be offered -- but the file name and the packages survive.
+		"/opt/lib/spring-aop-6.1.14.jar": jarBytes(t, map[string]string{
+			"org/springframework/aop/Advisor.class": "\xca\xfe\xba\xbe",
+			"org/aopalliance/aop/Advice.class":      "\xca\xfe\xba\xbe",
+		}),
+	})
+
+	if len(res.Unidentified) != 1 {
+		t.Fatalf("Unidentified = %v, want one entry", res.Unidentified)
+	}
+	u := res.Unidentified[0]
+	if u.FileArtifact != "spring-aop" {
+		t.Errorf("FileArtifact = %q, want spring-aop", u.FileArtifact)
+	}
+	if !u.HasClasses {
+		t.Errorf("HasClasses = false, want true")
+	}
+	want := []string{"org/aopalliance/aop", "org/springframework/aop"}
+	if !reflect.DeepEqual(u.ClassPackages, want) {
+		t.Errorf("ClassPackages = %v, want %v", u.ClassPackages, want)
+	}
+}
 func TestArchiveWithNoClasses(t *testing.T) {
 	res := readMaven(t, map[string]string{
 		"/opt/lib/thing-1.0-sources.jar": jarBytes(t, map[string]string{

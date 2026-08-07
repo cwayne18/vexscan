@@ -1935,3 +1935,57 @@ func TestProvenanceOmitsWhatItDoesNotKnow(t *testing.T) {
 		t.Errorf("an unanswered advisory source was still dated: %q", line)
 	}
 }
+
+// distroReport renders a scan with one OS finding and the given feed outcomes.
+func distroReport(t *testing.T, feeds ...ecosystem.DistroFeedResult) string {
+	t.Helper()
+	return renderText(&analyze.Result{
+		SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
+		Findings: []analyze.Finding{{
+			Ecosystem: "os", ID: "DEBIAN-CVE-2023-0464", CVE: "CVE-2023-0464",
+			Package: "openssl", Version: "3.0.11-1", Status: ecosystem.StatusLinked,
+		}},
+		DistroFeeds: feeds,
+	}, renderOpts{})
+}
+
+// The failure mode this note exists for: --distro-feeds ran, joined nothing, and
+// printed a report identical to one where the vendor was consulted and had
+// nothing to say. A whole release shipped that way. Matched == 0 is the only
+// signal that separates the two, so the report has to carry it.
+func TestReportSaysWhenADistroFeedMatchedNothing(t *testing.T) {
+	out := distroReport(t, ecosystem.DistroFeedResult{Name: "Debian Security Tracker"})
+
+	if !strings.Contains(out, "matched none of the OS findings") {
+		t.Errorf("a feed that joined nothing was reported as if it had run normally:\n%s", out)
+	}
+	if !strings.Contains(out, "Debian Security Tracker") {
+		t.Errorf("the note does not name the feed:\n%s", out)
+	}
+}
+
+// The honest quiet case, and the reason the note keys on Matched and not
+// Cleared: on debian:12 the tracker matches every OS finding and clears none of
+// them, because every one of them really is open. That is a working feed and
+// must print no note at all, or the note is noise and gets ignored.
+func TestReportIsSilentWhenADistroFeedMatchedButClearedNothing(t *testing.T) {
+	out := distroReport(t, ecosystem.DistroFeedResult{Name: "Debian Security Tracker", Matched: 1})
+
+	if strings.Contains(out, "matched none of the OS findings") {
+		t.Errorf("a feed that joined fine was reported as broken:\n%s", out)
+	}
+}
+
+// An unreadable feed already had its own note; it must not also collect the
+// matched-nothing one, which would say the same thing twice and blame the join
+// for what was a fetch failure.
+func TestReportDoesNotDoubleReportAnUnreadableDistroFeed(t *testing.T) {
+	out := distroReport(t, ecosystem.DistroFeedResult{Name: "SUSE CSAF-VEX", Error: "connection refused"})
+
+	if !strings.Contains(out, "could not be read") {
+		t.Errorf("the fetch failure is not reported:\n%s", out)
+	}
+	if strings.Contains(out, "matched none of the OS findings") {
+		t.Errorf("an unreadable feed also drew the matched-nothing note:\n%s", out)
+	}
+}

@@ -3,6 +3,7 @@ package analyze
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -629,5 +630,51 @@ func TestStampLeavesLocationUnsetWhenThereIsNoBinary(t *testing.T) {
 	}
 	if strings.Contains(string(b), `"location"`) {
 		t.Errorf("location should be omitted, got %s", b)
+	}
+}
+
+// The guard is wired into the pipeline as a slice pass: a false clean that
+// reaches it is corrected in place and the correction is logged, so the fail-on
+// gate and every overlay downstream see the real status.
+func TestGuardCleanStatusesCorrectsInPlaceAndLogs(t *testing.T) {
+	findings := []Finding{
+		// Legitimate clean, must survive untouched.
+		{Module: "a", CVE: "CVE-1", Status: ecosystem.StatusNotPresent, Method: "pclntab"},
+		// False clean: a not_present carrying a blocking taint. Must become linked.
+		{Module: "b", CVE: "CVE-2", Status: ecosystem.StatusNotPresent, Method: "elf-needed-closure",
+			Evidence: []ecosystem.Evidence{{Origin: "elf-needed-closure", Detail: "static-elf", Blocking: true}}},
+		// False clean: no provenance at all. Must become undetermined.
+		{Module: "c", CVE: "CVE-3", Status: ecosystem.StatusNotInPath},
+	}
+
+	var logs []string
+	guardCleanStatuses(findings, func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) })
+
+	if findings[0].Status != ecosystem.StatusNotPresent {
+		t.Errorf("legitimate clean was altered: %s", findings[0].Status)
+	}
+	if findings[1].Status != ecosystem.StatusLinked {
+		t.Errorf("tainted clean = %s, want linked", findings[1].Status)
+	}
+	if findings[2].Status != ecosystem.StatusUndetermined {
+		t.Errorf("unproven clean = %s, want undetermined", findings[2].Status)
+	}
+	if len(logs) != 2 {
+		t.Fatalf("want 2 correction log lines, got %d: %v", len(logs), logs)
+	}
+	for _, l := range logs {
+		if !strings.Contains(l, "false-clean guard") {
+			t.Errorf("log line does not name the guard: %q", l)
+		}
+	}
+}
+
+// A nil logger must not panic: the guard has to run in code paths that pass no
+// logf just as much as in the ones that do.
+func TestGuardCleanStatusesToleratesNilLogger(t *testing.T) {
+	findings := []Finding{{Module: "c", CVE: "CVE-3", Status: ecosystem.StatusNotInPath}}
+	guardCleanStatuses(findings, nil)
+	if findings[0].Status != ecosystem.StatusUndetermined {
+		t.Errorf("status = %s, want undetermined", findings[0].Status)
 	}
 }

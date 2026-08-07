@@ -63,7 +63,10 @@ func (r *Maven) Read(fsys target.RootFS, roots []string) (Result, error) {
 
 	sortPackages(res.Packages)
 	sort.Strings(res.Unreadable)
-	sort.Strings(res.Unidentified)
+	sort.Strings(res.Platform)
+	sort.Slice(res.Unidentified, func(i, j int) bool {
+		return res.Unidentified[i].Path < res.Unidentified[j].Path
+	})
 	return res, nil
 }
 
@@ -71,7 +74,22 @@ func (r *Maven) Read(fsys target.RootFS, roots []string) (Result, error) {
 func (r *Maven) collect(a *archive, db string, res *Result) {
 	pkgs := readCoords(a)
 	if len(pkgs) == 0 {
-		res.Unidentified = append(res.Unidentified, a.Path)
+		// The Java runtime's own jars carry no coordinates and never will:
+		// rt.jar is not a Maven artifact and no scan is asked about it. Naming
+		// them by convention keeps a JDK base image -- where they are the great
+		// majority of the unnamed archives -- from blocking every absence claim.
+		if isPlatformArchive(a.Path) {
+			res.Platform = append(res.Platform, a.Path)
+			return
+		}
+		classes := a.Classes()
+		artifact, _ := splitArchiveName(a.Path)
+		res.Unidentified = append(res.Unidentified, UnidentifiedArchive{
+			Path:          a.Path,
+			FileArtifact:  artifact,
+			ClassPackages: classPackages(classes),
+			HasClasses:    len(classes) > 0,
+		})
 		return
 	}
 
@@ -378,6 +396,69 @@ func classPrefixes(classes []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// classPackages are the distinct package directories the archive's classes live
+// under, slash-separated and at full depth ("org/springframework/aop").
+//
+// Unlike classPrefixes, which stops at two segments for a human-readable
+// summary, this keeps the whole package path, because an absence test compares
+// it against an artifact's group path: an archive that ships no class under
+// org/apache/logging/log4j cannot be log4j-core, however it was named.
+func classPackages(classes []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, c := range classes {
+		dir := path.Dir(stripMultiRelease(c))
+		if dir == "" || dir == "." {
+			continue
+		}
+		if !seen[dir] {
+			seen[dir] = true
+			out = append(out, dir)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// platformArchives are the base names of the JRE/JDK internal jars.
+//
+// The list is deliberately restricted to names that are unambiguously the Java
+// runtime and could never be a third-party Maven artifact. The generic ones a
+// JDK also ships -- tools.jar, resources.jar, plugin.jar -- are left out, so a
+// project's own jar of the same name is never mistaken for the platform and
+// wrongly cleared.
+var platformArchives = map[string]bool{
+	"rt.jar":               true,
+	"charsets.jar":         true,
+	"cldrdata.jar":         true,
+	"dnsns.jar":            true,
+	"jaccess.jar":          true,
+	"jce.jar":              true,
+	"jfr.jar":              true,
+	"jfxrt.jar":            true,
+	"jrt-fs.jar":           true,
+	"jsse.jar":             true,
+	"localedata.jar":       true,
+	"management-agent.jar": true,
+	"nashorn.jar":          true,
+	"sa-jdi.jar":           true,
+	"sunec.jar":            true,
+	"sunjce_provider.jar":  true,
+	"sunmscapi.jar":        true,
+	"sunpkcs11.jar":        true,
+	"zipfs.jar":            true,
+}
+
+// isPlatformArchive reports whether a path names a JRE/JDK runtime jar. The
+// match is on the base name so it holds for a nested spelling too.
+func isPlatformArchive(p string) bool {
+	base := path.Base(p)
+	if i := strings.LastIndex(base, "!/"); i >= 0 {
+		base = base[i+2:]
+	}
+	return platformArchives[strings.ToLower(base)]
 }
 
 // stripMultiRelease removes the META-INF/versions/N/ prefix from a versioned

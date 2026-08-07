@@ -211,6 +211,23 @@ func (g *Graph) markRoots(opts Options) {
 		return
 	}
 
+	// Peel the transparent exec wrappers -- tini, gosu, env and the like --
+	// that stand between the config and the program that actually runs. Each
+	// one execs a specific later argv token and loads no application code of
+	// its own, so resolving through it reaches a real entrypoint that can root a
+	// precise closure, where treating the wrapper as a shell would escalate to
+	// rooting everything. A wrapper whose grammar cannot be parsed with
+	// certainty is left in place, and the shell check below escalates as before.
+	argv = g.peelWrappers(opts, argv)
+	if len(argv) == 0 {
+		g.taints = append(g.taints, Taint{
+			Kind:   TaintNoEntrypoint,
+			Detail: "the entrypoint is an exec wrapper that forwards to no command, so what runs is unknown; name it with --roots",
+		})
+		g.escalate(opts, "wrapper names no command")
+		return
+	}
+
 	argv0 := argv[0]
 	base := path.Base(argv0)
 	if shells[base] || strings.HasSuffix(base, ".sh") {
@@ -241,6 +258,126 @@ func (g *Graph) markRoots(opts Options) {
 
 	// Later argv elements are arguments, not programs -- except for the common
 	// wrapper shapes, which the shell check above already caught.
+}
+
+// wrapperRule parses one exec wrapper's argument grammar and returns the argv it
+// forwards to. ok is false when the grammar carries something this parser does
+// not understand with certainty -- an option that might take an argument, a
+// missing command -- in which case the caller leaves the wrapper in place and
+// the closure escalates rather than risk rooting the wrong token.
+type wrapperRule func(argv []string) (inner []string, ok bool)
+
+// execWrappers are the argv-forwarding programs that stand in front of a real
+// entrypoint. Each execs a specific later token and runs no application code of
+// its own, so peeling it reaches the program whose reachability actually
+// matters. Shells and process supervisors are deliberately absent: they run
+// arbitrary or multiple programs and must still escalate.
+var execWrappers = map[string]wrapperRule{
+	"tini":        tiniRule,
+	"tini-static": tiniRule,
+	"dumb-init":   tiniRule,
+	"catatonit":   tiniRule,
+	"gosu":        gosuRule,
+	"su-exec":     gosuRule,
+	"env":         envRule,
+}
+
+// peelWrappers resolves through the transparent exec wrappers in front of the
+// entrypoint, rooting each one it recognizes so the wrapper's own dependencies
+// stay reachable, and returns the argv of the program that actually runs.
+//
+// A wrapper it cannot parse with certainty is returned unpeeled: the wrapper's
+// base name is also in shells, so the caller's shell check escalates, which is
+// the safe outcome. Each peel consumes at least the wrapper token, so the loop
+// terminates.
+func (g *Graph) peelWrappers(opts Options, argv []string) []string {
+	for len(argv) > 0 {
+		base := path.Base(argv[0])
+		rule, ok := execWrappers[base]
+		if !ok {
+			return argv
+		}
+		inner, ok := rule(argv)
+		if !ok {
+			return argv
+		}
+		if p, ok := g.lookupCommand(opts, argv[0]); ok {
+			g.addRoot(p, "exec wrapper: "+base, RootExplicit)
+		}
+		argv = inner
+	}
+	return argv
+}
+
+// tiniRule parses the init shims tini, dumb-init and catatonit: options, then an
+// optional "--" separator, then the command. With a separator everything after
+// it is the command; without one, the tail is the command only when it carries
+// no option tokens, because an option that consumes an argument (tini's
+// "-p SIGNAL") would otherwise make the first non-dash token look like the
+// program when it is the option's value.
+func tiniRule(argv []string) ([]string, bool) {
+	rest := argv[1:]
+	for i, t := range rest {
+		if t == "--" {
+			return rest[i+1:], true
+		}
+	}
+	for _, t := range rest {
+		if strings.HasPrefix(t, "-") {
+			return nil, false
+		}
+	}
+	return rest, true
+}
+
+// gosuRule parses gosu and su-exec, which take a user spec and then the command:
+// "gosu postgres postgres". Neither has options, so a leading dash is unexpected
+// and bails to escalation.
+func gosuRule(argv []string) ([]string, bool) {
+	if len(argv) < 3 || strings.HasPrefix(argv[1], "-") {
+		return nil, false
+	}
+	return argv[2:], true
+}
+
+// envRule parses env: option flags and NAME=value assignments, then the command.
+// Only the flags whose argument shape is certain are stepped over; anything else
+// that begins with a dash -- notably -S/--split-string, which re-parses a single
+// string into arguments -- bails to escalation rather than guess where the
+// command begins.
+func envRule(argv []string) ([]string, bool) {
+	i := 1
+	for i < len(argv) {
+		t := argv[i]
+		switch {
+		case t == "--":
+			i++
+			if i >= len(argv) {
+				return nil, false
+			}
+			return argv[i:], true
+		case t == "-", t == "-i", t == "--ignore-environment", t == "-0", t == "--null":
+			i++
+		case t == "-u", t == "--unset", t == "-C", t == "--chdir":
+			i += 2
+		case strings.HasPrefix(t, "-"):
+			return nil, false
+		case isAssignment(t):
+			i++
+		default:
+			return argv[i:], true
+		}
+	}
+	return nil, false
+}
+
+// isAssignment reports whether a token is a NAME=value environment assignment
+// rather than a command. The "=" has to come before any "/" so a path that
+// contains one -- "a=b/c" is an assignment, "/opt/a=b" is a program -- is not
+// mistaken for a variable.
+func isAssignment(t string) bool {
+	eq := strings.Index(t, "=")
+	return eq > 0 && !strings.Contains(t[:eq], "/")
 }
 
 // escalate roots every program in the image. This is what an unknown

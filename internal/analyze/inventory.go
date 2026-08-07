@@ -50,6 +50,10 @@ type OSInfo struct {
 	ID         string `json:"id,omitempty"`
 	VersionID  string `json:"version_id,omitempty"`
 	PrettyName string `json:"pretty_name,omitempty"`
+	// CPEName is the CPE_NAME field, e.g. "cpe:/o:suse:sles:15:sp5". It is the
+	// precise product key a CSAF security feed joins on, where a distro's own
+	// name for the release is exact and unambiguous in a way VERSION_ID is not.
+	CPEName string `json:"cpe_name,omitempty"`
 
 	// Ecosystem is the OSV ecosystem string, or empty with EcosystemError set.
 	Ecosystem      string `json:"ecosystem,omitempty"`
@@ -147,7 +151,10 @@ func Inventory(ctx context.Context, opts Options) (*InventoryResult, error) {
 			logf("    ! unreadable manifest %s", m)
 		}
 		for _, m := range l.Unidentified {
-			logf("    ! archive declares no coordinates %s", m)
+			logf("    ! archive declares no coordinates %s", m.Path)
+		}
+		for _, m := range l.Platform {
+			logf("    - runtime jar, not a queryable artifact: %s", m)
 		}
 	}
 
@@ -302,7 +309,7 @@ func readOSInfo(fsys target.RootFS, logf func(string, ...any)) *OSInfo {
 		return nil
 	}
 
-	info := &OSInfo{ID: rel.ID, VersionID: rel.VersionID, PrettyName: rel.PrettyName}
+	info := &OSInfo{ID: rel.ID, VersionID: rel.VersionID, PrettyName: rel.PrettyName, CPEName: rel.CPEName}
 	eco, err := rel.Ecosystem()
 	if err != nil {
 		info.EcosystemError = err.Error()

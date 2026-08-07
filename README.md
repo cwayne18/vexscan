@@ -553,6 +553,19 @@ are always roots.
 | a validated mined symbol is defined by nothing the package installs | `not_present` | `vulnerable_code_not_present` | `elf-dynsym-absent` |
 | reachable, or anything blocking | `linked` | *(none — treat as affected)* | `elf-needed-closure` |
 
+#### Transparent exec wrappers
+
+Before the entrypoint is judged a shell, transparent exec wrappers are peeled:
+`tini`, `dumb-init`, `catatonit` (and their `--` separators), `gosu` / `su-exec`,
+and `env` with its assignments and known flags. Each execs a specific later argv
+token and loads no application code of its own, so peeling reaches the real
+program and roots that instead of escalating — most of what runs Java and Node in
+production sits behind one of these. Peeling only advances past a layer whose
+argument grammar is parsed with certainty: `env -S`, `tini` with a bare option
+and no `--`, or `gosu` with no command are left in place and fall back to the
+`shell-entrypoint` escalation below. That fail-closed default is what keeps the
+narrowing from ever hiding live code.
+
 #### Taints
 
 A taint never sets a status. It *blocks* the closure from concluding
@@ -564,7 +577,7 @@ could not answer rather than answering wrongly.
 | `unresolved-needed` | a `DT_NEEDED` that resolved to nothing | scoped to that soname |
 | `dlopen` | a reachable ELF references `dlopen`/`dlmopen` | global, unless `--dlopen-policy=assume-none` |
 | `static-elf` | a reachable ELF has no `PT_INTERP`/`.dynamic` | blocks all C-library conclusions |
-| `shell-entrypoint` | argv[0] is a shell or init shim (`sh`, `busybox`, `tini`, `s6-*`) | every ELF in the standard bin dirs becomes a root |
+| `shell-entrypoint` | argv[0] is a shell or init shim (`sh`, `busybox`, `s6-*`), or a transparent wrapper (`tini`, `gosu`, `env`) used in a form its parser cannot read | every ELF in the standard bin dirs becomes a root |
 | `no-entrypoint` | the image config has neither Entrypoint nor Cmd — or there is no config at all, as in `--rootfs` mode | same escalation |
 
 `--roots /path/to/bin` adds entrypoints for an image whose real command comes
@@ -703,7 +716,7 @@ under** — the finding carries evidence saying the coordinates were reconstruct
 | Situation | Status | Justification | Method |
 |---|---|---|---|
 | no archive in the image declares the artifact | `not_present` | `component_not_present` | `jar-inventory` |
-| …but some archive could not be read or declares no coordinates | `undetermined` | — | reason `unidentified_archive` |
+| …but an archive that could be it was unreadable or unidentified | `undetermined` | — | reason `unidentified_archive` |
 | the archive holds no `.class` entry at all (sources, javadoc, resources jar) | `not_present` | `vulnerable_code_not_present` | `jar-no-code` |
 | a validated mined class is absent under every package spelling | `not_present` | `vulnerable_code_not_present` | `jar-class-absent` |
 | the archive is present but its listing could not be read | `linked` + blocking evidence | — | `jar-inventory` |
@@ -840,25 +853,36 @@ plugin is an inventory. With it, the numbers below are still dominated by
 | `ghcr.io/christophetd/log4shell-vulnerable-app --ecosystem maven` | 23 (+nested) | 27 | 24 | 0 / 0 / 79 |
 | `eclipse-temurin:21-jre --ecosystem maven` | 0 | 0 | 0 | plugin does not apply |
 
-Read the unidentified column, because it is the one that bites:
+Read the unidentified column, because it used to be the one that bit. An
+archive that declares no coordinates still cannot be named, but it no longer
+blocks every absence answer wholesale: an unidentified archive stops a
+`component_not_present` verdict only for an artifact it *could* be, and a jar
+that is positively something else, or that ships no code at all, is no longer in
+the way.
 
-- **A JRE image's own jars dominate it, and they should.** On the Log4Shell demo
-  image (JDK 8) 21 of the 24 are `rt.jar`, `charsets.jar`, `jre/lib/ext/*.jar`
-  and the security policy jars. Those are not Maven artifacts and have no
-  coordinates to find. But **an unidentified archive blocks `component_not_present`
-  for anything the scan is asked about and does not find** — the archive that
-  could not be named could be the one being asked about. So on a JDK 8 base
-  image, "that artifact is not here" is an answer this tool will not give.
-  Modern JREs are modular (`eclipse-temurin:21-jre` has no jars at all), which
-  is why that row is empty rather than noisy.
-- **`tomcat:10-jre21` leaves 13**, of which 10 are the `tomcat-i18n-*.jar`
-  resource bundles: they ship no classes, so tier 4 has no package prefix to
-  work from. The remainder are `jrt-fs.jar` and a sample war.
-- **A jar whose classes span two unrelated package roots falls out of tier 4.**
-  `spring-aop` bundles `org.aopalliance` alongside `org.springframework.aop`, so
-  the shared prefix is `org` and no coordinate is offered. That is 4 of 127 on
-  Jenkins and 1 of 27 on the demo image. Refusing beats guessing here, but it is
-  a gap, not a design win.
+- **A JRE image's own jars are recognized as the runtime.** On the Log4Shell demo
+  image (JDK 8) 21 of the 24 unnamed archives are `rt.jar`, `charsets.jar`,
+  `jre/lib/ext/*.jar` and the like. Those are not Maven artifacts and never will
+  be, so they are matched by name and set aside as platform jars rather than
+  counted as blockers — they cannot be the third-party artifact a scan is asked
+  about. On a JDK 8 base image, "that artifact is not here" is now an answer this
+  tool will give. Modern JREs are modular (`eclipse-temurin:21-jre` has no jars
+  at all), which is why that row is empty rather than noisy. The name list is
+  deliberately narrow: a project's own `tools.jar` or `plugin.jar` is left alone
+  so it is never mistaken for the platform and wrongly cleared.
+- **`tomcat:10-jre21`'s resource bundles no longer block.** Of the 13 it leaves,
+  10 are the `tomcat-i18n-*.jar` bundles: they ship no classes, so tier 4 has no
+  package prefix to work from — but a codeless archive cannot hold anyone's
+  vulnerable class, so it can no longer stand in the way of an absence answer.
+- **A jar whose classes span two unrelated package roots still falls out of tier
+  4**, and that is correct: `spring-aop` bundles `org.aopalliance` alongside
+  `org.springframework.aop`, so the shared prefix is `org` and no coordinate is
+  offered. It stays unidentified — but the partial identity that *can* be read,
+  the artifactId from its file name and the packages its classes declare, is now
+  kept, so it only blocks an artifact it could actually be. `spring-aop` no
+  longer blocks a question about `log4j-core`. What still blocks is the case that
+  should: an unidentified jar that ships classes under the asked-about group's
+  own package, which could be a repackaged copy carrying it under another name.
 
 **Shading is handled for the class test and not for the inventory.**
 `maven-shade-plugin` relocates `org.apache.commons.X` to
@@ -1666,6 +1690,106 @@ examined, while an unreachable hub only leaves rows in `AFFECTED` that a vendor
 had already answered. The first under-reports, which is the way this tool must
 never be wrong; the second over-reports, which is merely tiring.
 
+### Distribution security feeds (`--distro-feeds`)
+
+A VEX hub is a vendor publishing statements about *their own images*. A
+distribution publishes the same kind of judgement about *its packages*, in its
+own security feed, and `--distro-feeds` reads it the same way — as a second
+opinion that can move a row out of `AFFECTED`, never as a verdict that rewrites a
+`status`.
+
+The question it answers is the one the reachability closure cannot: whether the
+distribution built the vulnerable code into the package at all. Debian routinely
+marks a CVE not-affected for a source package because the flaw is in a code path
+they do not compile, or fixed it in a point release whose version an upstream OSV
+range does not know about. Both are false positives that a version match — and
+vexscan's own OSV lookup — still flags.
+
+```sh
+vexscan --image debian:12 --all --distro-feeds
+```
+
+Today this reads the [Debian security
+tracker](https://security-tracker.debian.org/tracker/) for Debian images
+(`ID=debian`) and SUSE's CSAF-VEX feed for the SUSE Linux Enterprise family
+including BCI (`ID=sles` and kin — see below); Ubuntu, Alpine and Red Hat track
+security in separate databases and will be separate feeds. Two verdicts, and only
+two, move a row:
+
+- **not-affected** — the tracker's `fixed_version: "0"` for the image's release,
+  meaning Debian's build never contained the flaw.
+- **already fixed** — a `resolved` advisory whose fix landed at or below the
+  installed version, compared with Debian's own version rules
+  (`internal/debver`). A fix *newer* than what is installed leaves the finding
+  standing.
+
+Everything else — an `open` advisory, an `undetermined` release, a `nodsa` note
+(Debian is affected but will not issue an update), or a release the image's
+`VERSION_ID` cannot be mapped to a codename — clears nothing. When the release
+cannot be named the feed declines rather than guess, because a verdict read off
+the wrong release is exactly the kind of wrong answer this tool must not produce.
+
+**It never rewrites `status`,** exactly like `--vexhub`, and it runs *after* it,
+so an explicit `--vexhub` statement always outranks the automatic feed. A cleared
+row moves to `ALREADY VEXED`, carries `Evidence{Origin: "distro-feed"}`, and
+keeps the local verdict it had. An unreachable feed prints a `NOTE:` and does not
+fail the run, for the same reason an unreachable hub does not: it can only leave a
+false positive sitting in `AFFECTED`, never invent a clean.
+
+The tracker's bulk JSON is large, so the feed is streamed and filtered to the
+handful of source packages the scan actually asked about rather than held in
+memory whole. If the download is truncated or malformed the whole feed is
+rejected — a short read never partially clears findings. It is off by default
+because it is a network fetch; `--distro-feeds` turns it on.
+
+**Known limitation: package provenance.** The feed is keyed by the image's
+`VERSION_ID` (e.g. Debian 12 → bookworm), so a verdict is read from that
+release's column. A package installed from `bookworm-backports`, `testing`, or a
+third-party repository is a different build than the one the tracker describes,
+so its not-affected or fixed verdict may not apply. This is the same trust model
+`--vexhub` already uses — and the same assumption the base OS scan makes, since
+the OSV lookup keys off the release too — and because a distro feed never
+rewrites `status`, a wrong verdict can only misfile a row into `ALREADY VEXED`
+for triage, never publish it as clean. A strict publication path keys off
+`status`, not the vexed bucket.
+
+#### SUSE / BCI (CSAF-VEX)
+
+The SUSE Linux Enterprise family — including the SLE BCI base images the RKE2 and
+K3s hardened builds sit on — is covered by a second provider that reads [SUSE's
+CSAF-VEX feed](https://ftp.suse.com/pub/projects/security/csaf-vex/). It handles
+`ID=sles`, `sled`, `sles_sap`, `sle_hpc`, `sle-micro` and `sle-micro-rt`.
+(openSUSE Leap and Tumbleweed track separately and are left to a future provider
+rather than answered for with enterprise verdicts.)
+
+SUSE publishes **one CSAF document per CVE** at a stable URL, so unlike Debian's
+one bulk file this provider fetches exactly the advisories the scan found — the
+CVE ids on the findings — and nothing else. A `404` means SUSE has no record for
+that CVE, which is a silent decline, not a failure.
+
+The join key is **CPE**, read from the image's own `os-release` `CPE_NAME`
+(a BCI base image reports `cpe:/o:suse:sles:15:sp5`). A CSAF document names dozens
+of products — Server, Desktop, HPC, the SLE modules, SUSE Micro, several service
+packs — whose verdicts differ, and the image's exact CPE selects the one product
+whose column applies. This is what keeps a Desktop not-affected off a Server
+image. When `os-release` carries no CPE, or the document names no product with
+it, the provider declines rather than guess — the same fail-closed rule the
+Debian feed uses for an unmappable release. Should one CPE name several products
+with conflicting verdicts, an `affected` product wins over a `not-affected` one.
+
+The same two verdicts move a row: **not-affected** (SUSE did not build the
+vulnerable code into that binary package) and **already fixed** (a `recommended`
+update whose version the installed one has reached, compared with rpm's own
+version rules in `internal/rpmver`). A fix *newer* than what is installed, or a
+package SUSE lists as plain `known_affected`, leaves the finding standing.
+Matching is by **binary** package name only — never the source — because one SUSE
+source builds several binaries with opposite verdicts (`libopenssl1_1`
+not-affected while `libopenssl1_0_0` is affected by the same CVE), so matching a
+source name against a binary list would clear the wrong package. Installed rpm
+versions always carry an epoch the CSAF fix omits; the comparison fails closed on
+that mismatch so a non-zero epoch can never clear a package whose version is below
+the fix.
+
 ### Contributing ruled-out findings back (`--vex-out`)
 
 `--vexhub` *reads* a hub. `--vex-out` *writes* the other direction: it turns
@@ -1749,6 +1873,7 @@ The JSON is `schema_version: 2`:
   "ecosystems": [ { "id": "os", "components": 65, "error": "" } ],
   "unreadable": { "count": 3, "paths": ["/opt/vendor"] },  // omitted when nothing was skipped
   "vex_hubs": [ { "url": "...", "author": "...", "products": 1082, "matched": 3 } ],  // only with --vexhub
+  "distro_feeds": [ { "name": "Debian Security Tracker", "matched": 4, "cleared": 4 } ],  // only with --distro-feeds
   "triage": {  // only with --triage
     "epss_date": "2026-08-04", "kev_date": "2026.08.04",  // the feeds' own dates, not today's
     "epss_stale": true, "kev_stale": true,   // a cached copy was used; omitted when false
@@ -1938,6 +2063,7 @@ Three properties are deliberate:
 | `--osv-ecosystem` | *(auto)* | Override the OSV ecosystem derived from os-release, from the `VENDOR`/`DISTRIBUTION` headers under `--rpm`, or from the `distro=` purl qualifier under `--sbom`, e.g. `Debian:12` |
 | `--roots` | | Extra entrypoints for the closures — shared libraries and language imports; repeatable |
 | `--vexhub` | | VEX Repository to check findings against, e.g. `https://github.com/rancher/vexhub` (also a raw base URL or a local directory); repeatable, earliest wins — see [VEX hubs](#vex-hubs---vexhub) |
+| `--distro-feeds` | off | Clear OS-package false positives with the distribution's own security feed: a vendor not-affected or an already-shipped fix moves a row to `ALREADY VEXED`, and like `--vexhub` never changes a `status`. Debian's security tracker and SUSE's CSAF-VEX today; network — see [Distribution security feeds](#distribution-security-feeds---distro-feeds) |
 | `--vex-out` | | Write OpenVEX `not_affected` documents for the findings ruled out into this directory, laid out as a VEX hub; with `--vexhub` they are merged into what that hub publishes, so it can be a clone of it — see [Contributing ruled-out findings back](#contributing-ruled-out-findings-back---vex-out) |
 | `--vex-author` | | With `--vex-out`, the OpenVEX `author` to record on the statements — **required**, and an error without `--vex-out` |
 | `--severity` | *(all)* | Only report findings at these severities: `CRITICAL`, `HIGH`, `UNKNOWN`, `MEDIUM`, `LOW`, `NONE`; comma-separated or repeatable. `UNKNOWN` must be named to be shown — see [Filtering by severity](#filtering-by-severity---severity) |

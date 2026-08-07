@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/cwayne18/vexscan/internal/cvss"
+	"github.com/cwayne18/vexscan/internal/distrofeed"
 	"github.com/cwayne18/vexscan/internal/ecosystem"
 	"github.com/cwayne18/vexscan/internal/ecosystem/golang"
 	"github.com/cwayne18/vexscan/internal/ecosystem/maven"
@@ -166,6 +167,14 @@ type Options struct {
 	// not the same knob as Ecosystems, which chooses which plugins run.
 	OSVEcosystem string
 
+	// OSVBaseURL overrides the OSV API root every advisory lookup is made
+	// against. Empty means the public api.osv.dev. It exists so a scan can be
+	// pointed at a mirror or an offline copy of the database -- the delivery
+	// direction a vendor maintaining its own advisory feed would take -- and so
+	// the corpus tests can drive a whole scan against a served set of
+	// advisories without the network.
+	OSVBaseURL string
+
 	// VEXHubs are VEX Hub repositories to check findings against (--vexhub),
 	// in priority order: the first hub with a statement about a finding wins,
 	// so an internal hub listed ahead of a vendor's overrides it.
@@ -184,6 +193,17 @@ type Options struct {
 	// present here, which is the only question this tool answers; what it
 	// changes is which of the answers a reader looks at first.
 	Triage *triage.Loader
+
+	// DistroFeeds are the distribution security feeds to check OS-package
+	// findings against (--distro-feeds), empty to skip them. They are concrete
+	// providers rather than a bool so a test can inject one pointed at a served
+	// fixture, and so the caller decides which distributions to consult.
+	//
+	// Like VEXHubs and Triage they never change a finding's status: a feed is a
+	// vendor's published second opinion, recorded as evidence, that can move a
+	// row out of AFFECTED for the reader but never invent a clean the local
+	// analysis did not reach.
+	DistroFeeds []distrofeed.Provider
 
 	// GoVersion optionally pins the Go toolchain for repo-mode analysis
 	// (e.g. "1.24.0"). Mainly useful with --module stdlib, whose findings depend
@@ -248,6 +268,11 @@ type Result struct {
 	// not be read. It is not part of Failed(): see vexOverlay for why a hub
 	// failure is not the same kind of incompleteness as an ecosystem failure.
 	VEXHubs []ecosystem.VEXHubResult `json:"vex_hubs,omitempty"`
+
+	// DistroFeeds records what each --distro-feeds source contributed, and like
+	// VEXHubs is not part of Failed(): a feed that could not clear a false
+	// positive only leaves a row in AFFECTED, never invents a clean.
+	DistroFeeds []ecosystem.DistroFeedResult `json:"distro_feeds,omitempty"`
 
 	// Withheld is what --severity removed from Findings, and is nil when the
 	// flag was not used or hid nothing. See severityFilter: a filtered result
@@ -696,7 +721,7 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	run := &imageRun{
 		subjects: subjects,
 		targeted: targeted(subjects),
-		resolver: newResolver(),
+		resolver: newResolver(opts.OSVBaseURL),
 		mine:     newMiner(opts, llmClient),
 		cves:     opts.CVEs,
 		logf:     logf,
@@ -740,6 +765,7 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	result.Unreadable = noteRPMFailures(result.Unreadable, rpms, logf)
 	result.Unreadable = noteSBOMFailures(result.Unreadable, bom, logf)
 
+	guardCleanStatuses(result.Findings, logf)
 	severityOverlay(result.Findings, run.resolver.severities())
 	// Filtering here, rather than in the renderer, is what keeps every count
 	// downstream honest: the LLM is never billed for a row nobody will read,
@@ -754,6 +780,15 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	upstreamOverlay(result.Findings, sets.Upstream)
 	fixedOverlay(result.Findings, run.resolver.fixedVersions())
 	result.VEXHubs = vexOverlay(ctx, opts.VEXHubs, result.Findings, run.resolver.aliases(), logf)
+	if len(opts.DistroFeeds) > 0 {
+		// After vexOverlay so a user's --vexhub outranks an automatic feed, and
+		// read from the tree the plugins already walked. The os-release read is
+		// cheap and only happens when a feed was actually requested.
+		//
+		// sets.All, not aliases(): a distro feed joins on CVE, and a distro
+		// advisory in OSV names its CVEs only in upstream. See distroOverlay.
+		result.DistroFeeds = distroOverlay(ctx, opts.DistroFeeds, readOSInfo(img.FS, logf), result.Findings, sets.All, logf)
+	}
 	result.Triage = triageOverlay(ctx, opts.Triage, result.Findings, sets.All, logf)
 	llmOverlay(ctx, llmClient, result.Findings, "", logf)
 	sortFindings(result.Findings)
@@ -1033,7 +1068,7 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 	run := &sourceRun{
 		subjects: subjects,
 		targeted: targeted(subjects),
-		resolver: newResolver(),
+		resolver: newResolver(opts.OSVBaseURL),
 		cves:     opts.CVEs,
 		logf:     logf,
 	}
@@ -1055,6 +1090,7 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 	}
 	result.Findings = append(result.Findings, unmapped(opts.CVEs, result.Findings)...)
 
+	guardCleanStatuses(result.Findings, logf)
 	severityOverlay(result.Findings, run.resolver.severities())
 	// See runTree for why the filter runs before the overlays rather than in
 	// the renderer. Repo mode is the path where it bites hardest: govulncheck's
@@ -1145,11 +1181,14 @@ type advisoryResolver struct {
 	corrected map[string]osv.Correction
 }
 
-func newResolver() *advisoryResolver {
+func newResolver(osvBaseURL string) *advisoryResolver {
 	r := &advisoryResolver{
 		client:    osv.NewClient(),
 		cache:     map[string]map[string]*osv.Advisory{},
 		corrected: map[string]osv.Correction{},
+	}
+	if osvBaseURL != "" {
+		r.client.BaseURL = osvBaseURL
 	}
 	r.client.OnCorrection = func(c osv.Correction) {
 		r.corrected[c.Advisory+"@"+c.Package+"@"+c.Version] = c
@@ -1673,6 +1712,27 @@ func llmOverlay(ctx context.Context, client *llm.Client, findings []Finding, loc
 			continue
 		}
 		f.LLM = v
+	}
+}
+
+// guardCleanStatuses runs Finding.Validate over every finding, enforcing the
+// false-clean invariant as a final net beneath the plugins' own call-site
+// discipline. A correction is logged rather than swallowed: a demotion the
+// guard had to make means a plugin emitted a clean it could not support, which
+// is a bug to be seen, not hidden.
+//
+// It runs before every other overlay and before the fail-on gate, so that the
+// severity filter, the VEX and triage overlays, and the exit gate all see the
+// corrected status. A finding the guard demotes from a clean to linked must be
+// gated on and reported as the real finding it now is.
+func guardCleanStatuses(findings []Finding, logf func(string, ...any)) {
+	for i := range findings {
+		if corrected, reason := findings[i].Validate(); reason != "" {
+			findings[i] = corrected
+			if logf != nil {
+				logf("  ! false-clean guard: %s", reason)
+			}
+		}
 	}
 }
 

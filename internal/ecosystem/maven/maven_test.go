@@ -231,6 +231,98 @@ func TestUnidentifiedArchiveBlocksAbsence(t *testing.T) {
 	}
 }
 
+// The Java runtime's own jars are not queryable artifacts and cannot be the one
+// a scan is asked about, so they never stand in the way of an absence answer.
+// Before this, a JDK base image's rt.jar alone made every "not here" verdict
+// undetermined.
+func TestPlatformJarDoesNotBlockAbsence(t *testing.T) {
+	img := javaImage(t, map[string]string{
+		"/usr/lib/jvm/java-8/jre/lib/rt.jar": jarBytes(t, map[string]string{
+			"java/lang/Object.class": "\xca\xfe\xba\xbe",
+		}),
+	})
+	f := absenceOf(t, img, "maven:org.apache.logging.log4j:log4j-core")
+	if f.Status != ecosystem.StatusNotPresent || f.Justification != "component_not_present" {
+		t.Errorf("status=%s justification=%q, want not_present/component_not_present",
+			f.Status, f.Justification)
+	}
+}
+
+// A resource or i18n bundle ships no compiled class, so it cannot hold the
+// vulnerable class of anything and cannot be the artifact asked about. The
+// tomcat-i18n-*.jar bundles are the bulk of what a servlet image leaves
+// unidentified.
+func TestCodelessArchiveDoesNotBlockAbsence(t *testing.T) {
+	img := javaImage(t, map[string]string{
+		"/usr/local/tomcat/lib/tomcat-i18n-es-10.1.30.jar": jarBytes(t, map[string]string{
+			"org/apache/catalina/i18n/LocalStrings_es.properties": "x=y",
+		}),
+	})
+	f := absenceOf(t, img, "maven:org.apache.logging.log4j:log4j-core")
+	if f.Status != ecosystem.StatusNotPresent || f.Justification != "component_not_present" {
+		t.Errorf("status=%s justification=%q, want not_present/component_not_present",
+			f.Status, f.Justification)
+	}
+}
+
+// An artifact's classes routinely do not live under its groupId path: Guava's
+// com.google.guava ships com/google/common. A differently-named, coordinate-less
+// jar that carries those classes could be a shaded or repackaged copy of the
+// asked-about artifact, so it must still block the claim of absence. Deciding
+// otherwise from the groupId path alone is the false clean this must never wave
+// through.
+func TestArtifactClassesOutsideGroupPathStillBlockAbsence(t *testing.T) {
+	img := javaImage(t, map[string]string{
+		// Classes span two unrelated roots, so no coordinate is offered and the
+		// jar is unidentified -- but one of those roots is guava's own
+		// (com/google/common, not the com/google/guava its groupId would
+		// suggest), so this jar could be carrying it and must still block.
+		"/opt/lib/app-shaded-1.0.jar": jarBytes(t, map[string]string{
+			"com/google/common/collect/ImmutableList.class": "\xca\xfe\xba\xbe",
+			"org/example/app/Main.class":                    "\xca\xfe\xba\xbe",
+		}),
+	})
+	f := absenceOf(t, img, "maven:com.google.guava:guava")
+	if f.Status != ecosystem.StatusUndetermined || f.Reason != "unidentified_archive" {
+		t.Errorf("status=%s reason=%q, want undetermined/unidentified_archive", f.Status, f.Reason)
+	}
+}
+
+// The narrowing only ever runs toward "could be": a jar that was named
+// something else but ships the asked-about group's classes could be a
+// repackaged copy, and still blocks. This is the case the file-name shortcut
+// must never wave through.
+func TestRepackagedArchiveStillBlocksAbsence(t *testing.T) {
+	img := javaImage(t, map[string]string{
+		// Classes span two unrelated roots, so no coordinate is offered and the
+		// jar is unidentified -- but one of those roots is log4j-core's own, so
+		// this jar could be carrying it and must still block.
+		"/opt/lib/bundle-1.0.0.jar": jarBytes(t, map[string]string{
+			"org/aopalliance/aop/Advice.class":           "\xca\xfe\xba\xbe",
+			"org/apache/logging/log4j/core/Logger.class": "\xca\xfe\xba\xbe",
+		}),
+	})
+	f := absenceOf(t, img, "maven:org.apache.logging.log4j:log4j-core")
+	if f.Status != ecosystem.StatusUndetermined || f.Reason != "unidentified_archive" {
+		t.Errorf("status=%s reason=%q, want undetermined/unidentified_archive", f.Status, f.Reason)
+	}
+}
+
+// absenceOf runs the plugin for a subject that no archive declares and returns
+// the single finding it produces.
+func absenceOf(t *testing.T, img *target.Image, raw string) ecosystem.Finding {
+	t.Helper()
+	subject, err := ecosystem.ParseSubject(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := findingsFor(t, img, []ecosystem.Subject{subject}, Options{}, anyAdvisory)
+	if len(got) != 1 {
+		t.Fatalf("got %d findings, want 1: %+v", len(got), got)
+	}
+	return got[0]
+}
+
 // A jar that never said what it is still gets queried against OSV -- a name
 // that matches nothing costs one entry in a batch -- but the finding has to say
 // out loud that the name was reconstructed.

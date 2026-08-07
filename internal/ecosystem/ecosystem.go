@@ -60,6 +60,16 @@ const (
 	// report counts it, and a caveat that miscounts the rows it explains is
 	// worse than none.
 	OriginGovulncheckUnavailable = "govulncheck-unavailable"
+
+	// OriginFalseCleanGuard is the evidence origin Finding.Validate stamps on a
+	// finding it had to correct. It exists so a downgrade the guard performed is
+	// visible in the output rather than silent: a reader can see the status the
+	// plugin emitted was overruled and why.
+	OriginFalseCleanGuard = "false-clean-guard"
+
+	// ReasonUnprovenClean is the reason on a finding the guard demoted to
+	// undetermined because nothing deterministic underwrote its clean verdict.
+	ReasonUnprovenClean = "clean_status_without_manifest_grade_evidence"
 )
 
 // SBOMFinding is the verdict for a component that a bill of materials named.
@@ -549,6 +559,112 @@ func (f Finding) Affected() bool {
 	return f.Status == StatusLinked || f.Status == StatusReachable
 }
 
+// clean reports whether a status is one of the two exculpatory verdicts: the
+// vulnerable code is absent, or present but unreachable. These are the only
+// statuses that can be a false clean, so they are the only ones Validate has to
+// police.
+func (s Status) clean() bool {
+	return s == StatusNotPresent || s == StatusNotInPath
+}
+
+// hasCleanProvenance reports whether a finding carries something that could
+// underwrite a clean verdict: a named deterministic method, or an evidence
+// entry from a real test.
+//
+// A bill of materials is explicitly not such a test. OriginSBOM names a package
+// and says nothing about what it installs or whether its code runs, so a clean
+// resting on nothing but an SBOM origin has no ground to stand on. Blocking
+// evidence is excluded too — a taint is the opposite of provenance for a clean.
+func (f Finding) hasCleanProvenance() bool {
+	if f.Method != "" {
+		return true
+	}
+	for _, e := range f.Evidence {
+		if !e.Blocking && e.Origin != "" && e.Origin != OriginSBOM {
+			return true
+		}
+	}
+	return false
+}
+
+// blockingTaint reports whether any evidence on the finding is a taint: an
+// observation that, by construction, stops the analysis concluding a component
+// is unaffected.
+func (f Finding) blockingTaint() bool {
+	for _, e := range f.Evidence {
+		if e.Blocking {
+			return true
+		}
+	}
+	return false
+}
+
+// Validate enforces the false-clean invariant, the one property the whole tool
+// rests on: a clean verdict — not_present or not_in_execute_path — is only ever
+// emitted when a deterministic test established it, and never in the face of a
+// taint that says the test could not be conclusive.
+//
+// Every plugin already honours this at the call site, gating each clean on a
+// manifest-grade signal (filesKnown, coordsKnown, a package database's own file
+// list, pclntab) and downgrading to linked with a recorded taint when the
+// signal is missing. Validate is the net under that discipline: a defence in
+// depth so a future plugin, refactor, or code path that forgets the guard
+// cannot ship a false negative, and so the invariant is a checked property
+// rather than a convention. On correct output it changes nothing.
+//
+// The correction is deliberately asymmetric, always toward the safe side:
+//
+//   - A clean carrying a taint becomes linked. A taint means the code may well
+//     be present and merely could not be ruled out, which is exactly what
+//     linked says; this mirrors the demotion the plugins perform themselves.
+//   - A clean with no deterministic provenance becomes undetermined. Nothing
+//     established the code's presence or absence, so neither clean nor linked is
+//     warranted — only "no conclusion could be reached".
+//
+// It returns the finding, corrected when it violated the rule, and a non-empty
+// reason when a correction was made, so the caller can log the violation
+// loudly. A silent correction would hide the bug the guard exists to surface.
+func (f Finding) Validate() (Finding, string) {
+	if !f.Status.clean() {
+		return f, ""
+	}
+	switch {
+	case f.blockingTaint():
+		reason := fmt.Sprintf("%s verdict for %s carries a blocking taint and cannot be a clean; downgraded to linked",
+			f.Status, f.identity())
+		f.Status = StatusLinked
+		f.Justification = ""
+		f.Evidence = append(f.Evidence, Evidence{Origin: OriginFalseCleanGuard, Detail: reason})
+		return f, reason
+	case !f.hasCleanProvenance():
+		reason := fmt.Sprintf("%s verdict for %s rests on no manifest-grade evidence; downgraded to undetermined",
+			f.Status, f.identity())
+		f.Status = StatusUndetermined
+		f.Justification = ""
+		f.Reason = ReasonUnprovenClean
+		f.Evidence = append(f.Evidence, Evidence{Origin: OriginFalseCleanGuard, Detail: reason})
+		return f, reason
+	}
+	return f, ""
+}
+
+// identity names a finding for a log line, using whichever of the neutral or
+// legacy spellings the caller has filled in.
+func (f Finding) identity() string {
+	pkg := f.Package
+	if pkg == "" {
+		pkg = f.Module
+	}
+	id := f.ID
+	if id == "" {
+		id = f.CVE
+	}
+	if pkg == "" {
+		return id
+	}
+	return pkg + " / " + id
+}
+
 // VEXStatement is a vendor's published claim about a finding, copied out of a
 // VEX hub document.
 //
@@ -597,6 +713,23 @@ type VEXHubResult struct {
 	Matched  int `json:"matched"`
 	// Error is why the hub contributed nothing. Unlike an ecosystem error it
 	// does not make the whole run incomplete: see the comment on vexOverlay.
+	Error string `json:"error,omitempty"`
+}
+
+// DistroFeedResult records how one distribution feed fared, for the same reason
+// VEXHubResult does: a feed that could not be read must not be indistinguishable
+// from one that had nothing to say. Cleared counts the findings it moved out of
+// AFFECTED with an exculpatory statement.
+type DistroFeedResult struct {
+	// Name is the feed's own name, e.g. "Debian Security Tracker".
+	Name string `json:"name"`
+	// Cleared is how many findings the feed's exculpatory statements moved out
+	// of AFFECTED. Matched is how many it spoke to at all, exculpatory or not.
+	Matched int `json:"matched"`
+	Cleared int `json:"cleared"`
+	// Error is why the feed contributed nothing, and like a hub's error does
+	// not make the run incomplete: a feed that could not clear a false positive
+	// only leaves a row in AFFECTED, never invents a clean.
 	Error string `json:"error,omitempty"`
 }
 

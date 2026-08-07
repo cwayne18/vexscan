@@ -186,8 +186,47 @@ type Result struct {
 	// It is Unreadable's sibling for the Maven reader, and it exists because the
 	// two are the same failure wearing different clothes: something is installed
 	// here and this scan cannot say what. A plugin asked whether an artifact is
-	// present must not answer no while one of these is on the disk.
-	Unidentified []string `json:"unidentified,omitempty"`
+	// present must not answer no while one of these could be the artifact asked
+	// about -- but each entry keeps the partial identity that could still be
+	// read, so the test is "could this archive be that artifact" rather than a
+	// blanket refusal.
+	Unidentified []UnidentifiedArchive `json:"unidentified,omitempty"`
+
+	// Platform are archives recognized as the Java runtime itself -- rt.jar and
+	// the other JRE/JDK internal jars -- named by convention rather than by any
+	// coordinate. They carry no META-INF/maven and would otherwise land in
+	// Unidentified and block every absence conclusion on a JDK base image, yet
+	// they are not queryable Maven artifacts and cannot be the third-party
+	// artifact a scan is asked about. Recorded for transparency, never blocking.
+	Platform []string `json:"platform,omitempty"`
+}
+
+// UnidentifiedArchive is a jar, war or ear that opened cleanly but declares no
+// coordinates. It keeps whatever partial identity could still be read off it so
+// an absence test can ask whether this particular archive could be the artifact
+// in question, rather than treating every unnamed jar as a blanket blocker.
+type UnidentifiedArchive struct {
+	// Path is how the archive is addressed, using the JVM's nested spelling for
+	// an embedded one: "/app/app.jar!/BOOT-INF/lib/mystery.jar".
+	Path string `json:"path"`
+
+	// FileArtifact is the artifactId parsed from the file name via the Maven
+	// <artifact>-<version> convention, or "" when the name does not follow it.
+	// A name that names a different artifact is positive evidence the archive is
+	// not the one being asked about.
+	FileArtifact string `json:"file_artifact,omitempty"`
+
+	// ClassPackages are the distinct package directories the archive's compiled
+	// classes live under, slash-separated ("org/springframework/aop"). They say
+	// what an archive could contain even when its coordinates could not be read:
+	// an archive that ships no class under an artifact's group path cannot be
+	// that artifact.
+	ClassPackages []string `json:"class_packages,omitempty"`
+
+	// HasClasses reports whether the archive ships any compiled class. Its
+	// central directory was read in full, so false means genuinely codeless --
+	// a resource, sources or javadoc jar -- rather than unread.
+	HasClasses bool `json:"has_classes"`
 }
 
 // Reader parses one language's installed-package layout out of the roots that
