@@ -28,11 +28,20 @@ const OriginDistroFeed = "distro-feed"
 // run, for the reason spelled out on vexOverlay: an unreadable feed only leaves
 // rows in AFFECTED that a vendor might have cleared, which over-reports, and this
 // tool's one unforgivable direction is under-reporting.
-func distroOverlay(ctx context.Context, providers []distrofeed.Provider, os *OSInfo, findings []Finding, aliases map[string][]string, logf func(string, ...any)) []ecosystem.DistroFeedResult {
+//
+// ids must be the wide set -- advisoryResolver.cveSets().All, which folds in
+// each record's Upstream -- and not aliases(). Every distro feed is keyed by
+// CVE, and no distro advisory in OSV carries a CVE in its own id or its
+// aliases: a Debian finding is DEBIAN-CVE-2026-54369 and a SUSE one is
+// SUSE-SU-2026:0885-1, with the CVEs they fix in upstream. Handed the narrow
+// set, every provider here matches nothing at all and the feature is a silent
+// no-op -- silent because a feed that matches nothing looks exactly like a feed
+// with nothing to say. See cveSets for why upstream is kept out of aliases.
+func distroOverlay(ctx context.Context, providers []distrofeed.Provider, os *OSInfo, findings []Finding, ids map[string][]string, logf func(string, ...any)) []ecosystem.DistroFeedResult {
 	if len(providers) == 0 || os == nil || os.ID == "" {
 		return nil
 	}
-	refs, index := osFindings(findings, aliases)
+	refs, index := osFindings(findings, ids)
 	if len(refs) == 0 {
 		return nil
 	}
@@ -144,7 +153,7 @@ func distroDetail(st distrofeed.Statement) string {
 // Statement the provider derives from it, so a verdict is applied to exactly the
 // finding -- and the version -- it was computed against, never a sibling package
 // that happens to share a source name and advisory.
-func osFindings(findings []Finding, aliases map[string][]string) ([]distrofeed.PkgRef, map[string]*Finding) {
+func osFindings(findings []Finding, idSets map[string][]string) ([]distrofeed.PkgRef, map[string]*Finding) {
 	index := map[string]*Finding{}
 	var refs []distrofeed.PkgRef
 	for i := range findings {
@@ -152,7 +161,7 @@ func osFindings(findings []Finding, aliases map[string][]string) ([]distrofeed.P
 		if !isOSPackage(*f) {
 			continue
 		}
-		ids := findingIDs(*f, aliases)
+		ids := findingIDs(*f, idSets)
 		id := strconv.Itoa(i)
 		refs = append(refs, distrofeed.PkgRef{
 			ID:      id,

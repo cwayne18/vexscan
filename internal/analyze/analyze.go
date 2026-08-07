@@ -784,7 +784,10 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 		// After vexOverlay so a user's --vexhub outranks an automatic feed, and
 		// read from the tree the plugins already walked. The os-release read is
 		// cheap and only happens when a feed was actually requested.
-		result.DistroFeeds = distroOverlay(ctx, opts.DistroFeeds, readOSInfo(img.FS, logf), result.Findings, run.resolver.aliases(), logf)
+		//
+		// sets.All, not aliases(): a distro feed joins on CVE, and a distro
+		// advisory in OSV names its CVEs only in upstream. See distroOverlay.
+		result.DistroFeeds = distroOverlay(ctx, opts.DistroFeeds, readOSInfo(img.FS, logf), result.Findings, sets.All, logf)
 	}
 	result.Triage = triageOverlay(ctx, opts.Triage, result.Findings, sets.All, logf)
 	llmOverlay(ctx, llmClient, result.Findings, "", logf)
