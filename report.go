@@ -203,7 +203,36 @@ func writeCaveats(dst *strings.Builder, res *analyze.Result, pal palette) {
 		fmt.Fprintf(b, "NOTE: VEX hub %s could not be read, so nothing was moved to ALREADY VEXED - %s\n", h.URL, h.Error)
 	}
 	writeMetadataCaveat(b, res)
+	writeGovulncheckCaveat(b, res)
 	writeTriageCaveats(b, res)
+}
+
+// writeGovulncheckCaveat warns that the Go reachability test was skipped because
+// govulncheck was not on PATH.
+//
+// A NOTE and not an INCOMPLETE banner: the scan read everything and every status
+// is sound. What is lost is precision -- a linked, package-granularity Go
+// finding on a binary that kept its symbols is exactly the shape govulncheck can
+// rule not_in_execute_path, and without the binary those findings stay linked
+// for want of the test. The finding carries the reason as evidence; this counts
+// them so the reader learns the one install that would sharpen the report.
+func writeGovulncheckCaveat(b *strings.Builder, res *analyze.Result) {
+	n := 0
+	for _, f := range res.Findings {
+		for _, e := range f.Evidence {
+			if e.Origin == ecosystem.OriginGovulncheckUnavailable {
+				n++
+				break
+			}
+		}
+	}
+	if n == 0 {
+		return
+	}
+	fmt.Fprintf(b, "NOTE: govulncheck was not found, so %d linked Go finding(s) could not be\n", n)
+	b.WriteString("      tested for reachability. Install govulncheck and re-run to let any whose\n")
+	b.WriteString("      vulnerable code is unreachable be ruled not_in_execute_path:\n")
+	b.WriteString("      go install golang.org/x/vuln/cmd/govulncheck@latest\n")
 }
 
 // writeCorrectionsCaveat names the advisories the database matched and this

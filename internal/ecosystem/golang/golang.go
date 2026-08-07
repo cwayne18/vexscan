@@ -441,6 +441,10 @@ func (p *Plugin) wantedModules(subjects []ecosystem.Subject) (modules []string, 
 
 // AnalyzeImage implements ecosystem.ImageAnalyzer.
 func (p *Plugin) AnalyzeImage(ctx context.Context, img *target.Image, items []ecosystem.WorkItem) ([]ecosystem.Finding, error) {
+	// Detected once: LookPath is cheap but the result is the same for every
+	// binary, and a linked finding records it so a missing govulncheck reads as
+	// a skipped reachability test rather than one that ruled nothing out.
+	govulnAvailable := binscan.GovulncheckAvailable()
 	var out []ecosystem.Finding
 	for _, item := range items {
 		st, ok := item.Component.Extra.(*state)
@@ -494,15 +498,16 @@ func (p *Plugin) AnalyzeImage(ctx context.Context, img *target.Image, items []ec
 			}
 
 			ec := evalCtx{
-				binaryRel: bin.rel,
-				module:    item.Component.Name,
-				version:   item.Component.Version,
-				purl:      item.Component.PURL,
-				product:   vex.GoProduct(bin.main),
-				stripped:  stripped,
-				syms:      syms,
-				govuln:    govuln,
-				logf:      p.Logf,
+				binaryRel:       bin.rel,
+				module:          item.Component.Name,
+				version:         item.Component.Version,
+				purl:            item.Component.PURL,
+				product:         vex.GoProduct(bin.main),
+				stripped:        stripped,
+				syms:            syms,
+				govuln:          govuln,
+				govulnAvailable: govulnAvailable,
+				logf:            p.Logf,
 			}
 			for _, req := range requests {
 				f := evaluate(ctx, ec, req.ID, req.Advisory)

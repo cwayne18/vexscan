@@ -16,14 +16,31 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/cwayne18/vexscan/internal/pkgdb"
 )
+
+// httpClient fetches package headers and payloads. The timeouts live on the
+// transport rather than on Client.Timeout on purpose: an overall deadline would
+// abort a legitimately slow --rpm-deep download of a multi-megabyte payload,
+// whereas these bound the parts that hang without progress -- a dead mirror that
+// accepts the connection and then never answers. Response streaming stays
+// unbounded so a slow-but-progressing transfer is never cut off.
+var httpClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: 15 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		IdleConnTimeout:       30 * time.Second,
+	},
+}
 
 // maxHeaderRead bounds what a single package may make this read.
 //
@@ -255,7 +272,7 @@ func readURL(ctx context.Context, u string, deep bool, extractRoot string, logf 
 	if err != nil {
 		return nil, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

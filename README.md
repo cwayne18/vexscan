@@ -498,6 +498,14 @@ For every Go binary that links the target module:
    packages appear in it, the linker eliminated them:
    `vulnerable_code_not_present`.
 
+> **govulncheck must be on `PATH`** for step 2. When it is not, non-stripped
+> binaries cannot be narrowed to `not_in_execute_path`, so those findings stay
+> `linked` — sound, but less precise than the tool can be. Rather than silently
+> return a coarser answer, the run tags every finding it would have refined and
+> prints a `NOTE:` in the report caveats telling you how many were affected and
+> how to install it (`go install golang.org/x/vuln/cmd/govulncheck@latest`). The
+> stripped-binary pclntab test in step 3 does not need it.
+
 With `--all`, the module list comes from each binary's build info — its
 dependencies, its own main module, and the toolchain (`stdlib`), since stdlib
 advisories apply to every Go binary by definition.
@@ -1057,7 +1065,7 @@ is non-fatal either way: the finding is still reported, just without a verdict.
 ## Output
 
 `--format text` is for reading; `--format json` is for keeping; `--format
-fixplan` is for acting.
+sarif` is for a code-scanning dashboard; `--format fixplan` is for acting.
 
 ### The text report
 
@@ -1733,6 +1741,43 @@ neutral fields so they cannot drift.
 `component_not_present` is expressed through `justification` rather than a sixth
 status, because VEX consumers already read that field.
 
+### SARIF
+
+`--format sarif` emits SARIF 2.1.0, the format GitHub code scanning and most CI
+security dashboards ingest. It exists so a vexscan run can land in the Security
+tab beside every other scanner — but carrying the one thing this tool has that a
+version scanner does not.
+
+**A ruled-out finding becomes a suppressed result.** `not_present` and
+`not_in_execute_path` are emitted as SARIF results with a `suppressions` entry
+of `kind: external` whose `justification` is the finding's OpenVEX
+justification. A dashboard shows those as dismissed-with-a-reason rather than as
+noise a human has to triage again — the same distinction the text report draws
+with its `RULED OUT` section, in the vocabulary a dashboard understands.
+`linked`, `reachable` and `undetermined` stay open results.
+
+```jsonc
+{
+  "ruleId": "CVE-2022-27943",
+  "level": "warning",
+  "message": { "text": "CVE-2022-27943 affects gcc-12 12.2.0-14+deb12u1 (status: not_present, pkgdb-no-code)" },
+  "suppressions": [ { "kind": "external", "justification": "vulnerable_code_not_present" } ],
+  "properties": { "status": "not_present", "purl": "pkg:deb/debian/gcc-12-base@...", "method": "pkgdb-no-code" }
+}
+```
+
+Each advisory becomes one `reportingDescriptor` rule, referenced by every result
+it produced, so one CVE fanned over three packages is one rule and three
+results. The rule carries `security-severity` — the CVSS number GitHub reads to
+colour an alert — derived from the finding's vector, or from its severity label
+when no vector was published. `level` maps severity to SARIF's `error` /
+`warning` / `note`, with an unrated finding warning rather than passing, the same
+rule the tool applies everywhere else. Every finding's `purl`, `status`,
+`method`, `justification`, EPSS and KEV land in `properties` for a consumer that
+wants them. Like `--format json` it is a machine document, so colour is never
+written to it.
+
+
 **An empty report is never silently produced.** If an ecosystem is detected but
 cannot be read, no findings are emitted for it, `ecosystems[].error` says why,
 the text report prints an `INCOMPLETE:` line, and the process exits 1. The same
@@ -1832,7 +1877,7 @@ Three properties are deliberate:
 | `--llm-model` | `gpt-4o` | Model id for `--llm-endpoint` |
 | `--llm-command` | | Run this installed CLI instead of an endpoint, e.g. `'claude -p'` |
 | `--mine-advisories` | `false` | With `--llm`, mine advisory prose for symbols and module paths to check |
-| `--format` | `text` | `text`, `json`, `fixplan`, or `inventory` |
+| `--format` | `text` | `text`, `json`, `sarif`, `fixplan`, or `inventory` |
 | `--details` | `false` | With `--format text`, print the full evidence block under each row instead of the table alone |
 | `--out` | *(stdout)* | Write output to a file |
 | `--gist` | `false` | Also upload the output to a public gist and print its URL (token needs `gist` scope) |

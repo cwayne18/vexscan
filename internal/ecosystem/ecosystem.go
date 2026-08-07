@@ -53,6 +53,13 @@ const (
 const (
 	OriginSBOM               = "sbom-metadata"
 	ReasonNoReachabilityTest = "no_reachability_test_possible"
+
+	// OriginGovulncheckUnavailable marks a linked Go finding whose reachability
+	// could not be tested because the govulncheck binary was not on PATH. Like
+	// OriginSBOM it lives here because the golang plugin writes it and the
+	// report counts it, and a caveat that miscounts the rows it explains is
+	// worse than none.
+	OriginGovulncheckUnavailable = "govulncheck-unavailable"
 )
 
 // SBOMFinding is the verdict for a component that a bill of materials named.

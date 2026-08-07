@@ -1497,6 +1497,44 @@ func TestTheMetadataCaveatIsForDescribedPackagesOnly(t *testing.T) {
 	}
 }
 
+// A linked Go finding carrying the govulncheck-unavailable evidence must make
+// the report say the reachability test was skipped, and count how many findings
+// it could not narrow. Without this a report from a box with no govulncheck is
+// byte-identical to one where govulncheck ran and ruled nothing out.
+func TestTheGovulncheckCaveatCountsSkippedFindings(t *testing.T) {
+	skipped := func(cve string) analyze.Finding {
+		return analyze.Finding{
+			Ecosystem: "golang", CVE: cve, ID: cve,
+			Module: "golang.org/x/net", Version: "v0.17.0",
+			Status: analyze.StatusLinked,
+			Evidence: []ecosystem.Evidence{{
+				Origin: ecosystem.OriginGovulncheckUnavailable,
+				Detail: "govulncheck is not on PATH",
+			}},
+		}
+	}
+	out := report(t, false, skipped("CVE-2023-39325"), skipped("CVE-2023-44487"))
+
+	if !strings.Contains(out, "govulncheck was not found") {
+		t.Errorf("the report does not warn that govulncheck was missing:\n%s", out)
+	}
+	if !strings.Contains(out, "2 linked Go finding(s) could not be") {
+		t.Errorf("the caveat does not count the findings it explains:\n%s", out)
+	}
+	if !strings.Contains(out, "go install golang.org/x/vuln/cmd/govulncheck@latest") {
+		t.Errorf("the caveat does not say how to fix it:\n%s", out)
+	}
+}
+
+// A scan where govulncheck ran must not carry the caveat: the absence of the
+// evidence is the whole signal, and a false warning would tell a user to
+// install a tool they already have.
+func TestTheGovulncheckCaveatIsAbsentWhenGovulncheckRan(t *testing.T) {
+	if out := report(t, false, gccTrio...); strings.Contains(out, "govulncheck was not found") {
+		t.Errorf("a report with no skipped findings carried the govulncheck caveat:\n%s", out)
+	}
+}
+
 // sbomReport renders the shape --sbom produces.
 func sbomReport(t *testing.T, findings ...analyze.Finding) string {
 	t.Helper()

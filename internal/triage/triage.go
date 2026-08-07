@@ -22,6 +22,7 @@ package triage
 import (
 	"context"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -210,21 +211,45 @@ func (l *Loader) Load(ctx context.Context, want map[string]bool) *Data {
 	d := &Data{EPSS: map[string]Score{}, KEV: map[string]KEVEntry{}}
 	c := cache{dir: l.dir()}
 
-	scores, date, stale, err := l.loadEPSS(ctx, c, want)
-	if err != nil {
-		d.EPSSError = err.Error()
-		l.logf("triage: EPSS unavailable: %v", err)
+	// The two feeds are independent static files on different hosts, so they
+	// download concurrently. Each still fails soft into its own Error field --
+	// one unreachable mirror must not stop the other, and neither aborts the
+	// scan.
+	var (
+		scores    map[string]Score
+		epssDate  string
+		epssStale bool
+		epssErr   error
+		entries   map[string]KEVEntry
+		kevDate   string
+		kevStale  bool
+		kevErr    error
+		wg        sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		scores, epssDate, epssStale, epssErr = l.loadEPSS(ctx, c, want)
+	}()
+	go func() {
+		defer wg.Done()
+		entries, kevDate, kevStale, kevErr = l.loadKEV(ctx, c)
+	}()
+	wg.Wait()
+
+	if epssErr != nil {
+		d.EPSSError = epssErr.Error()
+		l.logf("triage: EPSS unavailable: %v", epssErr)
 	} else {
-		d.EPSS, d.EPSSDate, d.EPSSStale = scores, date, stale
-		if stale {
-			l.logf("triage: EPSS feed unreachable; using the cached copy from %s", date)
+		d.EPSS, d.EPSSDate, d.EPSSStale = scores, epssDate, epssStale
+		if epssStale {
+			l.logf("triage: EPSS feed unreachable; using the cached copy from %s", epssDate)
 		}
 	}
 
-	entries, kevDate, kevStale, err := l.loadKEV(ctx, c)
-	if err != nil {
-		d.KEVError = err.Error()
-		l.logf("triage: KEV unavailable: %v", err)
+	if kevErr != nil {
+		d.KEVError = kevErr.Error()
+		l.logf("triage: KEV unavailable: %v", kevErr)
 	} else {
 		d.KEV, d.KEVDate, d.KEVStale = entries, kevDate, kevStale
 		if kevStale {
