@@ -178,9 +178,9 @@ func TestGroupAllInfersMainVersionFromImageTag(t *testing.T) {
 	if c.Version != "v1.36.3+k3s1" {
 		t.Errorf("version = %q, want v1.36.3+k3s1 (inferred from image tag)", c.Version)
 	}
-	note := c.Extra.(*state).inferredNote
+	note := c.Extra.(*state).inferred.detail
 	if note == "" || !strings.Contains(note, "v1.36.3-k3s1") {
-		t.Errorf("inferredNote = %q, want a provenance note citing the image tag", note)
+		t.Errorf("inferred detail = %q, want a provenance note citing the image tag", note)
 	}
 }
 
@@ -201,8 +201,8 @@ func TestGroupAllKeepsDevelWhenTagNotUsable(t *testing.T) {
 	if c.Version != "(devel)" {
 		t.Errorf("version = %q, want (devel) unchanged", c.Version)
 	}
-	if note := c.Extra.(*state).inferredNote; note != "" {
-		t.Errorf("inferredNote = %q, want empty (nothing was inferred)", note)
+	if note := c.Extra.(*state).inferred.detail; note != "" {
+		t.Errorf("inferred detail = %q, want empty (nothing was inferred)", note)
 	}
 }
 
@@ -226,8 +226,8 @@ func TestGroupAllRefusesAnUnrelatedImageTag(t *testing.T) {
 	if c.Version != "(devel)" {
 		t.Errorf("version = %q, want (devel): python's version is not this module's", c.Version)
 	}
-	if note := c.Extra.(*state).inferredNote; note != "" {
-		t.Errorf("inferredNote = %q, want empty (nothing was inferred)", note)
+	if note := c.Extra.(*state).inferred.detail; note != "" {
+		t.Errorf("inferred detail = %q, want empty (nothing was inferred)", note)
 	}
 }
 
@@ -243,10 +243,10 @@ func TestTheInferredNoteNamesItsAuthority(t *testing.T) {
 	if c == nil {
 		t.Fatalf("main module %s missing from inventory", mod)
 	}
-	note := c.Extra.(*state).inferredNote
+	note := c.Extra.(*state).inferred.detail
 	for _, want := range []string{"version not in build info", "v1.36.3-k3s1", "build suffix"} {
 		if !strings.Contains(note, want) {
-			t.Errorf("inferredNote = %q, missing %q", note, want)
+			t.Errorf("inferred detail = %q, missing %q", note, want)
 		}
 	}
 }
@@ -268,8 +268,8 @@ func TestGroupAllRealMainVersionIsUntouched(t *testing.T) {
 	if c.Version != "v1.0.0" {
 		t.Errorf("version = %q, want v1.0.0 (build-info version preserved)", c.Version)
 	}
-	if note := c.Extra.(*state).inferredNote; note != "" {
-		t.Errorf("inferredNote = %q, want empty", note)
+	if note := c.Extra.(*state).inferred.detail; note != "" {
+		t.Errorf("inferred detail = %q, want empty", note)
 	}
 }
 
@@ -384,8 +384,8 @@ func TestAnalyzeImageAttachesInferredVersionEvidence(t *testing.T) {
 		Version:   "v1.36.3+k3s1",
 		PURL:      purl(mod, "v1.36.3+k3s1"),
 		Extra: &state{
-			binaries:     []binary{{path: binPath, rel: "/bin/k3s", main: mod}},
-			inferredNote: note,
+			binaries: []binary{{path: binPath, rel: "/bin/k3s", main: mod}},
+			inferred: inference{origin: "image-tag-version", detail: note},
 		},
 	}
 	// A requested id with no advisory: evaluate returns undetermined without

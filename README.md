@@ -491,6 +491,8 @@ For every Go binary that links the target module:
 1. **Resolve the vulnerable packages** from the [OSV](https://osv.dev) Go
    database, keyed by module plus the version embedded in the binary's build
    info (`debug/buildinfo`) — no Trivy report or manual version input needed.
+   A binary's *own* main module often has no version there; see
+   [when the main module says `(devel)`](#when-the-main-module-says-devel).
 2. **govulncheck (binary mode)**, for non-stripped binaries: linked but
    unreachable is `vulnerable_code_not_in_execute_path`.
 3. **pclntab presence test.** A Go binary keeps its function-name table even
@@ -882,6 +884,69 @@ partition. Measured: `npm/cli --all --ecosystem npm` is 993 packages and
 carrying more than half the findings. `home-assistant/core --all --ecosystem
 pypi` is 1,224 packages and `0 / 0 / 26`, because `requirements.txt` declares no
 dev partition at all and 22 of the 26 additionally pin no version.
+
+### When the main module says `(devel)`
+
+**A Go binary built from a checkout carries no version for its own module, and
+that is not a small problem.** `go install` stamps a semver version into build
+info; `go build` from a source tree does not, and reports `(devel)`. OSV cannot
+range-match that, so it answers with *every* advisory ever filed against the
+module, including the ones fixed long before the build. This is by far the
+largest source of Go false positives, because it lands on the one module whose
+code is unquestionably present.
+
+vexscan tries two recoveries, strongest first, and only for the main module —
+dependencies always carry real versions in build info.
+
+**1. The binary's own linker flags.** A project that versions itself with
+`-ldflags "-X .../version.Version=v1.36.2+k3s1"` never gets that into
+`Main.Version`, but the flags themselves are recorded verbatim in build info.
+This is not an inference: it is the number the build used, read back out of the
+artifact.
+
+The difficulty is that large binaries stamp many versions. `/usr/bin/k3s` in
+`rancher/rancher:v2.15.0` carries 25 `-X` assignments, six of which look exactly
+like a version — for cri-tools, containerd, flannel, kube-router, cri-dockerd
+and k3s itself. Reading containerd's `v2.3.2` as k3s's version would range past
+every k3s advisory there is.
+
+So the test is the variable's **owning package**: the stamp counts only if it
+writes into the main module's own tree, or into package `main`, which by
+definition belongs to the binary being built. Exactly one of the six survives
+that. If two surviving stamps disagree, both are discarded.
+
+This is deliberately narrower than trivy, which selects on the *shape of the
+variable name* (a `main`/`common`/`version`/`cmd` prefix). Five of k3s's six
+stamps end in `/version.Version`, so that rule finds five candidates, cannot
+choose between them, and gives up: trivy reports the k3s main module with no
+version at all, and therefore no findings against it — true or false.
+
+**2. The image tag,** which is a guess about the artifact rather than a fact
+from it, and so is fenced much harder. The tag must normalize to full
+`MAJOR.MINOR.PATCH` semver, *and* something must connect it to this module:
+either it carries a k3s/rke2 build suffix (`+k3s1`, `+rke2r1` — those projects'
+own release markers, valid whatever the image is called), or the image is named
+after the module (`prom/prometheus`, `rancher/hardened-kubernetes`). Nothing
+connects `python:3.12.1` to a Go binary that happens to live inside it, so no
+version is inferred there.
+
+**When neither applies, `(devel)` is sent to OSV unchanged and the module
+over-reports.** That is deliberate. A version that reads too *high* ranges past
+a real advisory and marks a vulnerable binary clean, which is the one direction
+this tool must never go silently, so every gate above fails closed.
+
+**Every recovered version is on the finding.** Findings decided against one
+carry an evidence entry naming both the version and where it came from —
+`ldflags-version` with the exact `-X` key, or `image-tag-version` with the tag
+and why the tag was believed — so no reader has to take a version build info
+never stated on trust.
+
+On the k3s binary above, the two mechanisms compose: the ldflags stamp turns
+`(devel)` into `v1.36.2+k3s1`, which is a version the correction below can then
+actually reason about. Four advisories become none, and the two that OSV still
+matched are named in `corrections` rather than dropped.
+
+### Advisories that cannot say where the flaw was fixed
 
 **Some Go advisories cannot state where the flaw was fixed, and are corrected
 against their own data.** The Go vulnerability database imports records it does

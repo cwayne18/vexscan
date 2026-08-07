@@ -14,10 +14,11 @@ import (
 // `go build` from a checkout does not stamp a semver main-module version: build
 // info reports "(devel)" (or "" for some toolchains), and a project that sets
 // its version through `-ldflags -X pkg.Version=...` writes a *different*
-// variable that never reaches buildinfo.Main.Version. The v0.0.0 pseudo-zero is
-// the other shape of the same non-answer. Any of these, or anything that is not
-// valid semver at all, is uncomparable: OSV's range check has nothing to place
-// it against and returns advisories already fixed in the running version.
+// variable that never reaches buildinfo.Main.Version -- see ldflagsversion.go,
+// which reads that variable back. The v0.0.0 pseudo-zero is the other shape of
+// the same non-answer. Any of these, or anything that is not valid semver at
+// all, is uncomparable: OSV's range check has nothing to place it against and
+// returns advisories already fixed in the running version.
 func isDevelVersion(v string) bool {
 	switch strings.TrimSpace(v) {
 	case "", "(devel)", "devel":
@@ -144,6 +145,37 @@ func tagAuthority(modulePath, ref, version string) string {
 	return ""
 }
 
+// normalizeSemver puts a version string into the spelling OSV ranges against,
+// or reports that it is not a version at all.
+//
+// The 'v' prefix is optional everywhere versions are written down and mandatory
+// in x/mod/semver, so it is ensured rather than required. The MAJOR.MINOR.PATCH
+// check is the load-bearing part: semver.IsValid accepts partials, so a bare
+// date stamp like "20240101" would pass as "v20240101" -- a version far higher
+// than anything real, which would range past every advisory and report a
+// vulnerable artifact as clean. That is the under-report direction, so anything
+// without a full core is refused.
+func normalizeSemver(s string) (string, bool) {
+	v := strings.TrimSpace(s)
+	if v == "" {
+		return "", false
+	}
+	if !strings.HasPrefix(v, "v") {
+		v = "v" + v
+	}
+	if !semver.IsValid(v) {
+		return "", false
+	}
+	core := v[1:]
+	if i := strings.IndexAny(core, "-+"); i >= 0 {
+		core = core[:i]
+	}
+	if strings.Count(core, ".") != 2 {
+		return "", false
+	}
+	return v, true
+}
+
 // normalizeTagVersion turns an image tag into a comparable Go module version,
 // or reports that it is not one.
 //
@@ -154,26 +186,7 @@ func normalizeTagVersion(tag string) (string, bool) {
 	if tag == "" || tag == "latest" {
 		return "", false
 	}
-	v := dockerK3sSuffix.ReplaceAllString(tag, "+$1")
-	if !strings.HasPrefix(v, "v") {
-		v = "v" + v
-	}
-	if !semver.IsValid(v) {
-		return "", false
-	}
-	// semver.IsValid accepts partials ("v1", "v1.2") and a bare major, so a
-	// date-stamp tag like "20240101" would pass as "v20240101". A module
-	// version that could be mistaken for something newer than it is is exactly
-	// the under-report risk this must avoid, so require a full MAJOR.MINOR.PATCH
-	// core before trusting the tag.
-	core := v[1:]
-	if i := strings.IndexAny(core, "-+"); i >= 0 {
-		core = core[:i]
-	}
-	if strings.Count(core, ".") != 2 {
-		return "", false
-	}
-	return v, true
+	return normalizeSemver(dockerK3sSuffix.ReplaceAllString(tag, "+$1"))
 }
 
 // moduleVersionFromImageTag derives a comparable Go module version for
