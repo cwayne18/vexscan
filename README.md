@@ -1098,6 +1098,15 @@ when a section holds more than one status, so a Debian image (everything
 `linked`) does not get a column repeating that 152 times, and a repo scan mixing
 `linked` and `reachable` gets one automatically.
 
+A `LOCATION` column appears the same way, and only when a finding names a
+specific binary — which today means a Go image scan. One module can be linked
+into several binaries in the same image at the same version, so `golang.org/x/net
+0.17.0` can be two rows with identical `PACKAGE` and `VERSION` and a different
+answer for each binary; `LOCATION` is what tells them apart. An OS scan sets no
+binary (the package is the unit), so the column stays absent rather than blank,
+and the path is truncated from the left so the basename that identifies the file
+survives.
+
 `PACKAGE` is the **installed** package, not the source package the advisory is
 filed against. Those differ constantly and the difference is load-bearing:
 `CVE-2022-27943` is filed against Debian's `gcc-12` source, which ships as

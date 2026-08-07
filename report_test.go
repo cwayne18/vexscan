@@ -382,6 +382,43 @@ func TestFixedInColumnAppearsOnlyWithData(t *testing.T) {
 	}
 }
 
+// The LOCATION column names the specific binary a linked finding lives in. One
+// module can be linked into several binaries at the same version, so without it
+// those rows are identical. An OS scan sets no binary, so the column must not
+// appear there.
+func TestLocationColumnNamesTheBinaryForGoFindings(t *testing.T) {
+	// Two Go findings, same module and version, different binaries: the column
+	// appears and tells the rows apart.
+	go2 := report(t, false,
+		analyze.Finding{
+			CVE: "CVE-1", Package: "golang.org/x/net", Version: "0.1.0",
+			Binary: "usr/bin/api", Location: "usr/bin/api",
+			Status: analyze.StatusLinked, Severity: "HIGH", Method: "govulncheck",
+		},
+		analyze.Finding{
+			CVE: "CVE-1", Package: "golang.org/x/net", Version: "0.1.0",
+			Binary: "usr/bin/worker", Location: "usr/bin/worker",
+			Status: analyze.StatusLinked, Severity: "HIGH", Method: "govulncheck",
+		},
+	)
+	rows := sectionOf(t, go2, "AFFECTED")
+	if !strings.Contains(rows[0], "LOCATION") {
+		t.Fatalf("LOCATION header missing:\n%s", go2)
+	}
+	if !strings.Contains(lineWith(t, go2, "usr/bin/api"), "usr/bin/api") ||
+		!strings.Contains(lineWith(t, go2, "usr/bin/worker"), "usr/bin/worker") {
+		t.Errorf("each binary should identify its own row:\n%s", go2)
+	}
+
+	// An OS finding has no binary: the column must not appear.
+	os := report(t, false,
+		analyze.Finding{CVE: "CVE-2", Package: "libc6", Version: "2.36", Status: analyze.StatusLinked, Severity: "HIGH", Method: "elf-needed-closure"},
+	)
+	if strings.Contains(os, "LOCATION") {
+		t.Errorf("LOCATION column appeared for an OS scan that sets no binary:\n%s", os)
+	}
+}
+
 // An advisory that patched three maintained branches offers three upgrades,
 // and only one of them is the small one. The table still names a single target
 // -- a cell holding three versions is not scannable -- so --details is where

@@ -792,7 +792,17 @@ func writeSection(b *strings.Builder, s section, o renderOpts) {
 	// that publishes none (or a --repo run) does not get a column of dashes.
 	showFixed := fixedColumn(rows)
 
+	// LOCATION earns its place the same way: it names the specific binary a
+	// finding lives in, which only the Go plugin knows. One module can be
+	// linked into several binaries in the same image with the same package and
+	// version, and without this column those rows are indistinguishable. An OS
+	// scan sets no binary, so the column stays absent rather than blank.
+	showLocation := locationColumn(rows)
+
 	header := []string{"SEVERITY", "ADVISORY", "PACKAGE", "VERSION"}
+	if showLocation {
+		header = append(header, "LOCATION")
+	}
 	if showFixed {
 		header = append(header, "FIXED IN")
 	}
@@ -821,6 +831,9 @@ func writeSection(b *strings.Builder, s section, o renderOpts) {
 			shortAdvisory(f),
 			truncate(f.Component(), 40),
 			truncate(f.Version, 28),
+		}
+		if showLocation {
+			cells = append(cells, displayLocation(f))
 		}
 		if showFixed {
 			cells = append(cells, displayFixed(f))
@@ -956,6 +969,30 @@ func triageColumns(rows []analyze.Finding) (epss, kev bool) {
 		}
 	}
 	return epss, kev
+}
+
+// locationColumn reports whether any row in the section names a specific binary,
+// which is what earns the LOCATION column its place. Only the Go plugin sets a
+// binary path; an OS scan, or a --repo run, names none, so the column is absent
+// rather than a stack of blanks.
+func locationColumn(rows []analyze.Finding) bool {
+	for _, f := range rows {
+		if f.Location != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// displayLocation is the binary a finding lives in, empty when it has none. The
+// path is truncated from the left because the basename is what tells two
+// binaries apart, and it is the head of a long image path -- "usr/lib/..." -- that
+// is the same across all of them.
+func displayLocation(f analyze.Finding) string {
+	if f.Location == "" {
+		return ""
+	}
+	return truncateLeft(f.Location, 40)
 }
 
 // fixedColumn reports whether any row in the section has a published fix, which
@@ -1149,6 +1186,20 @@ func truncate(s string, max int) string {
 		return string(r[:max])
 	}
 	return string(r[:max-1]) + "…"
+}
+
+// truncateLeft shortens from the front, keeping the tail. For a path that is the
+// basename, which identifies the file; the leading directories a scan repeats on
+// every row are what gets dropped.
+func truncateLeft(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	if max <= 1 {
+		return string(r[len(r)-max:])
+	}
+	return "…" + string(r[len(r)-(max-1):])
 }
 
 // listCVEs joins the CVEs an advisory bundles, naming at most max of them and
