@@ -396,6 +396,122 @@ func TestShellEntrypointRootsEveryExecutable(t *testing.T) {
 		"/usr/lib/apt/methods/http", "/usr/lib/libtls.so.1")
 }
 
+// wrapperFixture is the shared tree for the exec-wrapper tests: the wrappers
+// themselves, an application that links one library, and an off-PATH program
+// (with a library only it links) that stands in for apt's transport methods.
+// A precise closure leaves that off-PATH program dead; an escalation reaches it,
+// so it is the discriminator between "saw through the wrapper" and "gave up and
+// rooted everything".
+func wrapperFixture(t *testing.T) (target.RootFS, fakeELF) {
+	t.Helper()
+	fsys := tree(t, map[string]string{
+		"/usr/bin/tini":             "",
+		"/usr/bin/gosu":             "",
+		"/usr/bin/env":              "",
+		"/usr/bin/app":              "",
+		"/usr/lib/libq.so":          "",
+		"/usr/lib/apt/methods/http": "",
+		"/usr/lib/libtls.so.1":      "",
+	})
+	objs := fakeELF{
+		"/usr/bin/tini":             exe(),
+		"/usr/bin/gosu":             exe(),
+		"/usr/bin/env":              exe(),
+		"/usr/bin/app":              exe("libq.so"),
+		"/usr/lib/libq.so":          lib(),
+		"/usr/lib/apt/methods/http": exe("libtls.so.1"),
+		"/usr/lib/libtls.so.1":      lib(),
+	}
+	return fsys, objs
+}
+
+// The init shims and privilege-drop wrappers exec a specific later argv token
+// and load no application code of their own, so the closure roots the program
+// they forward to and stays precise. Before this, an image run under tini or
+// gosu escalated to rooting everything, which is most of what runs Java and Node
+// in production.
+func TestExecWrapperResolvesToRealEntrypoint(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		argv []string
+	}{
+		{"tini with separator", []string{"/usr/bin/tini", "--", "/usr/bin/app"}},
+		{"tini without options", []string{"/usr/bin/tini", "/usr/bin/app"}},
+		{"gosu drops privilege", []string{"gosu", "postgres", "/usr/bin/app"}},
+		{"env with assignment", []string{"/usr/bin/env", "FOO=bar", "/usr/bin/app"}},
+		{"env with flag", []string{"/usr/bin/env", "-i", "/usr/bin/app"}},
+		{"nested tini then gosu", []string{"/usr/bin/tini", "--", "gosu", "postgres", "/usr/bin/app"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fsys, objs := wrapperFixture(t)
+			g := build(t, fsys, objs, Options{Config: target.ImageConfig{Entrypoint: tc.argv}})
+
+			if tt := hasTaint(g, TaintShellEntrypoint); tt != nil {
+				t.Errorf("wrapper was treated as a shell and escalated: %s", tt.Detail)
+			}
+			if tt := hasTaint(g, TaintNoEntrypoint); tt != nil {
+				t.Errorf("wrapper left the entrypoint unresolved: %s", tt.Detail)
+			}
+			reachable(t, g, "/usr/bin/app", "/usr/lib/libq.so")
+			// The off-PATH program stays dead, which it would not under an
+			// escalation. That is the proof the closure stayed precise.
+			unreachable(t, g, "/usr/lib/apt/methods/http", "/usr/lib/libtls.so.1")
+		})
+	}
+}
+
+// The parser only steps over argument shapes it is certain of. A wrapper used in
+// a way it cannot read -- env -S, which re-splits a string; tini with options
+// and no -- separator; gosu with no command -- is left in place, and the shell
+// check escalates. Guessing here would risk rooting the wrong token and calling
+// live code dead, so the ambiguous case has to fail closed.
+func TestAmbiguousWrapperStillEscalates(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		argv []string
+	}{
+		{"env split-string", []string{"/usr/bin/env", "-S", "/usr/bin/app --flag"}},
+		{"tini bare option", []string{"/usr/bin/tini", "-s", "/usr/bin/app"}},
+		{"gosu without command", []string{"gosu", "postgres"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fsys, objs := wrapperFixture(t)
+			g := build(t, fsys, objs, Options{Config: target.ImageConfig{Entrypoint: tc.argv}})
+
+			if hasTaint(g, TaintShellEntrypoint) == nil {
+				t.Fatal("an unparseable wrapper did not fall back to escalation")
+			}
+			// Escalation reaches the off-PATH program; that is the fail-closed
+			// behavior the invariant depends on.
+			reachable(t, g, "/usr/lib/apt/methods/http", "/usr/lib/libtls.so.1")
+		})
+	}
+}
+
+// A shell wrapper is not an exec wrapper: it runs arbitrary code and must still
+// escalate even though the peeling ran first.
+func TestShellScriptEntrypointStillEscalatesAfterPeeling(t *testing.T) {
+	fsys := tree(t, map[string]string{
+		"/usr/bin/tini":             "",
+		"/entrypoint.sh":            "",
+		"/usr/lib/apt/methods/http": "",
+	})
+	objs := fakeELF{
+		"/usr/bin/tini":             exe(),
+		"/entrypoint.sh":            exe(),
+		"/usr/lib/apt/methods/http": exe(),
+	}
+	g := build(t, fsys, objs, Options{Config: target.ImageConfig{
+		Entrypoint: []string{"/usr/bin/tini", "--", "/entrypoint.sh"},
+	}})
+
+	if hasTaint(g, TaintShellEntrypoint) == nil {
+		t.Fatal("a .sh script behind tini was not recognized as a shell entrypoint")
+	}
+	// tini was still peeled and rooted; the script behind it escalated.
+	reachable(t, g, "/usr/bin/tini", "/usr/lib/apt/methods/http")
+}
+
 // TestEscalationRootsProgramsNotLibraries: "every executable is a root" has to
 // mean every program anywhere, but it must not quietly mean every ELF file --
 // an unused library is the finding this package exists to produce.

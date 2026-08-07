@@ -553,6 +553,19 @@ are always roots.
 | a validated mined symbol is defined by nothing the package installs | `not_present` | `vulnerable_code_not_present` | `elf-dynsym-absent` |
 | reachable, or anything blocking | `linked` | *(none — treat as affected)* | `elf-needed-closure` |
 
+#### Transparent exec wrappers
+
+Before the entrypoint is judged a shell, transparent exec wrappers are peeled:
+`tini`, `dumb-init`, `catatonit` (and their `--` separators), `gosu` / `su-exec`,
+and `env` with its assignments and known flags. Each execs a specific later argv
+token and loads no application code of its own, so peeling reaches the real
+program and roots that instead of escalating — most of what runs Java and Node in
+production sits behind one of these. Peeling only advances past a layer whose
+argument grammar is parsed with certainty: `env -S`, `tini` with a bare option
+and no `--`, or `gosu` with no command are left in place and fall back to the
+`shell-entrypoint` escalation below. That fail-closed default is what keeps the
+narrowing from ever hiding live code.
+
 #### Taints
 
 A taint never sets a status. It *blocks* the closure from concluding
@@ -564,7 +577,7 @@ could not answer rather than answering wrongly.
 | `unresolved-needed` | a `DT_NEEDED` that resolved to nothing | scoped to that soname |
 | `dlopen` | a reachable ELF references `dlopen`/`dlmopen` | global, unless `--dlopen-policy=assume-none` |
 | `static-elf` | a reachable ELF has no `PT_INTERP`/`.dynamic` | blocks all C-library conclusions |
-| `shell-entrypoint` | argv[0] is a shell or init shim (`sh`, `busybox`, `tini`, `s6-*`) | every ELF in the standard bin dirs becomes a root |
+| `shell-entrypoint` | argv[0] is a shell or init shim (`sh`, `busybox`, `s6-*`), or a transparent wrapper (`tini`, `gosu`, `env`) used in a form its parser cannot read | every ELF in the standard bin dirs becomes a root |
 | `no-entrypoint` | the image config has neither Entrypoint nor Cmd — or there is no config at all, as in `--rootfs` mode | same escalation |
 
 `--roots /path/to/bin` adds entrypoints for an image whose real command comes
