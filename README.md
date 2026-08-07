@@ -703,7 +703,7 @@ under** — the finding carries evidence saying the coordinates were reconstruct
 | Situation | Status | Justification | Method |
 |---|---|---|---|
 | no archive in the image declares the artifact | `not_present` | `component_not_present` | `jar-inventory` |
-| …but some archive could not be read or declares no coordinates | `undetermined` | — | reason `unidentified_archive` |
+| …but an archive that could be it was unreadable or unidentified | `undetermined` | — | reason `unidentified_archive` |
 | the archive holds no `.class` entry at all (sources, javadoc, resources jar) | `not_present` | `vulnerable_code_not_present` | `jar-no-code` |
 | a validated mined class is absent under every package spelling | `not_present` | `vulnerable_code_not_present` | `jar-class-absent` |
 | the archive is present but its listing could not be read | `linked` + blocking evidence | — | `jar-inventory` |
@@ -840,25 +840,36 @@ plugin is an inventory. With it, the numbers below are still dominated by
 | `ghcr.io/christophetd/log4shell-vulnerable-app --ecosystem maven` | 23 (+nested) | 27 | 24 | 0 / 0 / 79 |
 | `eclipse-temurin:21-jre --ecosystem maven` | 0 | 0 | 0 | plugin does not apply |
 
-Read the unidentified column, because it is the one that bites:
+Read the unidentified column, because it used to be the one that bit. An
+archive that declares no coordinates still cannot be named, but it no longer
+blocks every absence answer wholesale: an unidentified archive stops a
+`component_not_present` verdict only for an artifact it *could* be, and a jar
+that is positively something else, or that ships no code at all, is no longer in
+the way.
 
-- **A JRE image's own jars dominate it, and they should.** On the Log4Shell demo
-  image (JDK 8) 21 of the 24 are `rt.jar`, `charsets.jar`, `jre/lib/ext/*.jar`
-  and the security policy jars. Those are not Maven artifacts and have no
-  coordinates to find. But **an unidentified archive blocks `component_not_present`
-  for anything the scan is asked about and does not find** — the archive that
-  could not be named could be the one being asked about. So on a JDK 8 base
-  image, "that artifact is not here" is an answer this tool will not give.
-  Modern JREs are modular (`eclipse-temurin:21-jre` has no jars at all), which
-  is why that row is empty rather than noisy.
-- **`tomcat:10-jre21` leaves 13**, of which 10 are the `tomcat-i18n-*.jar`
-  resource bundles: they ship no classes, so tier 4 has no package prefix to
-  work from. The remainder are `jrt-fs.jar` and a sample war.
-- **A jar whose classes span two unrelated package roots falls out of tier 4.**
-  `spring-aop` bundles `org.aopalliance` alongside `org.springframework.aop`, so
-  the shared prefix is `org` and no coordinate is offered. That is 4 of 127 on
-  Jenkins and 1 of 27 on the demo image. Refusing beats guessing here, but it is
-  a gap, not a design win.
+- **A JRE image's own jars are recognized as the runtime.** On the Log4Shell demo
+  image (JDK 8) 21 of the 24 unnamed archives are `rt.jar`, `charsets.jar`,
+  `jre/lib/ext/*.jar` and the like. Those are not Maven artifacts and never will
+  be, so they are matched by name and set aside as platform jars rather than
+  counted as blockers — they cannot be the third-party artifact a scan is asked
+  about. On a JDK 8 base image, "that artifact is not here" is now an answer this
+  tool will give. Modern JREs are modular (`eclipse-temurin:21-jre` has no jars
+  at all), which is why that row is empty rather than noisy. The name list is
+  deliberately narrow: a project's own `tools.jar` or `plugin.jar` is left alone
+  so it is never mistaken for the platform and wrongly cleared.
+- **`tomcat:10-jre21`'s resource bundles no longer block.** Of the 13 it leaves,
+  10 are the `tomcat-i18n-*.jar` bundles: they ship no classes, so tier 4 has no
+  package prefix to work from — but a codeless archive cannot hold anyone's
+  vulnerable class, so it can no longer stand in the way of an absence answer.
+- **A jar whose classes span two unrelated package roots still falls out of tier
+  4**, and that is correct: `spring-aop` bundles `org.aopalliance` alongside
+  `org.springframework.aop`, so the shared prefix is `org` and no coordinate is
+  offered. It stays unidentified — but the partial identity that *can* be read,
+  the artifactId from its file name and the packages its classes declare, is now
+  kept, so it only blocks an artifact it could actually be. `spring-aop` no
+  longer blocks a question about `log4j-core`. What still blocks is the case that
+  should: an unidentified jar that ships classes under the asked-about group's
+  own package, which could be a repackaged copy carrying it under another name.
 
 **Shading is handled for the class test and not for the inventory.**
 `maven-shade-plugin` relocates `org.apache.commons.X` to

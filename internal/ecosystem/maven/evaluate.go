@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/cwayne18/vexscan/internal/ecosystem"
+	"github.com/cwayne18/vexscan/internal/langdb"
 )
 
 // Methods name the deterministic test behind a status, and appear in the
@@ -124,11 +125,21 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 
 // absent decides a component the user named that no archive declares.
 func (e evaluator) absent(f ecosystem.Finding, c ecosystem.Component) ecosystem.Finding {
-	// An archive that would not open and an archive that names nothing are the
-	// same obstacle: "no archive here is X" is not a claim this scan is
-	// entitled to make while one of them is on the disk, because the one it
-	// could not identify could be X.
-	if blocked := append(append([]string(nil), e.st.unreadable...), e.st.unidentified...); len(blocked) > 0 {
+	// An archive that would not open and an archive that could be the artifact
+	// asked about are the same obstacle: "no archive here is X" is not a claim
+	// this scan is entitled to make while one of them is on the disk. An
+	// unreadable archive is opaque and always counts; an unidentified one counts
+	// only when it could plausibly be X -- a jar positively identified as some
+	// other artifact, or one that ships no code at all, no longer stands in the
+	// way of an answer it cannot be the subject of.
+	group, artifact := splitCoord(c.Name)
+	blocked := append([]string(nil), e.st.unreadable...)
+	for _, u := range e.st.unidentified {
+		if couldBe(u, group, artifact) {
+			blocked = append(blocked, u.Path)
+		}
+	}
+	if len(blocked) > 0 {
 		f.Status = ecosystem.StatusUndetermined
 		f.Reason = "unidentified_archive"
 		f.Evidence = []ecosystem.Evidence{{
@@ -147,6 +158,60 @@ func (e evaluator) absent(f ecosystem.Finding, c ecosystem.Component) ecosystem.
 		Detail: fmt.Sprintf("no jar, war or ear in this image declares %s", c.Name),
 	}}
 	return f
+}
+
+// splitCoord separates a Maven coordinate into its groupId and artifactId. A
+// bare artifactId with no colon leaves the group empty.
+func splitCoord(name string) (group, artifact string) {
+	if g, a, ok := strings.Cut(name, ":"); ok {
+		return g, a
+	}
+	return "", name
+}
+
+// couldBe reports whether an unidentified archive could be the artifact named by
+// group and artifact -- the only case in which it may block a claim of absence.
+//
+// The conclusion is only ever narrowed toward "yes, it could", so a false clean
+// cannot slip through here: the archive stops blocking only on positive evidence
+// that it is something else.
+//
+//   - A codeless archive ships no class, so it cannot hold the vulnerable class
+//     of any artifact and cannot be the one asked about.
+//   - An archive whose file name names a different artifact, and whose classes
+//     live under none of the asked-about group's packages, has said what it is
+//     twice over. A repackaged copy that lied about its name would still carry
+//     the artifact's classes, and those are checked regardless of the name.
+//   - Anything else -- an anonymous jar, or one whose classes could belong to
+//     the artifact -- still blocks.
+func couldBe(u langdb.UnidentifiedArchive, group, artifact string) bool {
+	if !u.HasClasses {
+		return false
+	}
+	if u.FileArtifact != "" && artifact != "" && u.FileArtifact != artifact &&
+		group != "" && !packagesUnder(u.ClassPackages, group) {
+		return false
+	}
+	return true
+}
+
+// packagesUnder reports whether any of the archive's class packages could belong
+// to the given groupId, comparing the group as a package path against each class
+// package in either direction so a class deeper than the group, or a group
+// deeper than the package root, both count.
+func packagesUnder(classPackages []string, group string) bool {
+	root := strings.ReplaceAll(group, ".", "/")
+	if root == "" {
+		return true
+	}
+	for _, p := range classPackages {
+		if p == root ||
+			strings.HasPrefix(p+"/", root+"/") ||
+			strings.HasPrefix(root+"/", p+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // coordinateTaint records that this artifact's identity was reconstructed

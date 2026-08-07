@@ -147,7 +147,10 @@ func Inventory(ctx context.Context, opts Options) (*InventoryResult, error) {
 			logf("    ! unreadable manifest %s", m)
 		}
 		for _, m := range l.Unidentified {
-			logf("    ! archive declares no coordinates %s", m)
+			logf("    ! archive declares no coordinates %s", m.Path)
+		}
+		for _, m := range l.Platform {
+			logf("    - runtime jar, not a queryable artifact: %s", m)
 		}
 	}
 

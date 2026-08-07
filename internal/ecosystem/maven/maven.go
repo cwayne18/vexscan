@@ -108,10 +108,12 @@ type state struct {
 
 	// unreadable are archives that would not open, and unidentified are
 	// archives that opened and declare no coordinates. Both matter only to an
-	// absent component, and for the same reason: something that could not be
-	// named cannot be ruled out as the thing being asked about.
+	// absent component: something that could not be named cannot be ruled out
+	// as the thing being asked about -- but an unidentified archive keeps the
+	// partial identity that was still readable, so absence is only blocked by
+	// the ones that could actually be the artifact named.
 	unreadable   []string
-	unidentified []string
+	unidentified []langdb.UnidentifiedArchive
 }
 
 // name is what to call this component in prose.
