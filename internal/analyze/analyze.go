@@ -166,6 +166,14 @@ type Options struct {
 	// not the same knob as Ecosystems, which chooses which plugins run.
 	OSVEcosystem string
 
+	// OSVBaseURL overrides the OSV API root every advisory lookup is made
+	// against. Empty means the public api.osv.dev. It exists so a scan can be
+	// pointed at a mirror or an offline copy of the database -- the delivery
+	// direction a vendor maintaining its own advisory feed would take -- and so
+	// the corpus tests can drive a whole scan against a served set of
+	// advisories without the network.
+	OSVBaseURL string
+
 	// VEXHubs are VEX Hub repositories to check findings against (--vexhub),
 	// in priority order: the first hub with a statement about a finding wins,
 	// so an internal hub listed ahead of a vendor's overrides it.
@@ -696,7 +704,7 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	run := &imageRun{
 		subjects: subjects,
 		targeted: targeted(subjects),
-		resolver: newResolver(),
+		resolver: newResolver(opts.OSVBaseURL),
 		mine:     newMiner(opts, llmClient),
 		cves:     opts.CVEs,
 		logf:     logf,
@@ -1034,7 +1042,7 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 	run := &sourceRun{
 		subjects: subjects,
 		targeted: targeted(subjects),
-		resolver: newResolver(),
+		resolver: newResolver(opts.OSVBaseURL),
 		cves:     opts.CVEs,
 		logf:     logf,
 	}
@@ -1147,11 +1155,14 @@ type advisoryResolver struct {
 	corrected map[string]osv.Correction
 }
 
-func newResolver() *advisoryResolver {
+func newResolver(osvBaseURL string) *advisoryResolver {
 	r := &advisoryResolver{
 		client:    osv.NewClient(),
 		cache:     map[string]map[string]*osv.Advisory{},
 		corrected: map[string]osv.Correction{},
+	}
+	if osvBaseURL != "" {
+		r.client.BaseURL = osvBaseURL
 	}
 	r.client.OnCorrection = func(c osv.Correction) {
 		r.corrected[c.Advisory+"@"+c.Package+"@"+c.Version] = c

@@ -10,7 +10,7 @@ import (
 const criticalVector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H" // 9.8
 
 func resolverWith(cache map[string]map[string]*osv.Advisory) *advisoryResolver {
-	r := newResolver()
+	r := newResolver("")
 	r.cache = cache
 	return r
 }
