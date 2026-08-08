@@ -225,9 +225,36 @@ func writeCaveats(dst *strings.Builder, res *analyze.Result, pal palette) {
 			fmt.Fprintf(b, "      Either the vendor has published nothing about these packages, or the join failed; treat the OS rows as unreviewed by %s either way.\n", d.Name)
 		}
 	}
+	writeOfflineCaveat(b, res)
 	writeMetadataCaveat(b, res)
 	writeGovulncheckCaveat(b, res)
 	writeTriageCaveats(b, res)
+}
+
+// writeOfflineCaveat says that the advisories were matched locally, and where
+// that matching could not be done.
+//
+// Scanning against a data export moves one job from osv.dev to this machine:
+// deciding which advisories apply to the installed version. Where a comparator
+// exists the answer is the same one the API would have given. Where none does,
+// the advisory is kept -- an over-matched row costs a reader a dismissal, an
+// under-matched one costs them the vulnerability -- and this is where that gets
+// said, because an offline report that quietly over-matched would be a report
+// nobody could calibrate against.
+//
+// A NOTE and not an INCOMPLETE banner: the scan read everything it meant to and
+// no status is unsound. What is weaker is the precision of the affected set.
+func writeOfflineCaveat(b *strings.Builder, res *analyze.Result) {
+	d := res.Descriptor
+	if d == nil || len(d.AdvisoryNotes) == 0 {
+		return
+	}
+	b.WriteString("NOTE: advisories were matched from a local OSV export, not by the OSV API, so\n")
+	b.WriteString("      the installed-version check was done here. Where it could not be done the\n")
+	b.WriteString("      advisory was kept rather than dropped:\n")
+	for _, n := range d.AdvisoryNotes {
+		fmt.Fprintf(b, "      %s\n", n)
+	}
 }
 
 // writeGovulncheckCaveat warns that the Go reachability test was skipped because

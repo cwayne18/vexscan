@@ -9,8 +9,15 @@ import (
 
 const criticalVector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H" // 9.8
 
-func resolverWith(cache map[string]map[string]*osv.Advisory) *advisoryResolver {
-	r := newResolver("")
+func resolverWith(t *testing.T, cache map[string]map[string]*osv.Advisory) *advisoryResolver {
+	t.Helper()
+	// Zero Options names no advisory source, so this is the API-backed resolver
+	// with nothing fetched -- which is all these tests want, since they replace
+	// the cache outright.
+	r, err := newResolver(Options{})
+	if err != nil {
+		t.Fatalf("newResolver: %v", err)
+	}
 	r.cache = cache
 	return r
 }
@@ -19,7 +26,7 @@ func resolverWith(cache map[string]map[string]*osv.Advisory) *advisoryResolver {
 // severity comes out of the advisories the resolver cached to decide the
 // findings existed, so it costs no extra request.
 func TestSeveritiesReadsWhatWasAlreadyFetched(t *testing.T) {
-	r := resolverWith(map[string]map[string]*osv.Advisory{
+	r := resolverWith(t, map[string]map[string]*osv.Advisory{
 		"Debian:12/zlib1g@1:1.2.13.dfsg-1": {
 			"DEBIAN-CVE-2023-45853": {
 				ID:         "DEBIAN-CVE-2023-45853",
@@ -49,7 +56,7 @@ func TestSeveritiesReadsWhatWasAlreadyFetched(t *testing.T) {
 // An advisory reachable from two components must not report a different
 // severity depending on map iteration order.
 func TestSeveritiesIsDeterministicAcrossComponents(t *testing.T) {
-	r := resolverWith(map[string]map[string]*osv.Advisory{
+	r := resolverWith(t, map[string]map[string]*osv.Advisory{
 		"Debian:12/a@1": {"CVE-1": {ID: "CVE-1", PublisherSeverity: "LOW"}},
 		"Debian:12/b@1": {"CVE-1": {ID: "CVE-1", PublisherSeverity: "CRITICAL"}},
 	})
@@ -61,7 +68,7 @@ func TestSeveritiesIsDeterministicAcrossComponents(t *testing.T) {
 }
 
 func TestSeveritiesToleratesNilAdvisories(t *testing.T) {
-	r := resolverWith(map[string]map[string]*osv.Advisory{
+	r := resolverWith(t, map[string]map[string]*osv.Advisory{
 		"Debian:12/a@1": {"CVE-1": nil},
 	})
 	if got := len(r.severities()); got != 0 {

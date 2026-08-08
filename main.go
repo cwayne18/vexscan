@@ -21,8 +21,10 @@ import (
 	"github.com/cwayne18/vexscan/internal/distrofeed/debian"
 	"github.com/cwayne18/vexscan/internal/distrofeed/suse"
 	"github.com/cwayne18/vexscan/internal/elfgraph"
+	"github.com/cwayne18/vexscan/internal/envx"
 	"github.com/cwayne18/vexscan/internal/gist"
 	"github.com/cwayne18/vexscan/internal/modgraph"
+	"github.com/cwayne18/vexscan/internal/osv"
 	"github.com/cwayne18/vexscan/internal/triage"
 )
 
@@ -60,6 +62,8 @@ func main() {
 		goos       = flag.String("os", "linux", "image OS variant to pull (image mode)")
 		arch       = flag.String("arch", "amd64", "image architecture variant to pull (image mode)")
 		osvEco     = flag.String("osv-ecosystem", "", "override the OSV ecosystem derived from the image's os-release, e.g. 'Debian:12'")
+		osvURL     = flag.String("osv-url", "", "OSV API root to query instead of "+osv.DefaultBaseURL+" -- a caching proxy or a mirror serving the same v1 API. For a scan with no network at all use --osv-dir, which reads OSV's published data export directly (env: VEXSCAN_OSV_URL)")
+		osvDir     = flag.String("osv-dir", "", "answer advisory lookups from a local copy of OSV's data export instead of the API: a directory of per-ecosystem JSON (gsutil -m rsync -r gs://osv-vulnerabilities DIR), or an all.zip. Version matching then happens here rather than on osv.dev, so read the NOTE the report prints about it (env: VEXSCAN_OSV_DIR)")
 		dlopen     = flag.String("dlopen-policy", "taint", "what a reachable dlopen does to the closure: taint (block conclusions) or assume-none")
 		dynamic    = flag.String("dynamic-import-policy", "taint", "what an import of a computed name does to a language import graph: taint (block conclusions) or assume-none; these are far more common than dlopen, so assume-none discards much more")
 		triageOn   = flag.Bool("triage", false, "order findings by exploitation evidence: EPSS scores and CISA's known-exploited catalog. Adds two columns and sorts known-exploited first, then by EPSS percentile; nothing is hidden, and no severity changes. Downloads two public feeds (~4 MB, cached under VEXSCAN_TRIAGE_CACHE)")
@@ -199,6 +203,16 @@ func main() {
 		fail("%v", err)
 	}
 
+	// The two advisory-source flags name the same thing twice, and honouring
+	// both would mean silently picking one -- on a flag whose whole purpose is
+	// deciding where the advisories came from. Resolved before the target
+	// checks so it fails on the command line rather than after a pull.
+	advisoryDir := pick(*osvDir, envx.Get("OSV_DIR"))
+	advisoryURL := pick(*osvURL, envx.Get("OSV_URL"))
+	if advisoryDir != "" && advisoryURL != "" {
+		fail("--osv-dir reads a local data export and --osv-url queries an API; pass one")
+	}
+
 	logf := func(format string, args ...any) {
 		if !*quiet {
 			fmt.Fprintf(os.Stderr, format+"\n", args...)
@@ -242,6 +256,8 @@ func main() {
 		OS:                 *goos,
 		Arch:               *arch,
 		OSVEcosystem:       *osvEco,
+		OSVBaseURL:         advisoryURL,
+		OSVDir:             advisoryDir,
 		Roots:              roots,
 		VEXHubs:            vexhubs,
 		Triage:             triageLoader(*triageOn),
@@ -449,6 +465,18 @@ func distroProviders(on bool) []distrofeed.Provider {
 		return nil
 	}
 	return []distrofeed.Provider{debian.New(), suse.New()}
+}
+
+// pick returns the first non-empty of its arguments, which is how a flag that
+// also has an environment variable resolves: the flag was typed for this run
+// and the variable was exported for all of them.
+func pick(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // fail prints a usage error and exits 2.
@@ -746,6 +774,27 @@ status or a severity: whether a vulnerability is being exploited elsewhere says
 nothing about whether the code is present here. Both are keyed by CVE, so an
 advisory that never got one cannot be scored, and the report names those rather
 than filing them as zero. Absence from the KEV catalog means nothing at all.
+
+Advisories come from api.osv.dev unless you say otherwise. Two flags say
+otherwise, and they differ in who decides which advisories apply, not just in
+where the bytes come from:
+
+  vexscan --image myorg/app:latest --all --osv-url http://osv-proxy.corp:8000
+  gsutil -m rsync -r gs://osv-vulnerabilities /srv/osv
+  vexscan --image myorg/app:latest --all --osv-dir /srv/osv
+
+--osv-url still queries a v1 OSV API, just a different one: a caching proxy in
+front of osv.dev, or a mirror serving your own feed. osv.dev still matches the
+installed version against each advisory's ranges. Use it to cut egress or to
+pin a scan to a vendor's advisory set.
+
+--osv-dir needs no server at all. It reads OSV's published data export -- the
+same records the API serves -- from a directory or an all.zip, which makes it
+the flag for a host with no network. The version matching then happens on this
+machine, against dpkg, rpm, apk and semver ordering. Where no comparator can
+order an ecosystem the advisory is kept rather than dropped, and the report
+says how many and which: over-matching costs a reader a dismissal, and
+under-matching costs them the vulnerability. Pass one or the other, never both.
 
 --version prints vexscan's own version and exits. It used to mean "override the
 module version read from a binary's build info"; that setting is now spelled

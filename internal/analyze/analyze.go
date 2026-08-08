@@ -169,11 +169,28 @@ type Options struct {
 
 	// OSVBaseURL overrides the OSV API root every advisory lookup is made
 	// against. Empty means the public api.osv.dev. It exists so a scan can be
-	// pointed at a mirror or an offline copy of the database -- the delivery
-	// direction a vendor maintaining its own advisory feed would take -- and so
-	// the corpus tests can drive a whole scan against a served set of
-	// advisories without the network.
+	// pointed at a mirror -- a caching proxy, or a vendor serving the same v1
+	// API over its own advisory feed -- and so the corpus tests can drive a
+	// whole scan against a served set of advisories without the network.
+	//
+	// It still speaks HTTP to something. OSVDir is the knob for a host with no
+	// network at all.
 	OSVBaseURL string
+
+	// OSVDir answers advisory lookups from a local copy of OSV's published data
+	// export instead of from any API: a directory laid out the way
+	// gs://osv-vulnerabilities is, or an all.zip holding the same records.
+	//
+	// The difference from OSVBaseURL is not the transport, it is who decides
+	// which advisories apply. Against the API, osv.dev matches the queried
+	// version against each record's ranges and vexscan reads the answer. Against
+	// an export there is nobody to ask, so that matching happens here -- see
+	// osv.OpenLocal, and the caveat the report prints because of it.
+	//
+	// Mutually exclusive with OSVBaseURL: both name the advisory source, and
+	// choosing between them silently is the one thing a provenance knob must not
+	// do.
+	OSVDir string
 
 	// VEXHubs are VEX Hub repositories to check findings against (--vexhub),
 	// in priority order: the first hub with a statement about a finding wins,
@@ -331,10 +348,10 @@ type Descriptor struct {
 	Started  time.Time `json:"started,omitempty"`  // when the command began
 	Duration string    `json:"duration,omitempty"` // "12.4s"
 
-	// AdvisorySource is where the advisories were read from -- today always
-	// the live OSV API, and the one field an offline or cached database would
-	// change. It is recorded even when nothing was queried, because "which
-	// database said nothing" is the question an empty report raises.
+	// AdvisorySource is where the advisories were read from: the live OSV API,
+	// a mirror named by OSVBaseURL, or a local data export named by OSVDir. It
+	// is recorded even when nothing was queried, because "which database said
+	// nothing" is the question an empty report raises.
 	AdvisorySource string `json:"advisory_source,omitempty"`
 
 	// AdvisoriesAsOf is when that source answered, which for a live API is how
@@ -342,6 +359,15 @@ type Descriptor struct {
 	// itself worth telling apart from a scan that resolved some and found
 	// nothing.
 	AdvisoriesAsOf time.Time `json:"advisories_as_of,omitempty"`
+
+	// AdvisoryNotes are caveats the source itself raised about the answers it
+	// gave. Empty for the API, which does its own version matching and reports
+	// nothing about it; non-empty for a local export, which does that matching
+	// here and has to say where it could not.
+	//
+	// They are caveats and not findings, so they are printed with the other
+	// caveats and never change a status.
+	AdvisoryNotes []string `json:"advisory_notes,omitempty"`
 }
 
 // Failed reports whether the findings are an incomplete account of the target
@@ -718,10 +744,14 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	analyzers := ecosystem.ImageAnalyzers(plugins)
 	result := &Result{SchemaVersion: SchemaVersion, Target: img.Ref, Mode: opts.mode(), Module: opts.Module}
 
+	resolver, err := newResolver(opts)
+	if err != nil {
+		return nil, err
+	}
 	run := &imageRun{
 		subjects: subjects,
 		targeted: targeted(subjects),
-		resolver: newResolver(opts.OSVBaseURL),
+		resolver: resolver,
 		mine:     newMiner(opts, llmClient),
 		cves:     opts.CVEs,
 		logf:     logf,
@@ -1065,10 +1095,14 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 
 	// The inventory-driven analyzers run through the same three phases as an
 	// image scan, sharing one advisory cache between them.
+	resolver, err := newResolver(opts)
+	if err != nil {
+		return nil, err
+	}
 	run := &sourceRun{
 		subjects: subjects,
 		targeted: targeted(subjects),
-		resolver: newResolver(opts.OSVBaseURL),
+		resolver: resolver,
 		cves:     opts.CVEs,
 		logf:     logf,
 	}
@@ -1158,13 +1192,35 @@ func (r *sourceRun) analyze(ctx context.Context, a ecosystem.InventorySourceAnal
 	return stamp(a.ID(), findings), true, nil
 }
 
+// advisorySource is where advisories come from.
+//
+// Three methods, because that is the whole of what the resolver ever asked of
+// osv.Client: two lookups and a name to print. Keeping it that narrow is the
+// point -- an alternative source has to answer the same two questions in the
+// same osv.Advisory shape, so every field the analysis depends on (Upstream for
+// the distro-feed join, Pkgs for Go package granularity, Fixed for the fix
+// plan) is present or the source does not compile, rather than arriving empty
+// and reading as "nothing to say".
+type advisorySource interface {
+	// Query returns advisory-id -> Advisory for one ref, keyed by every
+	// identifier the advisory is known by.
+	Query(ctx context.Context, ref osv.Ref) (map[string]*osv.Advisory, error)
+	// QueryBatch resolves many refs at once; result[i] answers refs[i], so the
+	// answer is always the same length as refs.
+	QueryBatch(ctx context.Context, refs []osv.Ref) ([]map[string]*osv.Advisory, error)
+	// Describe names the source for Descriptor.AdvisorySource. A report outlives
+	// the run, and "which database said this" is not recoverable from the
+	// findings.
+	Describe() string
+}
+
 // advisoryResolver turns an inventory into per-component advisory sets.
 //
 // It lives here rather than in the plugins so that no plugin decides which
 // advisories exist for the code it just examined — the presence test and the
 // vulnerability list come from independent parties.
 type advisoryResolver struct {
-	client *osv.Client
+	client advisorySource
 	cache  map[string]map[string]*osv.Advisory // component key -> advisories
 
 	// asOf is when the advisory database first answered. It is a read of the
@@ -1181,19 +1237,41 @@ type advisoryResolver struct {
 	corrected map[string]osv.Correction
 }
 
-func newResolver(osvBaseURL string) *advisoryResolver {
+// newResolver builds the resolver over whichever advisory source the options
+// name. An unreadable local export is a hard error rather than a fall back to
+// the API: the reason to pass OSVDir is that there is no network to fall back
+// to, and a scan that silently changed where its advisories came from would
+// misreport the one field that says.
+func newResolver(opts Options) (*advisoryResolver, error) {
 	r := &advisoryResolver{
-		client:    osv.NewClient(),
 		cache:     map[string]map[string]*osv.Advisory{},
 		corrected: map[string]osv.Correction{},
 	}
-	if osvBaseURL != "" {
-		r.client.BaseURL = osvBaseURL
-	}
-	r.client.OnCorrection = func(c osv.Correction) {
+	// The callback is wired before the source is handed over, so a correction
+	// raised during the very first lookup is counted.
+	onCorrection := func(c osv.Correction) {
 		r.corrected[c.Advisory+"@"+c.Package+"@"+c.Version] = c
 	}
-	return r
+
+	if opts.OSVDir != "" {
+		if opts.OSVBaseURL != "" {
+			return nil, fmt.Errorf("OSVDir reads a local data export and OSVBaseURL queries an API; set one")
+		}
+		db, err := osv.OpenLocal(opts.OSVDir, onCorrection, opts.Logf)
+		if err != nil {
+			return nil, fmt.Errorf("opening the local OSV export: %w", err)
+		}
+		r.client = db
+		return r, nil
+	}
+
+	c := osv.NewClient()
+	if opts.OSVBaseURL != "" {
+		c.BaseURL = opts.OSVBaseURL
+	}
+	c.OnCorrection = onCorrection
+	r.client = c
+	return r, nil
 }
 
 // corrections is what the resolver set aside, or nil if it set aside nothing.
@@ -1224,11 +1302,15 @@ func (r *advisoryResolver) answered() {
 // descriptor is the provenance half of Result.Descriptor -- the half only the
 // resolver can fill in.
 func (r *advisoryResolver) descriptor() *Descriptor {
-	base := r.client.BaseURL
-	if base == "" {
-		base = osv.DefaultBaseURL
+	d := &Descriptor{AdvisorySource: r.client.Describe(), AdvisoriesAsOf: r.asOf}
+	// Optional, and deliberately not part of advisorySource: having something
+	// to say here is a property of matching versions locally, and the API path
+	// -- where osv.dev did that matching and did not report on it -- would only
+	// ever return nil.
+	if n, ok := r.client.(interface{ Notes() []string }); ok {
+		d.AdvisoryNotes = n.Notes()
 	}
-	return &Descriptor{AdvisorySource: base, AdvisoriesAsOf: r.asOf}
+	return d
 }
 
 // workItems pairs each component with its advisories and the requested ids.
