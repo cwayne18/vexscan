@@ -224,12 +224,17 @@ func readZip(path string, add func(string, []byte)) error {
 		}
 		rc, err := f.Open()
 		if err != nil {
-			return err
+			return fmt.Errorf("%s: %w", f.Name, err)
 		}
-		data, err := io.ReadAll(rc)
+		const maxJSON = 50 << 20 // 50 MiB
+		lr := &io.LimitedReader{R: rc, N: maxJSON + 1}
+		data, err := io.ReadAll(lr)
 		rc.Close()
 		if err != nil {
-			return err
+			return fmt.Errorf("%s: %w", f.Name, err)
+		}
+		if lr.N <= 0 {
+			return fmt.Errorf("%s: JSON record too large (>%d bytes)", f.Name, maxJSON)
 		}
 		add(f.Name, data)
 	}
