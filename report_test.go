@@ -1199,6 +1199,73 @@ func TestALongReportRepeatsTheCorrectionNote(t *testing.T) {
 	}
 }
 
+// An offline scan matched the versions itself, and where it could not it kept
+// the advisory. That is a weaker affected set than the API would have given, and
+// a report that did not say so would be one nobody could calibrate against.
+
+func offlineReport(t *testing.T, notes []string, findings ...analyze.Finding) string {
+	t.Helper()
+	return renderText(&analyze.Result{
+		SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
+		Findings:   findings,
+		Descriptor: &analyze.Descriptor{AdvisorySource: "local OSV export /srv/osv", AdvisoryNotes: notes},
+	}, renderOpts{})
+}
+
+func TestTheOfflineCaveatNamesWhatCouldNotBeChecked(t *testing.T) {
+	out := offlineReport(t, []string{
+		"PyPI: 4 advisory(ies) kept without a version check (no comparator), e.g. GHSA-aaaa, GHSA-bbbb",
+	}, gccTrio[1])
+
+	if !strings.Contains(out, "NOTE: advisories were matched from a local OSV export") {
+		t.Errorf("no offline banner in:\n%s", out)
+	}
+	// The ecosystem, the count and the ids: a reader who wants to check the four
+	// rows by hand needs all three, and a bare "some were kept" gives them none.
+	for _, want := range []string{"PyPI", "4 advisory(ies)", "GHSA-aaaa"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
+	}
+}
+
+// The whole point of the note is that the export path over-matches. An empty
+// report from an offline scan still has to say the scan was offline.
+func TestTheOfflineCaveatSurvivesAnEmptyReport(t *testing.T) {
+	out := offlineReport(t, []string{"Hex: 1 advisory(ies) kept without a version check (no comparator)"})
+	if !strings.Contains(out, "local OSV export") {
+		t.Errorf("an empty offline report dropped its note:\n%s", out)
+	}
+}
+
+// An offline scan whose every version *was* checked has nothing weaker to
+// declare, and a note it prints every time is a note readers learn to skip.
+func TestNoOfflineCaveatWhenEveryVersionWasChecked(t *testing.T) {
+	out := offlineReport(t, nil, gccTrio[1])
+	if strings.Contains(out, "local OSV export, not by the OSV API") {
+		t.Errorf("a fully-checked offline scan raised the caveat anyway:\n%s", out)
+	}
+}
+
+func TestNoOfflineCaveatWithoutADescriptor(t *testing.T) {
+	out := report(t, false, gccTrio...)
+	if strings.Contains(out, "local OSV export") {
+		t.Errorf("an API-backed report mentions a local export:\n%s", out)
+	}
+}
+
+func TestALongReportRepeatsTheOfflineCaveat(t *testing.T) {
+	out := longReport(t, 60, func(res *analyze.Result) {
+		res.Descriptor = &analyze.Descriptor{
+			AdvisorySource: "local OSV export /srv/osv",
+			AdvisoryNotes:  []string{"PyPI: 4 advisory(ies) kept without a version check (no comparator)"},
+		}
+	})
+	if got := strings.Count(out, "NOTE: advisories were matched from a local OSV export"); got != 2 {
+		t.Errorf("offline note appears %d times, want 2 (both ends):\n%s", got, out)
+	}
+}
+
 // Paging must never be able to change a byte, so the renderer cannot know
 // whether it is talking to a terminal. This is the regression test for that:
 // the same result renders identically however it is consumed.

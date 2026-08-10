@@ -219,11 +219,18 @@ func NewClient() *Client {
 }
 
 func (c *Client) endpoint(path string) string {
-	base := c.BaseURL
-	if base == "" {
-		base = DefaultBaseURL
+	return strings.TrimSuffix(c.Describe(), "/") + path
+}
+
+// Describe names the advisory source this client reads, for the provenance line
+// a report carries. It is the configured root rather than a fixed string
+// because pointing a scan at a mirror changes the answer to "who said this",
+// which is the whole reason the field exists.
+func (c *Client) Describe() string {
+	if c.BaseURL == "" {
+		return DefaultBaseURL
 	}
-	return strings.TrimSuffix(base, "/") + path
+	return c.BaseURL
 }
 
 func (c *Client) http() *http.Client {
@@ -276,6 +283,14 @@ type vuln struct {
 	Upstream []string `json:"upstream"`
 	Summary  string   `json:"summary"`
 	Details  string   `json:"details"`
+	// Withdrawn is set, to a timestamp, when the publisher retracted the record.
+	//
+	// Read only by the local export reader. The API never serves a withdrawn
+	// record, but the bucket keeps shipping it -- so this is a filter the API
+	// silently applied on vexscan's behalf that the offline path has to apply
+	// for itself, and one of the few places the two sources are not the same
+	// data.
+	Withdrawn string `json:"withdrawn"`
 	// Severity is OSV's list of scores, one per scoring system. A record may
 	// carry a CVSS_V3 entry, a CVSS_V4 entry, both, or neither.
 	Severity []struct {
@@ -314,6 +329,12 @@ type affected struct {
 	// record almost always has one range with one fixed event, which is
 	// the version to upgrade to.
 	Ranges []versionRange `json:"ranges"`
+	// Versions is the enumerated list of affected versions some records publish
+	// instead of, or alongside, ranges. It is read only by the local export
+	// reader: against the API, osv.dev has already applied it. Matching it needs
+	// no comparator, so where it exists it is the most reliable answer available
+	// offline.
+	Versions []string `json:"versions"`
 }
 
 type versionRange struct {
