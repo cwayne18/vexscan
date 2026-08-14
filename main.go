@@ -53,7 +53,7 @@ func main() {
 		ref        = flag.String("ref", "", "branch, tag, or commit to check out for --repo (default: repo default branch)")
 		repoPath   = flag.String("repo-path", ".", "module subdirectory within --repo to scan")
 		module     = flag.String("module", "", "deprecated alias for --package golang:MODULE")
-		all        = flag.Bool("all", false, "check everything each ecosystem can inventory, instead of named packages")
+		all        = flag.Bool("all", false, "check everything each ecosystem can inventory, instead of named packages (the default in --image mode when no --package/--cves is given)")
 		cvesFlag   = flag.String("cves", "", "comma-separated CVE/GHSA/GO ids to check; alone, they are resolved against the whole target")
 		cvesFile   = flag.String("cves-file", "", "path to a file with one CVE/GHSA/GO id per line (merged with --cves)")
 		modVersion = flag.String("module-version", "", "override the module version (image mode only; default: read from each binary's build info)")
@@ -70,7 +70,7 @@ func main() {
 		mine       = flag.Bool("mine-advisories", false, "with --llm, let the model read each advisory's prose for symbols to check against the image")
 		rpmDeep    = flag.Bool("rpm-deep", false, "with --rpm, decompress each package's payload and extract its ELF objects so the dynsym-absent test can run (needs --mine-advisories to have a symbol to look for; costs the whole download, and still cannot run the reachability closure)")
 		trustAbs   = flag.Bool("trust-import-absence", false, "let a missing dynamic import of the vulnerable symbol conclude not_in_execute_path (see README: this is weaker than it looks)")
-		useLLM     = flag.Bool("llm", false, "consult a chat model on genuinely-affected CVEs for exploitability (needs a provider: --llm-endpoint or --llm-command)")
+		useLLM     = flag.Bool("llm", false, "consult a chat model on genuinely-affected CVEs for exploitability (needs a provider: --llm-endpoint or --llm-command; implies --details for --format text so the verdicts are shown)")
 		llmURL     = flag.String("llm-endpoint", "", "OpenAI-compatible chat/completions URL for --llm -- an API provider, or a local Ollama (env: VEXSCAN_LLM_ENDPOINT; credential: VEXSCAN_LLM_TOKEN)")
 		llmModel   = flag.String("llm-model", "", "model id for --llm-endpoint (env: VEXSCAN_LLM_MODEL; default gpt-4o)")
 		llmCommand = flag.String("llm-command", "", "for --llm, run this installed CLI instead of calling an endpoint, e.g. 'claude -p'; the prompt arrives on its stdin (env: VEXSCAN_LLM_COMMAND)")
@@ -177,6 +177,21 @@ func main() {
 	colors, err := parseColor(*colorMode)
 	if err != nil {
 		fail("%v", err)
+	}
+
+	// --image with no subject means "scan the whole image": --all is the only
+	// sensible default there, so assume it rather than making the user type it.
+	// A named --package/--module/--cves still narrows the scan, and --all with
+	// those is an error caught just below, so only fill it in when nothing else
+	// selects a subject.
+	if *image != "" && !*all && len(packages) == 0 && *module == "" && len(cves) == 0 {
+		*all = true
+	}
+	// --llm's verdicts live in the per-finding evidence block, which only the
+	// text report prints and only with --details; without it the model runs and
+	// its output goes nowhere, so turn it on for the format that can show it.
+	if *useLLM && *format == "text" {
+		*details = true
 	}
 
 	if !inventoryMode {

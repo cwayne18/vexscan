@@ -146,7 +146,7 @@ Three ways to say what to check, and you need exactly one of them:
 |---|---|
 | `--package SPEC...` | these components, every advisory that applies to them (or just `--cves`) |
 | `--cves LIST` alone | resolve these ids against the whole target, wherever they land |
-| `--all` | everything each selected ecosystem can enumerate |
+| `--all` | everything each selected ecosystem can enumerate (the default in `--image` mode when you name no `--package`/`--cves`) |
 
 `--ecosystem` (repeatable) restricts which plugins run. Naming one that no
 plugin provides is an error rather than a silent empty report — as is a
@@ -1121,7 +1121,10 @@ deterministic tests could not clear, and it cannot change a status.
 - **`--llm`** — for CVEs whose vulnerable code is genuinely linked or reachable,
   a chat model gives an advisory `likely` / `unlikely` / `unknown` exploitability
   verdict, recorded under `llm` on the finding. You choose which model — see
-  [Choosing a provider](#choosing-a-provider).
+  [Choosing a provider](#choosing-a-provider). Because the verdict lives in the
+  per-finding evidence block, `--llm` turns on `--details` for `--format text`
+  so it is actually printed; pass `--format json`/`sarif` to get it structured
+  instead.
 - **`--mine-advisories`** — lets the model read an advisory's prose and extract
   symbols, sonames, filenames and **module paths** worth checking. Distro OSV
   records give a fixed version and nothing about what inside the package is
