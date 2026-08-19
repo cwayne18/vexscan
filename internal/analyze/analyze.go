@@ -818,6 +818,9 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	// costs no network (every record was fetched to decide the findings existed),
 	// so hoisting it above the filter is free.
 	sets := run.resolver.cveSets()
+	// Promote GO/GHSA display ids to their CVE before anything reads a finding's
+	// identity, so scoring evidence, the report and --details all name the CVE.
+	cveOverlay(result.Findings, sets.All)
 	// --prefer-vendor favours a vendor's own CVSS score over the OSV-derived one,
 	// and does so before the severity filter and the fail gate so a vendor score
 	// that raises or lowers a rating is what both weigh -- which is the whole
@@ -1165,6 +1168,8 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 	// Go finding here is UNKNOWN, and a preferred vendor's score is the only way one
 	// gets a real rating that --severity can then filter on.
 	sets := run.resolver.cveSets()
+	// See runTree: name each finding by its CVE where the alias set has one.
+	cveOverlay(result.Findings, sets.All)
 	if len(opts.VendorScorers) > 0 {
 		preferVendorScores(ctx, opts.VendorScorers, result.Findings, sets.All, logf)
 	}
@@ -1636,6 +1641,34 @@ func (r *advisoryResolver) cveSets() idSets {
 		}
 	}
 	return out
+}
+
+// cveOverlay promotes a real CVE into a finding's CVE field for display.
+//
+// A Go advisory is reported under its own GO-2026-1234 id, and a GHSA record
+// under a GHSA id; both usually alias the CVE a reader actually wants to look
+// up, and vexscan otherwise prints the GO/GHSA spelling because that is the id
+// the plugin was handed. When a finding's CVE field does not already hold a CVE,
+// this fills it from the advisory's alias set -- the same set the score, VEX and
+// distro joins resolve through -- so the report prints CVE-2026-1234 and
+// --details shows "CVE-2026-1234 (GO-2026-1234)".
+//
+// The GO/GHSA id stays in GoID and ID, so every overlay that matches on it --
+// severity, upstream, VEX, prefer-vendor -- keeps hitting; this only adds the
+// CVE as a fourth name, never removes one. Only an unambiguous CVE is promoted:
+// a bundle that fixes several has no single CVE to stand in for its id, so it
+// keeps its own and upstreamOverlay lists the rest under "addresses:". A finding
+// with no CVE alias at all -- a distro DSA, say -- is left exactly as it is.
+func cveOverlay(findings []Finding, all map[string][]string) {
+	for i := range findings {
+		f := &findings[i]
+		if bareCVE.MatchString(f.CVE) {
+			continue
+		}
+		if cves := findingCVEs(*f, all); len(cves) == 1 {
+			f.CVE = cves[0]
+		}
+	}
 }
 
 // upstreamOverlay records, on each finding, the CVEs its advisory addresses.
