@@ -43,6 +43,20 @@ type csafProduct struct {
 type csafVulnerability struct {
 	CVE           string            `json:"cve"`
 	ProductStatus csafProductStatus `json:"product_status"`
+	// Scores is SUSE's own CVSS rating(s) for the CVE. A VEX document carries
+	// product status; a SUSE one also carries the score, which --prefer-vendor
+	// reads to favour SUSE's rating over the OSV-derived one.
+	Scores []csafScore `json:"scores"`
+}
+
+// csafScore is one CVSS entry in a vulnerability's scores array. Only the v3
+// vector is read: internal/cvss scores v3.0/v3.1 and nothing else, matching how
+// every other advisory in this tool is rated.
+type csafScore struct {
+	CVSSV3 struct {
+		BaseScore    float64 `json:"baseScore"`
+		VectorString string  `json:"vectorString"`
+	} `json:"cvss_v3"`
 }
 
 // csafProductStatus is the per-product verdict lists. Each entry is a composite
@@ -102,8 +116,13 @@ func (p *Provider) fetchAll(ctx context.Context, cves []string) (map[string]*adv
 }
 
 // fetchOne fetches and parses one CVE's document. A 404 returns (nil, nil): no
-// record is a decline, not a failure.
+// record is a decline, not a failure. A document fetched once in a scan is
+// cached, so the score pass and the verdict pass share a single download.
 func (p *Provider) fetchOne(ctx context.Context, cve string) (*advisory, error) {
+	key := strings.ToUpper(cve)
+	if c, ok := p.cached(key); ok {
+		return c.adv, nil
+	}
 	url := p.docURL(cve)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -115,12 +134,37 @@ func (p *Provider) fetchOne(ctx context.Context, cve string) (*advisory, error) 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
+		p.store(key, nil)
 		return nil, nil
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("fetch %s: %s", url, resp.Status)
 	}
-	return parseDocument(resp.Body, url)
+	adv, err := parseDocument(resp.Body, url)
+	if err != nil {
+		return nil, err
+	}
+	p.store(key, adv)
+	return adv, nil
+}
+
+// cached returns a memoised document for a CVE. The bool distinguishes a cached
+// 404 (adv nil, ok true) from a CVE never fetched (ok false).
+func (p *Provider) cached(key string) (cachedDoc, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	c, ok := p.docs[key]
+	return c, ok
+}
+
+// store memoises a fetched document, allocating the cache on first use.
+func (p *Provider) store(key string, adv *advisory) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.docs == nil {
+		p.docs = map[string]cachedDoc{}
+	}
+	p.docs[key] = cachedDoc{adv: adv}
 }
 
 // parseDocument decodes a CSAF-VEX document into the reduced advisory form,
@@ -143,15 +187,40 @@ func parseDocument(r io.Reader, url string) (*advisory, error) {
 		url:           url,
 		cpeToProducts: map[string][]string{},
 		vulns:         map[string]*vulnStatus{},
+		scores:        map[string]string{},
 	}
 	collectCPEs(doc.ProductTree.Branches, adv.cpeToProducts)
 	for _, v := range doc.Vulnerabilities {
 		if v.CVE == "" {
 			continue
 		}
-		adv.vulns[strings.ToUpper(v.CVE)] = buildVulnStatus(v.ProductStatus)
+		cve := strings.ToUpper(v.CVE)
+		adv.vulns[cve] = buildVulnStatus(v.ProductStatus)
+		if vec := bestVector(v.Scores); vec != "" {
+			adv.scores[cve] = vec
+		}
 	}
 	return adv, nil
+}
+
+// bestVector returns the CVSS v3 vector to use for a CVE from its scores array.
+// SUSE publishes a single rating per CVE across its products, so there is
+// normally one entry; should a document ever carry several, the highest base
+// score wins, the same fail-towards-severe rule the rest of this tool uses when
+// two sources rate one vulnerability differently.
+func bestVector(scores []csafScore) string {
+	var best string
+	var bestScore float64 = -1
+	for _, s := range scores {
+		vec := strings.TrimSpace(s.CVSSV3.VectorString)
+		if !strings.HasPrefix(vec, "CVSS:3.0/") && !strings.HasPrefix(vec, "CVSS:3.1/") {
+			continue
+		}
+		if s.CVSSV3.BaseScore > bestScore {
+			best, bestScore = vec, s.CVSSV3.BaseScore
+		}
+	}
+	return best
 }
 
 // collectCPEs walks the product tree and records, for every product that carries

@@ -148,4 +148,11 @@ type Statement struct {
 	Source string
 	// Author is who published the feed, e.g. "Debian Security Tracker".
 	Author string
+	// CVSSVector is the vendor's own CVSS v3 base vector for the CVE, when the
+	// feed publishes one (SUSE's CSAF does; Debian's tracker does not). It is
+	// carried for --prefer-vendor, which favours a named vendor's rating over
+	// the OSV-derived one. Empty when the feed stated no score, in which case
+	// the OSV rating stands. Like every other field here it is a second opinion
+	// and never changes a finding's Status.
+	CVSSVector string
 }

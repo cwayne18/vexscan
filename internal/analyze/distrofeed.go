@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cwayne18/vexscan/internal/cvss"
 	"github.com/cwayne18/vexscan/internal/distrofeed"
 	"github.com/cwayne18/vexscan/internal/ecosystem"
 )
@@ -13,6 +14,12 @@ import (
 // security feed contributed. It is a sibling of "vendor-vex": both are a
 // vendor's published second opinion, recorded and never allowed to set a status.
 const OriginDistroFeed = "distro-feed"
+
+// OriginPreferVendor is the evidence origin recorded when --prefer-vendor
+// replaces a finding's rating with a vendor's own CVSS score. Unlike the other
+// origins this one marks a change to Severity/CVSS, so it exists to leave an
+// audit trail of which vendor's score won and what it displaced.
+const OriginPreferVendor = "prefer-vendor"
 
 // distroOverlay annotates OS-package findings with a distribution's own security
 // feed, in place, and reports what each feed contributed.
@@ -179,4 +186,137 @@ func osFindings(findings []Finding, idSets map[string][]string) ([]distrofeed.Pk
 // findings a distro feed is about.
 func isOSPackage(f Finding) bool {
 	return f.Ecosystem == "os"
+}
+
+// distroScores fetches every provider's statements for the current findings and
+// returns them without applying any verdict, together with the index that ties a
+// statement's RefID back to its finding.
+//
+// It exists so --prefer-vendor can read a vendor's CVSS score before the
+// severity filter runs, where distroOverlay -- which runs after it, for the
+// precedence reasons on that function -- would be too late to change what the
+// filter and the fail gate weigh. The two share a fetch: each provider caches
+// the documents it reads, so distroOverlay's later pass costs no extra network.
+//
+// A provider that errors is logged and skipped, never fatal: a score that could
+// not be read only leaves the OSV rating in place, which over-reports at worst
+// and can never invent a clean.
+func distroScores(ctx context.Context, providers []distrofeed.Provider, os *OSInfo, findings []Finding, ids map[string][]string, logf func(string, ...any)) ([]distrofeed.Statement, map[string]*Finding) {
+	if len(providers) == 0 || os == nil || os.ID == "" {
+		return nil, nil
+	}
+	refs, index := osFindings(findings, ids)
+	if len(refs) == 0 {
+		return nil, index
+	}
+	var out []distrofeed.Statement
+	for _, p := range providers {
+		if !p.Handles(os.ID) {
+			continue
+		}
+		stmts, err := p.Lookup(ctx, distrofeed.Query{OSID: os.ID, Release: os.VersionID, CPE: os.CPEName, Packages: refs})
+		if err != nil {
+			logf("  ! distro feed %s: %v", p.Name(), err)
+			logf("    (its OSV-derived rating stands for any score it could not read)")
+		}
+		out = append(out, stmts...)
+	}
+	return out, index
+}
+
+// preferVendorOverlay overrides a finding's severity with a preferred vendor's
+// own CVSS score, in place, when --prefer-vendor named one that scored the
+// finding's CVE.
+//
+// It is the one overlay that deliberately changes Severity and CVSS. The rule is
+// that the vendor's score is authoritative: it wins even when it is lower than
+// the OSV-derived rating, because "trust my distribution's rating of this CVE"
+// is exactly what the flag asks for. When several preferred vendors scored the
+// same finding, the earliest in the --prefer-vendor list wins, the same
+// earliest-wins order --vexhub uses.
+//
+// It records what it did as evidence so the change is auditable, and never
+// touches Status: the local verdict on whether the code is present stands.
+func preferVendorOverlay(stmts []distrofeed.Statement, index map[string]*Finding, prefer []string, logf func(string, ...any)) {
+	if len(stmts) == 0 || len(prefer) == 0 || len(index) == 0 {
+		return
+	}
+	// pick is the winning vendor's score for one finding so far, kept so a
+	// higher-priority vendor listed later in the statements can still displace a
+	// lower-priority one seen first.
+	type pick struct {
+		rank   int
+		vendor string
+		vector string
+		label  string
+		was    string
+	}
+	best := map[*Finding]pick{}
+	for _, st := range stmts {
+		if st.CVSSVector == "" {
+			continue
+		}
+		rank := vendorRank(st.Author, prefer)
+		if rank < 0 {
+			continue
+		}
+		f := index[st.RefID]
+		if f == nil {
+			continue
+		}
+		score, ok := cvss.Score(st.CVSSVector)
+		if !ok {
+			// A vector this tool cannot score is no better than no score: leave
+			// the OSV rating rather than blank a finding on a vendor typo.
+			continue
+		}
+		if cur, seen := best[f]; seen && cur.rank <= rank {
+			continue
+		}
+		best[f] = pick{rank: rank, vendor: st.Author, vector: st.CVSSVector, label: cvss.Label(score), was: f.Severity}
+	}
+	var overridden int
+	for f, p := range best {
+		f.Severity = p.label
+		f.CVSS = p.vector
+		f.Evidence = append(f.Evidence, ecosystem.Evidence{
+			Origin: OriginPreferVendor,
+			Detail: preferDetail(p.vendor, p.label, p.was),
+		})
+		overridden++
+	}
+	if overridden > 0 {
+		logf("prefer-vendor: %d finding(s) rated from a preferred vendor's own CVSS score", overridden)
+	}
+}
+
+// vendorRank returns the position of the first --prefer-vendor entry that names
+// the statement's author, or -1 for none. The match is a case-insensitive
+// substring so a user types the vendor ("suse") rather than the feed's full
+// author string ("SUSE Security Team").
+func vendorRank(author string, prefer []string) int {
+	a := strings.ToLower(author)
+	for i, v := range prefer {
+		v = strings.ToLower(strings.TrimSpace(v))
+		if v != "" && strings.Contains(a, v) {
+			return i
+		}
+	}
+	return -1
+}
+
+// preferDetail is the one-line evidence summary of a prefer-vendor override,
+// naming the vendor, the rating used, and the OSV rating it displaced when they
+// differ.
+func preferDetail(vendor, label, was string) string {
+	var b strings.Builder
+	b.WriteString(vendor)
+	b.WriteString(" rates this ")
+	b.WriteString(label)
+	if was != "" && !strings.EqualFold(was, label) {
+		b.WriteString(", used instead of ")
+		b.WriteString(was)
+	}
+	b.WriteString(" (preferred vendor score)")
+	return b.String()
 }

@@ -33,7 +33,7 @@ func main() {
 	var versionArg versionFlag
 	flag.Var(&versionArg, "version", "print vexscan's version and exit (deprecated: --version=VERSION still overrides a module version; use --module-version)")
 
-	var packages, ecosystems, roots, vexhubs, severities, rpms stringList
+	var packages, ecosystems, roots, vexhubs, severities, rpms, preferVendors stringList
 	flag.Var(&packages, "package", "package to check: a purl, an ecosystem:name shorthand (deb:openssl, golang:golang.org/x/net), or a bare name resolved against the inventory; repeatable")
 	flag.Var(&ecosystems, "ecosystem", "restrict the scan to these ecosystems (golang, os, pypi, npm, maven, or a distro family like debian); repeatable, default all")
 	flag.Var(&roots, "roots", "extra entrypoints for the reachability closures (shared libraries and language imports), for an image whose real command comes from outside its config; repeatable")
@@ -92,6 +92,9 @@ func main() {
 		noPager     = flag.Bool("no-pager", false, "never page the output, even when stdout is a terminal (VEXSCAN_PAGER picks the pager; setting it empty turns paging off for good)")
 		distroFeeds = flag.Bool("distro-feeds", false, "clear OS-package false positives with the distribution's own security feed: a vendor <not-affected> or an already-shipped fix moves a row to ALREADY VEXED, and like --vexhub never changes a status. Debian's security tracker and SUSE's CSAF-VEX today; network, off by default")
 	)
+	flag.Var(&preferVendors, "prefer-vendor", "favour this security vendor's CVSS score over the OSV-derived one, e.g. 'suse'; "+
+		"repeatable for a priority order, and unlike --severity it can lower a rating (the vendor's score is authoritative when present). "+
+		"Reads the score from --distro-feeds, so it needs that flag and only affects the products those feeds cover (SUSE's CSAF today)")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -202,6 +205,12 @@ func main() {
 	if err != nil {
 		fail("%v", err)
 	}
+	// --prefer-vendor reads its scores from the distro feeds, so without them it
+	// has nothing to favour. Warned rather than fatal: the flag is harmless on
+	// its own, and a warning is enough to say why it changed nothing.
+	if len(preferVendors) > 0 && !*distroFeeds {
+		fmt.Fprintln(os.Stderr, "warning: --prefer-vendor reads vendor scores from --distro-feeds; add --distro-feeds or it has no effect")
+	}
 
 	// The two advisory-source flags name the same thing twice, and honouring
 	// both would mean silently picking one -- on a flag whose whole purpose is
@@ -262,6 +271,7 @@ func main() {
 		VEXHubs:            vexhubs,
 		Triage:             triageLoader(*triageOn),
 		DistroFeeds:        distroProviders(*distroFeeds),
+		PreferVendors:      preferVendors,
 		DlopenPolicy:       dlopenPolicy,
 		DynamicPolicy:      dynamicPolicy,
 		GoVersion:          *goVersion,
