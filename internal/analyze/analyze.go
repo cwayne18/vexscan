@@ -222,18 +222,21 @@ type Options struct {
 	// analysis did not reach.
 	DistroFeeds []distrofeed.Provider
 
-	// PreferVendors names the security vendors whose CVSS score should be
-	// favoured over the OSV-derived one (--prefer-vendor), in priority order:
-	// the first listed vendor that scored a finding's CVE wins, and only when
-	// none did does the OSV rating stand. A vendor matches a feed whose author
-	// contains the name case-insensitively, so "suse" selects SUSE's CSAF feed.
+	// VendorScorers are the vendors whose own CVSS score should be favoured over
+	// the OSV-derived one (--prefer-vendor), in priority order: the first that
+	// scored a finding's CVE wins, and only when none did does the OSV rating
+	// stand. They are concrete scorers rather than a name list for the reason
+	// DistroFeeds is -- a test injects one pointed at a served fixture -- and the
+	// caller resolves --prefer-vendor names to them so an unknown vendor is
+	// reported once, on the command line.
 	//
 	// Unlike every other overlay this DOES change a finding's Severity and CVSS,
-	// deliberately: it is the one knob that lets a reader say "trust my
-	// distribution's rating of this CVE, even when it is lower than NVD's". The
-	// scores it favours come from the distro feeds, so it has an effect only
-	// alongside DistroFeeds and only on the products those feeds cover.
-	PreferVendors []string
+	// deliberately: it is the one knob that lets a reader say "trust this vendor's
+	// rating of this CVE, even when it is lower than NVD's". A score is keyed by
+	// CVE, not by product, so it applies to a finding in any ecosystem -- a Go
+	// module's rating as readily as an OS package's -- and needs no os-release,
+	// CPE or --distro-feeds to take effect.
+	VendorScorers []distrofeed.Scorer
 
 	// GoVersion optionally pins the Go toolchain for repo-mode analysis
 	// (e.g. "1.24.0"). Mainly useful with --module stdlib, whose findings depend
@@ -811,23 +814,23 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	guardCleanStatuses(result.Findings, logf)
 	severityOverlay(result.Findings, run.resolver.severities())
 	// sets is needed by the overlays below, and -- when --prefer-vendor is set --
-	// by the distro-feed score fetch that has to run before the severity filter.
-	// It costs no network (every record was fetched to decide the findings
-	// existed), so hoisting it above the filter is free.
+	// by the vendor score fetch that has to run before the severity filter. It
+	// costs no network (every record was fetched to decide the findings existed),
+	// so hoisting it above the filter is free.
 	sets := run.resolver.cveSets()
-	// --prefer-vendor favours a distribution's own CVSS score over the
-	// OSV-derived one, and does so before the severity filter and the fail gate
-	// so a vendor score that raises or lowers a rating is what both weigh --
-	// which is the whole point of the flag. The documents it reads are cached in
-	// each provider, so distroOverlay's later pass reuses this fetch rather than
-	// hitting the network twice. The os-release read is shared with that pass.
+	// --prefer-vendor favours a vendor's own CVSS score over the OSV-derived one,
+	// and does so before the severity filter and the fail gate so a vendor score
+	// that raises or lowers a rating is what both weigh -- which is the whole
+	// point of the flag. It is CVE-keyed, so it runs over every finding regardless
+	// of ecosystem and needs neither os-release nor --distro-feeds; when both are
+	// on, the SUSE provider's document cache is shared, so distroOverlay's later
+	// pass reuses this fetch rather than hitting the network twice.
+	if len(opts.VendorScorers) > 0 {
+		preferVendorScores(ctx, opts.VendorScorers, result.Findings, sets.All, logf)
+	}
 	var distroOS *OSInfo
 	if len(opts.DistroFeeds) > 0 {
 		distroOS = readOSInfo(img.FS, logf)
-		if len(opts.PreferVendors) > 0 {
-			stmts, index := distroScores(ctx, opts.DistroFeeds, distroOS, result.Findings, sets.All, logf)
-			preferVendorOverlay(stmts, index, opts.PreferVendors, logf)
-		}
 	}
 	// Filtering here, rather than in the renderer, is what keeps every count
 	// downstream honest: the LLM is never billed for a row nobody will read,
@@ -1156,6 +1159,15 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 
 	guardCleanStatuses(result.Findings, logf)
 	severityOverlay(result.Findings, run.resolver.severities())
+	// Hoisted above the filter for the same reason runTree does it: --prefer-vendor
+	// rescoring has to reach the severity filter and the fail gate. Repo mode is
+	// where it earns its keep -- govulncheck's OpenVEX carries no severity, so every
+	// Go finding here is UNKNOWN, and a preferred vendor's score is the only way one
+	// gets a real rating that --severity can then filter on.
+	sets := run.resolver.cveSets()
+	if len(opts.VendorScorers) > 0 {
+		preferVendorScores(ctx, opts.VendorScorers, result.Findings, sets.All, logf)
+	}
 	// See runTree for why the filter runs before the overlays rather than in
 	// the renderer. Repo mode is the path where it bites hardest: govulncheck's
 	// OpenVEX carries no severity, so every Go finding here is UNKNOWN and a
@@ -1164,7 +1176,6 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 	result.Findings, result.Withheld = severityFilter(result.Findings, opts.Severities)
 	// No productOverlay here: repo mode has no image, and the only artifact a
 	// checkout is is its own module, which the Go plugin already recorded.
-	sets := run.resolver.cveSets()
 	upstreamOverlay(result.Findings, sets.Upstream)
 	fixedOverlay(result.Findings, run.resolver.fixedVersions())
 	result.VEXHubs = vexOverlay(ctx, opts.VEXHubs, result.Findings, run.resolver.aliases(), logf)

@@ -18,26 +18,49 @@ const (
 	vectorCritical = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
 )
 
-// suseScoreStmt is an affected SUSE statement carrying a CVSS vector, the shape
-// distroScores hands preferVendorOverlay.
-func suseScoreStmt(refID, vector string) distrofeed.Statement {
-	return distrofeed.Statement{
-		RefID: refID, Distro: "suse", Package: "bash", CVE: "CVE-2023-0464",
-		Status: distrofeed.StatusAffected, Author: "SUSE Security Team", CVSSVector: vector,
-	}
+// fakeScorer is a distrofeed.Scorer that answers from a fixed CVE->vector map,
+// so a test can set a vendor's score without a server. It records the ids it was
+// asked about, to prove a finding's CVEs reached it.
+type fakeScorer struct {
+	name     string
+	scores   map[string]string
+	err      error
+	askedFor []string
 }
 
+func (f *fakeScorer) Name() string { return f.name }
+
+func (f *fakeScorer) Scores(_ context.Context, cves []string) (map[string]string, error) {
+	f.askedFor = append(f.askedFor, cves...)
+	return f.scores, f.err
+}
+
+func suseScorer(scores map[string]string) *fakeScorer {
+	return &fakeScorer{name: "SUSE Security Team", scores: scores}
+}
+
+// sevFinding is an OS-package finding at a given rating, the common case.
 func sevFinding(cve, severity, cvss string) Finding {
 	return Finding{Ecosystem: "os", ID: cve, CVE: cve, Package: "bash", Version: "5.2-1", Severity: severity, CVSS: cvss}
+}
+
+// preferEvidence returns the prefer-vendor evidence detail on a finding, or "".
+func preferEvidence(f Finding) string {
+	for _, e := range f.Evidence {
+		if e.Origin == OriginPreferVendor {
+			return e.Detail
+		}
+	}
+	return ""
 }
 
 // The headline case the flag exists for: a preferred vendor's score is
 // authoritative and wins even when it is lower than the OSV-derived rating.
 func TestPreferVendorLowerScoreWins(t *testing.T) {
 	findings := []Finding{sevFinding("CVE-2023-0464", "CRITICAL", vectorCritical)}
-	index := map[string]*Finding{"0": &findings[0]}
+	scorer := suseScorer(map[string]string{"CVE-2023-0464": vectorHigh})
 
-	preferVendorOverlay([]distrofeed.Statement{suseScoreStmt("0", vectorHigh)}, index, []string{"suse"}, quiet)
+	preferVendorScores(context.Background(), []distrofeed.Scorer{scorer}, findings, nil, quiet)
 
 	if findings[0].Severity != "HIGH" {
 		t.Errorf("severity = %q, want HIGH (the preferred vendor's lower score wins)", findings[0].Severity)
@@ -45,12 +68,7 @@ func TestPreferVendorLowerScoreWins(t *testing.T) {
 	if findings[0].CVSS != vectorHigh {
 		t.Errorf("cvss = %q, want the vendor vector", findings[0].CVSS)
 	}
-	var detail string
-	for _, e := range findings[0].Evidence {
-		if e.Origin == OriginPreferVendor {
-			detail = e.Detail
-		}
-	}
+	detail := preferEvidence(findings[0])
 	if detail == "" {
 		t.Fatal("no prefer-vendor evidence recorded")
 	}
@@ -59,102 +77,141 @@ func TestPreferVendorLowerScoreWins(t *testing.T) {
 	}
 }
 
+// The point of the redesign: a finding in a non-OS ecosystem, reported under a
+// GO id with no CVE of its own, is still rescored -- reached through the advisory
+// alias set that resolves the GO id to the CVE the vendor feed is keyed by.
+func TestPreferVendorRescoresGoModuleViaAlias(t *testing.T) {
+	f := Finding{Ecosystem: "golang", ID: "GO-2026-1234", GoID: "GO-2026-1234", Package: "golang.org/x/net", Version: "0.1.0", Severity: "CRITICAL", CVSS: vectorCritical}
+	findings := []Finding{f}
+	// The resolver's alias set bridges the GO id to the CVE SUSE scored.
+	ids := map[string][]string{"GO-2026-1234": {"GO-2026-1234", "CVE-2026-9999"}}
+	scorer := suseScorer(map[string]string{"CVE-2026-9999": vectorHigh})
+
+	preferVendorScores(context.Background(), []distrofeed.Scorer{scorer}, findings, ids, quiet)
+
+	if findings[0].Severity != "HIGH" {
+		t.Errorf("severity = %q, want HIGH: a Go finding must be rescored via its CVE alias", findings[0].Severity)
+	}
+	// And the scorer was actually asked about the resolved CVE.
+	var asked bool
+	for _, id := range scorer.askedFor {
+		if id == "CVE-2026-9999" {
+			asked = true
+		}
+	}
+	if !asked {
+		t.Errorf("scorer was asked about %v, want it to include CVE-2026-9999", scorer.askedFor)
+	}
+}
+
 // A finding with no OSV rating still takes the vendor's score, and the evidence
 // does not claim to have displaced a rating that was never there.
 func TestPreferVendorFillsUnrated(t *testing.T) {
 	findings := []Finding{sevFinding("CVE-2023-0464", "", "")}
-	index := map[string]*Finding{"0": &findings[0]}
+	scorer := suseScorer(map[string]string{"CVE-2023-0464": vectorHigh})
 
-	preferVendorOverlay([]distrofeed.Statement{suseScoreStmt("0", vectorHigh)}, index, []string{"suse"}, quiet)
+	preferVendorScores(context.Background(), []distrofeed.Scorer{scorer}, findings, nil, quiet)
 
 	if findings[0].Severity != "HIGH" {
 		t.Errorf("severity = %q, want HIGH", findings[0].Severity)
 	}
-	for _, e := range findings[0].Evidence {
-		if e.Origin == OriginPreferVendor && strings.Contains(e.Detail, "instead of") {
-			t.Errorf("evidence claims to have displaced a rating that did not exist: %q", e.Detail)
-		}
+	if strings.Contains(preferEvidence(findings[0]), "instead of") {
+		t.Errorf("evidence claims to have displaced a rating that did not exist: %q", preferEvidence(findings[0]))
 	}
 }
 
-// A vendor nobody asked for is ignored: the OSV rating stands untouched.
-func TestPreferVendorIgnoresUnnamedVendor(t *testing.T) {
+// A CVE no scorer rated keeps its OSV rating: the flag only ever adds a vendor's
+// opinion where they have one.
+func TestPreferVendorUnscoredCVEStands(t *testing.T) {
 	findings := []Finding{sevFinding("CVE-2023-0464", "CRITICAL", vectorCritical)}
-	index := map[string]*Finding{"0": &findings[0]}
+	scorer := suseScorer(map[string]string{"CVE-2099-0001": vectorHigh}) // a different CVE
 
-	preferVendorOverlay([]distrofeed.Statement{suseScoreStmt("0", vectorHigh)}, index, []string{"debian"}, quiet)
+	preferVendorScores(context.Background(), []distrofeed.Scorer{scorer}, findings, nil, quiet)
 
 	if findings[0].Severity != "CRITICAL" {
-		t.Errorf("severity = %q, want CRITICAL unchanged (SUSE was not a preferred vendor)", findings[0].Severity)
+		t.Errorf("severity = %q, want CRITICAL unchanged (SUSE did not score this CVE)", findings[0].Severity)
 	}
-	for _, e := range findings[0].Evidence {
-		if e.Origin == OriginPreferVendor {
-			t.Error("evidence was recorded for a vendor that was not preferred")
-		}
+	if preferEvidence(findings[0]) != "" {
+		t.Error("evidence was recorded for a CVE the vendor did not score")
 	}
 }
 
-// An empty vector is no score at all: the OSV rating stands rather than being
-// blanked.
-func TestPreferVendorEmptyVectorFallsBack(t *testing.T) {
+// An unscannable vector is no score at all: the OSV rating stands rather than
+// being blanked.
+func TestPreferVendorBadVectorFallsBack(t *testing.T) {
 	findings := []Finding{sevFinding("CVE-2023-0464", "CRITICAL", vectorCritical)}
-	index := map[string]*Finding{"0": &findings[0]}
+	scorer := suseScorer(map[string]string{"CVE-2023-0464": "not-a-vector"})
 
-	preferVendorOverlay([]distrofeed.Statement{suseScoreStmt("0", "")}, index, []string{"suse"}, quiet)
+	preferVendorScores(context.Background(), []distrofeed.Scorer{scorer}, findings, nil, quiet)
 
 	if findings[0].Severity != "CRITICAL" {
-		t.Errorf("severity = %q, want CRITICAL (an empty vendor vector must not override)", findings[0].Severity)
+		t.Errorf("severity = %q, want CRITICAL (an unscannable vendor vector must not override)", findings[0].Severity)
 	}
 }
 
 // When two preferred vendors both score a finding, the earlier one in the
-// --prefer-vendor list wins, whatever order the statements arrive in.
+// scorer list -- which the caller builds in --prefer-vendor priority order --
+// wins.
 func TestPreferVendorEarliestListedWins(t *testing.T) {
 	findings := []Finding{sevFinding("CVE-2023-0464", "MEDIUM", "")}
-	index := map[string]*Finding{"0": &findings[0]}
-	debianStmt := distrofeed.Statement{
-		RefID: "0", Author: "Debian Security Tracker", Status: distrofeed.StatusAffected, CVSSVector: vectorCritical,
-	}
-	// Debian's statement is seen first but SUSE is listed first in the preference.
-	stmts := []distrofeed.Statement{debianStmt, suseScoreStmt("0", vectorHigh)}
+	first := &fakeScorer{name: "SUSE Security Team", scores: map[string]string{"CVE-2023-0464": vectorHigh}}
+	second := &fakeScorer{name: "Debian Security Tracker", scores: map[string]string{"CVE-2023-0464": vectorCritical}}
 
-	preferVendorOverlay(stmts, index, []string{"suse", "debian"}, quiet)
+	preferVendorScores(context.Background(), []distrofeed.Scorer{first, second}, findings, nil, quiet)
 
 	if findings[0].Severity != "HIGH" {
-		t.Errorf("severity = %q, want HIGH (SUSE outranks Debian in the preference order)", findings[0].Severity)
+		t.Errorf("severity = %q, want HIGH (the first-listed vendor wins)", findings[0].Severity)
 	}
 }
 
-func TestVendorRank(t *testing.T) {
-	prefer := []string{"suse", "debian"}
+// A bundle finding relating to several CVEs takes the most severe of the
+// vendor's own scores among them -- fail towards severe within one vendor.
+func TestPreferVendorBundleTakesHighest(t *testing.T) {
+	f := sevFinding("CVE-2023-0001", "", "")
+	findings := []Finding{f}
+	ids := map[string][]string{"CVE-2023-0001": {"CVE-2023-0001", "CVE-2023-0002"}}
+	scorer := suseScorer(map[string]string{
+		"CVE-2023-0001": vectorHigh,     // 7.5
+		"CVE-2023-0002": vectorCritical, // 9.8
+	})
+
+	preferVendorScores(context.Background(), []distrofeed.Scorer{scorer}, findings, ids, quiet)
+
+	if findings[0].Severity != "CRITICAL" {
+		t.Errorf("severity = %q, want CRITICAL (the worst of the vendor's scores for the bundle)", findings[0].Severity)
+	}
+}
+
+func TestBestVendorVector(t *testing.T) {
+	scores := map[string]string{"CVE-2023-0464": vectorHigh, "CVE-2023-9999": vectorCritical}
 	cases := []struct {
-		author string
-		want   int
+		name      string
+		cves      []string
+		wantVec   string
+		wantLabel string
+		wantOK    bool
 	}{
-		{"SUSE Security Team", 0},
-		{"Debian Security Tracker", 1},
-		{"Red Hat Product Security", -1},
-		{"", -1},
+		{"one match", []string{"CVE-2023-0464"}, vectorHigh, "HIGH", true},
+		{"highest of several", []string{"CVE-2023-0464", "CVE-2023-9999"}, vectorCritical, "CRITICAL", true},
+		{"case-insensitive", []string{"cve-2023-0464"}, vectorHigh, "HIGH", true},
+		{"no match", []string{"CVE-2000-0000"}, "", "", false},
 	}
 	for _, c := range cases {
-		if got := vendorRank(c.author, prefer); got != c.want {
-			t.Errorf("vendorRank(%q) = %d, want %d", c.author, got, c.want)
+		vec, label, ok := bestVendorVector(scores, c.cves)
+		if ok != c.wantOK || vec != c.wantVec || label != c.wantLabel {
+			t.Errorf("%s: bestVendorVector = (%q, %q, %v), want (%q, %q, %v)", c.name, vec, label, ok, c.wantVec, c.wantLabel, c.wantOK)
 		}
 	}
 }
 
-// End to end through the fetch: a served SUSE document's score reaches a finding
-// via distroScores + preferVendorOverlay, exercising the RefID/index plumbing
-// osFindings builds.
+// End to end through the real SUSE provider: a served CSAF document's score
+// reaches a finding via Scores + preferVendorScores, over HTTP, with no CPE or
+// product join in play -- the standalone path a bare --prefer-vendor takes.
 func TestPreferVendorEndToEnd(t *testing.T) {
 	const scoredCSAF = `{
-  "product_tree": { "branches": [
-    { "category": "product_name", "name": "SUSE Linux Enterprise Server 15 SP5",
-      "product": { "product_id": "SUSE Linux Enterprise Server 15 SP5",
-        "product_identification_helper": { "cpe": "cpe:/o:suse:sles:15:sp5" } } } ] },
+  "product_tree": { "branches": [] },
   "vulnerabilities": [ { "cve": "CVE-2023-0464",
-    "scores": [ { "cvss_v3": { "baseScore": 7.5, "vectorString": "` + vectorHigh + `", "version": "3.1" } } ],
-    "product_status": { "known_affected": [ "SUSE Linux Enterprise Server 15 SP5:bash" ] } } ] }`
+    "scores": [ { "cvss_v3": { "baseScore": 7.5, "vectorString": "` + vectorHigh + `", "version": "3.1" } } ] } ] }`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/cve-2023-0464.json") {
 			w.Write([]byte(scoredCSAF))
@@ -165,11 +222,9 @@ func TestPreferVendorEndToEnd(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	p := &suse.Provider{BaseURL: srv.URL}
-	os := &OSInfo{ID: "sles", VersionID: "15.5", CPEName: "cpe:/o:suse:sles:15:sp5"}
 	findings := []Finding{sevFinding("CVE-2023-0464", "CRITICAL", vectorCritical)}
 
-	stmts, index := distroScores(context.Background(), []distrofeed.Provider{p}, os, findings, nil, quiet)
-	preferVendorOverlay(stmts, index, []string{"suse"}, quiet)
+	preferVendorScores(context.Background(), []distrofeed.Scorer{p}, findings, nil, quiet)
 
 	if findings[0].Severity != "HIGH" {
 		t.Errorf("severity = %q, want HIGH from SUSE's served score", findings[0].Severity)

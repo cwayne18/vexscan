@@ -188,121 +188,124 @@ func isOSPackage(f Finding) bool {
 	return f.Ecosystem == "os"
 }
 
-// distroScores fetches every provider's statements for the current findings and
-// returns them without applying any verdict, together with the index that ties a
-// statement's RefID back to its finding.
+// preferVendorScores overrides each finding's Severity and CVSS with a preferred
+// vendor's own score, in place, wherever --prefer-vendor named a vendor that
+// scored one of the finding's CVEs.
 //
-// It exists so --prefer-vendor can read a vendor's CVSS score before the
-// severity filter runs, where distroOverlay -- which runs after it, for the
-// precedence reasons on that function -- would be too late to change what the
-// filter and the fail gate weigh. The two share a fetch: each provider caches
-// the documents it reads, so distroOverlay's later pass costs no extra network.
-//
-// A provider that errors is logged and skipped, never fatal: a score that could
-// not be read only leaves the OSV rating in place, which over-reports at worst
-// and can never invent a clean.
-func distroScores(ctx context.Context, providers []distrofeed.Provider, os *OSInfo, findings []Finding, ids map[string][]string, logf func(string, ...any)) ([]distrofeed.Statement, map[string]*Finding) {
-	if len(providers) == 0 || os == nil || os.ID == "" {
-		return nil, nil
-	}
-	refs, index := osFindings(findings, ids)
-	if len(refs) == 0 {
-		return nil, index
-	}
-	var out []distrofeed.Statement
-	for _, p := range providers {
-		if !p.Handles(os.ID) {
-			continue
-		}
-		stmts, err := p.Lookup(ctx, distrofeed.Query{OSID: os.ID, Release: os.VersionID, CPE: os.CPEName, Packages: refs})
-		if err != nil {
-			logf("  ! distro feed %s: %v", p.Name(), err)
-			logf("    (its OSV-derived rating stands for any score it could not read)")
-		}
-		out = append(out, stmts...)
-	}
-	return out, index
-}
-
-// preferVendorOverlay overrides a finding's severity with a preferred vendor's
-// own CVSS score, in place, when --prefer-vendor named one that scored the
-// finding's CVE.
+// Unlike distroOverlay this is CVE-keyed, not product-keyed, and that is the
+// whole point of the redesign: a vendor rates a CVE once, and that rating is as
+// true of a Go module or an npm package that bundles the flaw as of an OS
+// package, so this speaks to a finding in *any* ecosystem. It needs no
+// os-release, no CPE and no package join -- it asks each scorer for the CVEs the
+// findings are about and applies what comes back. A finding reported under a
+// GO-2026-xxxx id is reached through the advisory alias set (findingCVEs), which
+// resolves it to the CVE the vendor feed is actually keyed by.
 //
 // It is the one overlay that deliberately changes Severity and CVSS. The rule is
 // that the vendor's score is authoritative: it wins even when it is lower than
-// the OSV-derived rating, because "trust my distribution's rating of this CVE"
-// is exactly what the flag asks for. When several preferred vendors scored the
-// same finding, the earliest in the --prefer-vendor list wins, the same
-// earliest-wins order --vexhub uses.
+// the OSV-derived rating, because "trust this vendor's rating of this CVE" is
+// exactly what the flag asks for. The scorers are consulted in --prefer-vendor
+// priority order and the first that scored a finding wins, the same
+// earliest-wins order --vexhub uses. It records what it did as evidence so the
+// change is auditable, and never touches Status: the local verdict on whether
+// the code is present stands.
 //
-// It records what it did as evidence so the change is auditable, and never
-// touches Status: the local verdict on whether the code is present stands.
-func preferVendorOverlay(stmts []distrofeed.Statement, index map[string]*Finding, prefer []string, logf func(string, ...any)) {
-	if len(stmts) == 0 || len(prefer) == 0 || len(index) == 0 {
+// A scorer that errors is logged and skipped, never fatal: a score that could
+// not be read only leaves the OSV rating in place, which over-reports at worst
+// and can never invent a clean.
+func preferVendorScores(ctx context.Context, scorers []distrofeed.Scorer, findings []Finding, ids map[string][]string, logf func(string, ...any)) {
+	if len(scorers) == 0 || len(findings) == 0 {
 		return
 	}
-	// pick is the winning vendor's score for one finding so far, kept so a
-	// higher-priority vendor listed later in the statements can still displace a
-	// lower-priority one seen first.
-	type pick struct {
-		rank   int
-		vendor string
-		vector string
-		label  string
-		was    string
+
+	// The CVEs each finding is about, resolved through the alias set so a
+	// GO/GHSA-named finding still yields the CVE a vendor feed is keyed by, and
+	// their union to ask every scorer about in one batch.
+	perFinding := make([][]string, len(findings))
+	seen := map[string]bool{}
+	var query []string
+	for i := range findings {
+		cves := findingCVEs(findings[i], ids)
+		perFinding[i] = cves
+		for _, cve := range cves {
+			if !seen[cve] {
+				seen[cve] = true
+				query = append(query, cve)
+			}
+		}
 	}
-	best := map[*Finding]pick{}
-	for _, st := range stmts {
-		if st.CVSSVector == "" {
-			continue
-		}
-		rank := vendorRank(st.Author, prefer)
-		if rank < 0 {
-			continue
-		}
-		f := index[st.RefID]
-		if f == nil {
-			continue
-		}
-		score, ok := cvss.Score(st.CVSSVector)
-		if !ok {
-			// A vector this tool cannot score is no better than no score: leave
-			// the OSV rating rather than blank a finding on a vendor typo.
-			continue
-		}
-		if cur, seen := best[f]; seen && cur.rank <= rank {
-			continue
-		}
-		best[f] = pick{rank: rank, vendor: st.Author, vector: st.CVSSVector, label: cvss.Label(score), was: f.Severity}
+	if len(query) == 0 {
+		return
 	}
+
+	// Fetch each vendor's scores once, in priority order. A vendor's map is
+	// keyed by uppercase CVE.
+	type vendorScores struct {
+		name   string
+		scores map[string]string
+	}
+	fetched := make([]vendorScores, 0, len(scorers))
+	for _, s := range scorers {
+		scores, err := s.Scores(ctx, query)
+		if err != nil {
+			logf("  ! prefer-vendor %s: %v", s.Name(), err)
+			logf("    (its OSV-derived rating stands for any score it could not read)")
+		}
+		if len(scores) > 0 {
+			fetched = append(fetched, vendorScores{name: s.Name(), scores: scores})
+		}
+	}
+
 	var overridden int
-	for f, p := range best {
-		f.Severity = p.label
-		f.CVSS = p.vector
-		f.Evidence = append(f.Evidence, ecosystem.Evidence{
-			Origin: OriginPreferVendor,
-			Detail: preferDetail(p.vendor, p.label, p.was),
-		})
-		overridden++
+	for i := range findings {
+		f := &findings[i]
+		for _, v := range fetched {
+			vec, label, ok := bestVendorVector(v.scores, perFinding[i])
+			if !ok {
+				continue
+			}
+			f.Evidence = append(f.Evidence, ecosystem.Evidence{
+				Origin: OriginPreferVendor,
+				Detail: preferDetail(v.name, label, f.Severity),
+			})
+			f.Severity = label
+			f.CVSS = vec
+			overridden++
+			// Earliest-listed vendor wins: stop at the first that scored it.
+			break
+		}
 	}
 	if overridden > 0 {
 		logf("prefer-vendor: %d finding(s) rated from a preferred vendor's own CVSS score", overridden)
 	}
 }
 
-// vendorRank returns the position of the first --prefer-vendor entry that names
-// the statement's author, or -1 for none. The match is a case-insensitive
-// substring so a user types the vendor ("suse") rather than the feed's full
-// author string ("SUSE Security Team").
-func vendorRank(author string, prefer []string) int {
-	a := strings.ToLower(author)
-	for i, v := range prefer {
-		v = strings.ToLower(strings.TrimSpace(v))
-		if v != "" && strings.Contains(a, v) {
-			return i
+// bestVendorVector returns the vendor's CVSS vector and label for a finding,
+// choosing the highest-scoring one among the finding's CVEs.
+//
+// A finding usually has one CVE, but a bundle addresses several, and a vendor may
+// have scored more than one of them. Taking the most severe is the same
+// fail-towards-severe rule the rest of the tool uses when one row relates to
+// several ratings: the vendor's opinion is preferred, but among the vendor's own
+// numbers for this row the worst is the safe one. A vector the tool cannot score
+// is treated as no score -- the OSV rating stands rather than a finding being
+// blanked on a vendor typo.
+func bestVendorVector(scores map[string]string, cves []string) (vector, label string, ok bool) {
+	best := -1.0
+	for _, cve := range cves {
+		vec := scores[strings.ToUpper(cve)]
+		if vec == "" {
+			continue
+		}
+		score, valid := cvss.Score(vec)
+		if !valid {
+			continue
+		}
+		if score > best {
+			best, vector, label, ok = score, vec, cvss.Label(score), true
 		}
 	}
-	return -1
+	return vector, label, ok
 }
 
 // preferDetail is the one-line evidence summary of a prefer-vendor override,

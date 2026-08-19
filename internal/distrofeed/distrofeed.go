@@ -70,6 +70,31 @@ type Provider interface {
 	Lookup(ctx context.Context, q Query) ([]Statement, error)
 }
 
+// Scorer is a vendor that publishes its own CVSS score per CVE, which
+// --prefer-vendor favours over the OSV-derived rating.
+//
+// It is a separate interface from Provider because scoring is a different join
+// from clearing. A Provider's verdict is about a package in a product, so it
+// needs the image's os-release and CPE and only ever speaks to OS-package
+// findings. A vendor's score is about the CVE itself -- SUSE rates CVE-2026-1234
+// once, and that rating is as true of a Go module bundling the flaw as of an rpm
+// -- so a Scorer is keyed by CVE alone and answers for a finding in any
+// ecosystem. That is what lets --prefer-vendor rescore a GO-2026-xxxx finding,
+// not just the OS layer.
+type Scorer interface {
+	// Name is the vendor's author string, matched against --prefer-vendor
+	// case-insensitively, e.g. "SUSE Security Team".
+	Name() string
+	// Scores returns, for the CVEs it has a record of, an uppercase-CVE -> CVSS
+	// v3 vector string map. A CVE the vendor did not score is absent rather than
+	// present with an empty string. Ids that are not CVEs are ignored, so a
+	// caller may pass a finding's whole alias set and let the Scorer pick the
+	// CVEs out. An error is the feed being unreadable: like Lookup's, it is
+	// warned about but never fatal, since a missing score only leaves the OSV
+	// rating in place and can never invent a clean.
+	Scores(ctx context.Context, cves []string) (map[string]string, error)
+}
+
 // Query is what the overlay knows about the image and asks a provider to speak
 // to. A provider answers for the packages and advisories it recognizes and is
 // silent about the rest.
@@ -148,11 +173,4 @@ type Statement struct {
 	Source string
 	// Author is who published the feed, e.g. "Debian Security Tracker".
 	Author string
-	// CVSSVector is the vendor's own CVSS v3 base vector for the CVE, when the
-	// feed publishes one (SUSE's CSAF does; Debian's tracker does not). It is
-	// carried for --prefer-vendor, which favours a named vendor's rating over
-	// the OSV-derived one. Empty when the feed stated no score, in which case
-	// the OSV rating stands. Like every other field here it is a second opinion
-	// and never changes a finding's Status.
-	CVSSVector string
 }

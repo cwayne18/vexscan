@@ -130,6 +130,38 @@ func (p *Provider) Lookup(ctx context.Context, q distrofeed.Query) ([]distrofeed
 	return out, err
 }
 
+// Scores implements distrofeed.Scorer: SUSE's own CVSS v3 vector for each CVE it
+// has a document for, keyed by uppercase CVE.
+//
+// This is the score half of the same CSAF documents Lookup reads, split out
+// because a score needs none of the product join a verdict does. There is no CPE
+// here and no package matching: a SUSE document rates its CVE once across every
+// product, so the rating applies to a finding whatever ecosystem it came from --
+// which is exactly what --prefer-vendor wants when it rescores a Go module by
+// SUSE's number. The per-run cache is shared with Lookup, so a scan that runs
+// both --prefer-vendor and --distro-feeds downloads each document once.
+func (p *Provider) Scores(ctx context.Context, cves []string) (map[string]string, error) {
+	ids := onlyCVEs(cves)
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	docs, err := p.fetchAll(ctx, ids)
+	// docs holds every advisory that was read; err aggregates the ones that could
+	// not be. Both are returned: the scores that arrived are used and the failures
+	// reported, because a score that could not be read only leaves the OSV rating
+	// in place and can never invent a clean.
+	out := map[string]string{}
+	for cve, adv := range docs {
+		if adv == nil {
+			continue
+		}
+		if vec := adv.scores[cve]; vec != "" {
+			out[cve] = vec
+		}
+	}
+	return out, err
+}
+
 // statementFor decides one finding's verdict from whichever of its CVE ids SUSE
 // has a document for. The ids are aliases of a single vulnerability, so any one
 // of them speaking is the vendor's verdict for that finding. It fails closed: if
@@ -158,7 +190,6 @@ func statementFor(pkg distrofeed.PkgRef, cpe string, docs map[string]*advisory) 
 			Justification: why,
 			Source:        doc.url,
 			Author:        author,
-			CVSSVector:    doc.scores[strings.ToUpper(id)],
 		}
 		if !status.Exculpatory() {
 			// An affected verdict from any alias vetoes a clear from another.

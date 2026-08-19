@@ -236,23 +236,32 @@ const scoredCSAF = `{
     "product_status": {
       "known_affected": [ "SUSE Linux Enterprise Server 15 SP5:bash" ] } } ] }`
 
-// A document that publishes a CVSS score exposes it on every statement it
-// produces for that CVE, so --prefer-vendor can favour SUSE's own rating.
-func TestScoreOnStatement(t *testing.T) {
+// Scores returns SUSE's own CVSS vector for a CVE it has a document for, keyed
+// by uppercase CVE and needing no CPE or product join -- the product-independent
+// score --prefer-vendor favours for a finding in any ecosystem.
+func TestScoresReturnsVendorVector(t *testing.T) {
 	p := &Provider{BaseURL: serve(t, map[string]string{"cve-2023-0464.json": scoredCSAF}, nil)}
-	st := only(t, lookup(t, p, pkgQuery(bookwormCPE(), "bash", "5.2-1", "CVE-2023-0464")))
-	if st.CVSSVector != "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H" {
-		t.Fatalf("CVSSVector = %q, want SUSE's v3.1 vector", st.CVSSVector)
+	got, err := p.Scores(context.Background(), []string{"CVE-2023-0464"})
+	if err != nil {
+		t.Fatalf("Scores: %v", err)
+	}
+	if got["CVE-2023-0464"] != "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H" {
+		t.Fatalf("score = %q, want SUSE's v3.1 vector", got["CVE-2023-0464"])
 	}
 }
 
-// A document with no scores array leaves the vector empty, which is the signal
-// for --prefer-vendor to fall back to the OSV-derived rating.
-func TestNoScoreLeavesVectorEmpty(t *testing.T) {
+// Scores filters its input to real CVE ids and is silent about a CVE with no
+// score: a GO/GHSA alias is dropped rather than fetched to a 404, and a document
+// with no scores array leaves the CVE absent so --prefer-vendor falls back to the
+// OSV-derived rating.
+func TestScoresIgnoresNonCVEAndUnscored(t *testing.T) {
 	p := &Provider{BaseURL: serve(t, docs(), nil)}
-	st := only(t, lookup(t, p, pkgQuery(bookwormCPE(), "libopenssl-1_0_0-devel", "1.0.2p-150000.3.70.1", "CVE-2023-0464")))
-	if st.CVSSVector != "" {
-		t.Fatalf("CVSSVector = %q, want empty for a document with no scores", st.CVSSVector)
+	got, err := p.Scores(context.Background(), []string{"GO-2023-1751", "CVE-2023-0464"})
+	if err != nil {
+		t.Fatalf("Scores: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("scores = %v, want none (the GO id is not a CVE and the document carries no score)", got)
 	}
 }
 

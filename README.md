@@ -1902,9 +1902,8 @@ configuration. `--prefer-vendor` says: when this vendor has published a score fo
 a CVE, use theirs.
 
 ```sh
-# Rate SUSE findings by SUSE's own CVSS, falling back to OSV where SUSE has none
-vexscan --image registry.suse.com/bci/bci-base:15.6 --all --ecosystem os \
-  --distro-feeds --prefer-vendor suse
+# Rate every finding SUSE has scored by SUSE's own CVSS, falling back to OSV
+vexscan --image docker.io/rancher/k3s:v1.36.3-k3s1 --all --prefer-vendor suse
 ```
 
 It is the same idea as
@@ -1912,20 +1911,32 @@ It is the same idea as
 SUSE's rating of a CVE and only falls back to another source when SUSE has not
 scored it. The flag is **ordered and repeatable** — `--prefer-vendor suse
 --prefer-vendor debian` tries SUSE first, then Debian, then the OSV rating — and
-a name matches a feed's author case-insensitively, so `suse` selects *SUSE
-Security Team*.
+a name matches a vendor case-insensitively, so `suse` selects *SUSE Security
+Team*.
 
-The score comes from the distribution's own feed, so **`--prefer-vendor` reads it
-from `--distro-feeds`** and has an effect only where that feed does: the products
-its providers cover, on the images they handle. SUSE's CSAF carries a CVSS v3
-base score and vector per CVE (`vulnerabilities[].scores[].cvss_v3`) right beside
-the not-affected/fixed status the feed already reads; Debian's tracker publishes
-no score, so `--prefer-vendor debian` has nothing to favour today. Without
-`--distro-feeds` the flag prints a warning and changes nothing.
+**It is keyed by CVE, not by package.** A vendor rates a CVE once, and that
+rating is as true of a Go module or an npm package that bundles the flaw as of an
+OS package — so `--prefer-vendor` rescores findings in **every ecosystem**, not
+just the OS layer. It needs no `--distro-feeds`, no `os-release` and no CPE: those
+drive the *false-positive clearing* in [`--distro-feeds`](#distribution-security-feeds---distro-feeds),
+which is a product-level join; scoring is a plain CVE lookup. (When you do pass
+both, the SUSE CSAF documents are downloaded once and shared between the two.)
+
+A finding vexscan reports under a `GO-2026-xxxx` id with no CVE of its own is
+still rescored: it is matched through the advisory's alias set — the same record
+that gives it a severity — which resolves the Go id to the `CVE-2026-xxxx` the
+vendor feed is keyed by. So `GO-2026-1234` picks up SUSE's score for its
+underlying CVE without you naming the CVE.
+
+SUSE's CSAF carries a CVSS v3 base score and vector per CVE
+(`vulnerabilities[].scores[].cvss_v3`). It is the first — and today only — vendor
+vexscan can score; a name it does not recognise (`--prefer-vendor debian`, which
+publishes no score) is reported on stderr and ignored rather than silently doing
+nothing.
 
 Two properties are worth stating plainly, because this is the **one overlay that
 changes a finding's `severity` and `cvss`** where every other second opinion
-(`--vexhub`, `--triage`, `--distro-feeds` itself) is forbidden to:
+(`--vexhub`, `--triage`, `--distro-feeds`) is forbidden to:
 
 - **The vendor's score is authoritative — it wins even when it is lower.** If
   SUSE rates a CVE `MEDIUM` that NVD calls `HIGH`, the row becomes `MEDIUM`, and
@@ -1934,18 +1945,19 @@ changes a finding's `severity` and `cvss`** where every other second opinion
   The change is applied **before** the severity filter and the fail gate so both
   see the vendor's number, and every override records an
   `Evidence{Origin: "prefer-vendor"}` line naming the vendor and the rating it
-  displaced, so a reader can always see why a row is scored the way it is.
+  displaced, so a reader can always see why a row is scored the way it is. When a
+  finding relates to several CVEs and the vendor scored more than one, the most
+  severe of the vendor's own numbers is used.
 - **It can score what OSV left `UNKNOWN`.** SUSE's *OSV export* publishes no CVSS
   at all — the [triage section](#prioritising-by-exploitation-triage) notes every
-  SUSE advisory renders `UNKNOWN` there — but SUSE's *CSAF* does carry a score.
-  So on a SUSE image `--prefer-vendor suse` gives a real rating to findings that
-  would otherwise have none, which `--severity` can then filter and `--fail-on`
-  can gate on.
+  SUSE advisory renders `UNKNOWN` there — and govulncheck's OpenVEX carries none
+  either, so Go findings in repo mode are `UNKNOWN` too. SUSE's *CSAF* does carry
+  a score, so `--prefer-vendor suse` gives a real rating to findings that would
+  otherwise have none, which `--severity` can then filter and `--fail-on` gate on.
 
-Only vendors with a score-bearing feed can be favoured; SUSE is the first, and
-others join as their feeds do. A finding whose CVE the preferred vendor did not
-score keeps its OSV rating — the flag only ever *adds* a vendor's opinion where
-they have one, and never blanks a rating on its absence.
+A finding whose CVE the preferred vendor did not score keeps its OSV rating — the
+flag only ever *adds* a vendor's opinion where they have one, and never blanks a
+rating on its absence.
 
 ### Contributing ruled-out findings back (`--vex-out`)
 

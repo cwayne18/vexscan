@@ -322,17 +322,27 @@ func splitNVR(s string) (name, evr string) {
 // filtered to real CVE ids -- the only thing SUSE's per-CVE feed is keyed by, so
 // OSV aliases like GHSA ids are dropped rather than fetched to a certain 404.
 func uniqueCVEs(pkgs []distrofeed.PkgRef) []string {
+	var all []string
+	for _, p := range pkgs {
+		all = append(all, p.CVEs...)
+	}
+	return onlyCVEs(all)
+}
+
+// onlyCVEs upper-cases a list of ids, keeps the ones that are real CVE ids, and
+// de-duplicates them. SUSE's per-CVE feed is keyed by CVE alone, so a GHSA or a
+// GO id -- which a finding's alias set carries alongside the CVE -- is dropped
+// here rather than fetched to a certain 404.
+func onlyCVEs(ids []string) []string {
 	seen := map[string]bool{}
 	var out []string
-	for _, p := range pkgs {
-		for _, id := range p.CVEs {
-			up := strings.ToUpper(strings.TrimSpace(id))
-			if !cveRE.MatchString(up) || seen[up] {
-				continue
-			}
-			seen[up] = true
-			out = append(out, up)
+	for _, id := range ids {
+		up := strings.ToUpper(strings.TrimSpace(id))
+		if !cveRE.MatchString(up) || seen[up] {
+			continue
 		}
+		seen[up] = true
+		out = append(out, up)
 	}
 	return out
 }

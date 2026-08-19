@@ -92,9 +92,9 @@ func main() {
 		noPager     = flag.Bool("no-pager", false, "never page the output, even when stdout is a terminal (VEXSCAN_PAGER picks the pager; setting it empty turns paging off for good)")
 		distroFeeds = flag.Bool("distro-feeds", false, "clear OS-package false positives with the distribution's own security feed: a vendor <not-affected> or an already-shipped fix moves a row to ALREADY VEXED, and like --vexhub never changes a status. Debian's security tracker and SUSE's CSAF-VEX today; network, off by default")
 	)
-	flag.Var(&preferVendors, "prefer-vendor", "favour this security vendor's CVSS score over the OSV-derived one, e.g. 'suse'; "+
+	flag.Var(&preferVendors, "prefer-vendor", "favour this security vendor's own CVSS score over the OSV-derived one, e.g. 'suse'; "+
 		"repeatable for a priority order, and unlike --severity it can lower a rating (the vendor's score is authoritative when present). "+
-		"Reads the score from --distro-feeds, so it needs that flag and only affects the products those feeds cover (SUSE's CSAF today)")
+		"Keyed by CVE, so it rescores findings in any ecosystem (Go modules included), not just OS packages; network, SUSE today")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -220,12 +220,10 @@ func main() {
 	if err != nil {
 		fail("%v", err)
 	}
-	// --prefer-vendor reads its scores from the distro feeds, so without them it
-	// has nothing to favour. Warned rather than fatal: the flag is harmless on
-	// its own, and a warning is enough to say why it changed nothing.
-	if len(preferVendors) > 0 && !*distroFeeds {
-		fmt.Fprintln(os.Stderr, "warning: --prefer-vendor reads vendor scores from --distro-feeds; add --distro-feeds or it has no effect")
-	}
+	// --prefer-vendor and --distro-feeds both draw on the same vendor sources, so
+	// they are resolved together: distroSources shares one provider instance per
+	// vendor between them and reports any --prefer-vendor name it cannot score.
+	distroFeedProviders, vendorScorers := distroSources(*distroFeeds, preferVendors)
 
 	// The two advisory-source flags name the same thing twice, and honouring
 	// both would mean silently picking one -- on a flag whose whole purpose is
@@ -285,8 +283,8 @@ func main() {
 		Roots:              roots,
 		VEXHubs:            vexhubs,
 		Triage:             triageLoader(*triageOn),
-		DistroFeeds:        distroProviders(*distroFeeds),
-		PreferVendors:      preferVendors,
+		DistroFeeds:        distroFeedProviders,
+		VendorScorers:      vendorScorers,
 		DlopenPolicy:       dlopenPolicy,
 		DynamicPolicy:      dynamicPolicy,
 		GoVersion:          *goVersion,
@@ -480,16 +478,48 @@ func triageLoader(on bool) *triage.Loader {
 	return triage.New()
 }
 
-// distroProviders is the distribution feeds --distro-feeds turns on. Each is
-// keyed to the os-release it Handles, so an image only ever consults the feed
-// that speaks for it: Debian's security tracker for Debian, SUSE's CSAF-VEX for
-// the SUSE Linux Enterprise family (including SLE BCI container images). The rest
-// (Red Hat CSAF, Alpine secdb) will join the slice as they land.
-func distroProviders(on bool) []distrofeed.Provider {
-	if !on {
-		return nil
+// distroSources resolves the two flags that draw on a vendor's security data:
+// --distro-feeds, which clears false positives, and --prefer-vendor, which
+// favours a vendor's own CVSS score. It returns the feed providers the first
+// turns on and the scorers the second names, in --prefer-vendor priority order.
+//
+// The two are built together so a vendor consulted by both is a single instance,
+// which matters because the SUSE provider caches the CSAF documents it reads: a
+// scan run with `--distro-feeds --prefer-vendor suse` then downloads each
+// document once and both the score pass and the verdict pass share it.
+//
+// A --prefer-vendor name for a vendor that publishes no score vexscan can read is
+// reported and dropped rather than silently ignored: today only SUSE does, so
+// `--prefer-vendor debian` says so instead of quietly changing nothing.
+func distroSources(feedsOn bool, prefer []string) ([]distrofeed.Provider, []distrofeed.Scorer) {
+	// One instance per vendor, shared between the two lists.
+	suseP := suse.New()
+
+	var scorers []distrofeed.Scorer
+	seen := map[string]bool{}
+	for _, name := range prefer {
+		key := strings.ToLower(strings.TrimSpace(name))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		switch key {
+		case "suse":
+			scorers = append(scorers, suseP)
+		default:
+			fmt.Fprintf(os.Stderr, "warning: --prefer-vendor %q is not a vendor vexscan can score today (known: suse); ignoring it\n", name)
+		}
 	}
-	return []distrofeed.Provider{debian.New(), suse.New()}
+
+	var feeds []distrofeed.Provider
+	if feedsOn {
+		// Each feed is keyed to the os-release it Handles, so an image only ever
+		// consults the one that speaks for it: Debian's security tracker for
+		// Debian, SUSE's CSAF-VEX for the SUSE Linux Enterprise family (including
+		// SLE BCI images). Red Hat CSAF and Alpine secdb join as they land.
+		feeds = []distrofeed.Provider{debian.New(), suseP}
+	}
+	return feeds, scorers
 }
 
 // pick returns the first non-empty of its arguments, which is how a flag that
