@@ -1893,6 +1893,60 @@ versions always carry an epoch the CSAF fix omits; the comparison fails closed o
 that mismatch so a non-zero epoch can never clear a package whose version is below
 the fix.
 
+### Favouring a vendor's own score (`--prefer-vendor`)
+
+By default a finding's rating is the OSV-derived CVSS — usually NVD's or GitHub's.
+A distribution often scores the same CVE differently, because the number that
+matters to them is how the flaw behaves *in their build*, on their default
+configuration. `--prefer-vendor` says: when this vendor has published a score for
+a CVE, use theirs.
+
+```sh
+# Rate SUSE findings by SUSE's own CVSS, falling back to OSV where SUSE has none
+vexscan --image registry.suse.com/bci/bci-base:15.6 --all --ecosystem os \
+  --distro-feeds --prefer-vendor suse
+```
+
+It is the same idea as
+[`rke2-toolbox`](https://github.com/cwayne18/rke2-toolbox), which always favours
+SUSE's rating of a CVE and only falls back to another source when SUSE has not
+scored it. The flag is **ordered and repeatable** — `--prefer-vendor suse
+--prefer-vendor debian` tries SUSE first, then Debian, then the OSV rating — and
+a name matches a feed's author case-insensitively, so `suse` selects *SUSE
+Security Team*.
+
+The score comes from the distribution's own feed, so **`--prefer-vendor` reads it
+from `--distro-feeds`** and has an effect only where that feed does: the products
+its providers cover, on the images they handle. SUSE's CSAF carries a CVSS v3
+base score and vector per CVE (`vulnerabilities[].scores[].cvss_v3`) right beside
+the not-affected/fixed status the feed already reads; Debian's tracker publishes
+no score, so `--prefer-vendor debian` has nothing to favour today. Without
+`--distro-feeds` the flag prints a warning and changes nothing.
+
+Two properties are worth stating plainly, because this is the **one overlay that
+changes a finding's `severity` and `cvss`** where every other second opinion
+(`--vexhub`, `--triage`, `--distro-feeds` itself) is forbidden to:
+
+- **The vendor's score is authoritative — it wins even when it is lower.** If
+  SUSE rates a CVE `MEDIUM` that NVD calls `HIGH`, the row becomes `MEDIUM`, and
+  `--severity` and `--fail-on` weigh it as `MEDIUM`. That is the point: it lets a
+  gate reflect your distribution's assessment rather than the upstream worst case.
+  The change is applied **before** the severity filter and the fail gate so both
+  see the vendor's number, and every override records an
+  `Evidence{Origin: "prefer-vendor"}` line naming the vendor and the rating it
+  displaced, so a reader can always see why a row is scored the way it is.
+- **It can score what OSV left `UNKNOWN`.** SUSE's *OSV export* publishes no CVSS
+  at all — the [triage section](#prioritising-by-exploitation-triage) notes every
+  SUSE advisory renders `UNKNOWN` there — but SUSE's *CSAF* does carry a score.
+  So on a SUSE image `--prefer-vendor suse` gives a real rating to findings that
+  would otherwise have none, which `--severity` can then filter and `--fail-on`
+  can gate on.
+
+Only vendors with a score-bearing feed can be favoured; SUSE is the first, and
+others join as their feeds do. A finding whose CVE the preferred vendor did not
+score keeps its OSV rating — the flag only ever *adds* a vendor's opinion where
+they have one, and never blanks a rating on its absence.
+
 ### Contributing ruled-out findings back (`--vex-out`)
 
 `--vexhub` *reads* a hub. `--vex-out` *writes* the other direction: it turns

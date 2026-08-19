@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cwayne18/vexscan/internal/distrofeed"
@@ -57,6 +58,21 @@ type Provider struct {
 	HTTP *http.Client
 	// BaseURL is the CSAF-VEX directory; DefaultBaseURL when empty.
 	BaseURL string
+
+	// mu guards docs, the per-run cache of fetched documents. A single scan
+	// looks a CVE up at most twice -- once before the severity filter to read
+	// SUSE's score for --prefer-vendor, and once after to apply its verdict --
+	// and caching the parsed document means the second pass costs no network.
+	// A successful fetch is cached, including a 404 as a nil document; a
+	// transient error is not, so it can be retried on the next pass.
+	mu   sync.Mutex
+	docs map[string]cachedDoc
+}
+
+// cachedDoc is one memoised fetch. adv is nil for a 404 (SUSE has no record),
+// which is a real answer worth caching, not a miss.
+type cachedDoc struct {
+	adv *advisory
 }
 
 // New returns a Provider with sane defaults.
@@ -142,6 +158,7 @@ func statementFor(pkg distrofeed.PkgRef, cpe string, docs map[string]*advisory) 
 			Justification: why,
 			Source:        doc.url,
 			Author:        author,
+			CVSSVector:    doc.scores[strings.ToUpper(id)],
 		}
 		if !status.Exculpatory() {
 			// An affected verdict from any alias vetoes a clear from another.
@@ -162,6 +179,12 @@ type advisory struct {
 	cpeToProducts map[string][]string
 	// per vulnerability id, the product-status sets.
 	vulns map[string]*vulnStatus
+	// scores maps a CVE id to the CVSS v3 vector SUSE published for it, when
+	// the document carried one. SUSE rates a CVE once across all its products,
+	// so a single vector per id is enough; it is read so --prefer-vendor can
+	// favour SUSE's own rating over the OSV-derived one. Empty when the
+	// document published no v3 vector.
+	scores map[string]string
 }
 
 // vulnStatus is one CVE's product-status lists, indexed for lookup by

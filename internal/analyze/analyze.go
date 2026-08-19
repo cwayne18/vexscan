@@ -222,6 +222,19 @@ type Options struct {
 	// analysis did not reach.
 	DistroFeeds []distrofeed.Provider
 
+	// PreferVendors names the security vendors whose CVSS score should be
+	// favoured over the OSV-derived one (--prefer-vendor), in priority order:
+	// the first listed vendor that scored a finding's CVE wins, and only when
+	// none did does the OSV rating stand. A vendor matches a feed whose author
+	// contains the name case-insensitively, so "suse" selects SUSE's CSAF feed.
+	//
+	// Unlike every other overlay this DOES change a finding's Severity and CVSS,
+	// deliberately: it is the one knob that lets a reader say "trust my
+	// distribution's rating of this CVE, even when it is lower than NVD's". The
+	// scores it favours come from the distro feeds, so it has an effect only
+	// alongside DistroFeeds and only on the products those feeds cover.
+	PreferVendors []string
+
 	// GoVersion optionally pins the Go toolchain for repo-mode analysis
 	// (e.g. "1.24.0"). Mainly useful with --module stdlib, whose findings depend
 	// on the toolchain version.
@@ -797,6 +810,25 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 
 	guardCleanStatuses(result.Findings, logf)
 	severityOverlay(result.Findings, run.resolver.severities())
+	// sets is needed by the overlays below, and -- when --prefer-vendor is set --
+	// by the distro-feed score fetch that has to run before the severity filter.
+	// It costs no network (every record was fetched to decide the findings
+	// existed), so hoisting it above the filter is free.
+	sets := run.resolver.cveSets()
+	// --prefer-vendor favours a distribution's own CVSS score over the
+	// OSV-derived one, and does so before the severity filter and the fail gate
+	// so a vendor score that raises or lowers a rating is what both weigh --
+	// which is the whole point of the flag. The documents it reads are cached in
+	// each provider, so distroOverlay's later pass reuses this fetch rather than
+	// hitting the network twice. The os-release read is shared with that pass.
+	var distroOS *OSInfo
+	if len(opts.DistroFeeds) > 0 {
+		distroOS = readOSInfo(img.FS, logf)
+		if len(opts.PreferVendors) > 0 {
+			stmts, index := distroScores(ctx, opts.DistroFeeds, distroOS, result.Findings, sets.All, logf)
+			preferVendorOverlay(stmts, index, opts.PreferVendors, logf)
+		}
+	}
 	// Filtering here, rather than in the renderer, is what keeps every count
 	// downstream honest: the LLM is never billed for a row nobody will read,
 	// and a hub's Matched is statements about findings that are actually in the
@@ -806,18 +838,16 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	// analyzes a tree whose provenance nobody recorded, and inventing a purl
 	// from a directory name would look up an artifact that does not exist.
 	productOverlay(result.Findings, opts.Image)
-	sets := run.resolver.cveSets()
 	upstreamOverlay(result.Findings, sets.Upstream)
 	fixedOverlay(result.Findings, run.resolver.fixedVersions())
 	result.VEXHubs = vexOverlay(ctx, opts.VEXHubs, result.Findings, run.resolver.aliases(), logf)
 	if len(opts.DistroFeeds) > 0 {
 		// After vexOverlay so a user's --vexhub outranks an automatic feed, and
-		// read from the tree the plugins already walked. The os-release read is
-		// cheap and only happens when a feed was actually requested.
+		// read from the tree the plugins already walked.
 		//
 		// sets.All, not aliases(): a distro feed joins on CVE, and a distro
 		// advisory in OSV names its CVEs only in upstream. See distroOverlay.
-		result.DistroFeeds = distroOverlay(ctx, opts.DistroFeeds, readOSInfo(img.FS, logf), result.Findings, sets.All, logf)
+		result.DistroFeeds = distroOverlay(ctx, opts.DistroFeeds, distroOS, result.Findings, sets.All, logf)
 	}
 	result.Triage = triageOverlay(ctx, opts.Triage, result.Findings, sets.All, logf)
 	llmOverlay(ctx, llmClient, result.Findings, "", logf)

@@ -221,6 +221,102 @@ func TestTrailingDataRejected(t *testing.T) {
 	}
 }
 
+// scoredCSAF carries a CVSS v3 score alongside the product status, the shape a
+// real SUSE document has and the one --prefer-vendor reads.
+const scoredCSAF = `{
+  "product_tree": { "branches": [
+    { "category": "product_name", "name": "SUSE Linux Enterprise Server 15 SP5",
+      "product": { "product_id": "SUSE Linux Enterprise Server 15 SP5",
+        "product_identification_helper": { "cpe": "cpe:/o:suse:sles:15:sp5" } } } ] },
+  "vulnerabilities": [ { "cve": "CVE-2023-0464",
+    "scores": [ { "cvss_v3": {
+      "baseScore": 7.5,
+      "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+      "version": "3.1" }, "products": [ "SUSE Linux Enterprise Server 15 SP5" ] } ],
+    "product_status": {
+      "known_affected": [ "SUSE Linux Enterprise Server 15 SP5:bash" ] } } ] }`
+
+// A document that publishes a CVSS score exposes it on every statement it
+// produces for that CVE, so --prefer-vendor can favour SUSE's own rating.
+func TestScoreOnStatement(t *testing.T) {
+	p := &Provider{BaseURL: serve(t, map[string]string{"cve-2023-0464.json": scoredCSAF}, nil)}
+	st := only(t, lookup(t, p, pkgQuery(bookwormCPE(), "bash", "5.2-1", "CVE-2023-0464")))
+	if st.CVSSVector != "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H" {
+		t.Fatalf("CVSSVector = %q, want SUSE's v3.1 vector", st.CVSSVector)
+	}
+}
+
+// A document with no scores array leaves the vector empty, which is the signal
+// for --prefer-vendor to fall back to the OSV-derived rating.
+func TestNoScoreLeavesVectorEmpty(t *testing.T) {
+	p := &Provider{BaseURL: serve(t, docs(), nil)}
+	st := only(t, lookup(t, p, pkgQuery(bookwormCPE(), "libopenssl-1_0_0-devel", "1.0.2p-150000.3.70.1", "CVE-2023-0464")))
+	if st.CVSSVector != "" {
+		t.Fatalf("CVSSVector = %q, want empty for a document with no scores", st.CVSSVector)
+	}
+}
+
+// bestVector takes the highest base score and ignores anything that is not a
+// CVSS v3 vector, matching how the rest of the tool rates a vulnerability.
+func TestBestVector(t *testing.T) {
+	cases := []struct {
+		name   string
+		scores []csafScore
+		want   string
+	}{
+		{"none", nil, ""},
+		{"single", scoresOf(7.5, "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"), "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"},
+		{"highest wins", scoresOf(4.0, "CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:L/I:N/A:N", 9.8, "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"),
+			"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"},
+		{"non-v3 ignored", scoresOf(9.9, "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"), ""},
+	}
+	for _, c := range cases {
+		if got := bestVector(c.scores); got != c.want {
+			t.Errorf("%s: bestVector = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// A document fetched for its score is not fetched a second time when its verdict
+// is applied: the two passes --prefer-vendor and distroOverlay make share one
+// download, so a run does not double its network.
+func TestDocumentIsCached(t *testing.T) {
+	var hits int32
+	p := &Provider{BaseURL: serve(t, map[string]string{"cve-2023-0464.json": scoredCSAF}, &hits)}
+	q := pkgQuery(bookwormCPE(), "bash", "5.2-1", "CVE-2023-0464")
+	only(t, lookup(t, p, q))
+	only(t, lookup(t, p, q))
+	if hits != 1 {
+		t.Errorf("fetched %d times, want 1 (the second Lookup should hit the cache)", hits)
+	}
+}
+
+// A 404 is cached too: a CVE SUSE has no record for is not re-requested on a
+// second pass.
+func TestMissingDocumentIsCached(t *testing.T) {
+	var hits int32
+	p := &Provider{BaseURL: serve(t, map[string]string{}, &hits)}
+	q := pkgQuery(bookwormCPE(), "bash", "5.2-1", "CVE-2099-9999")
+	lookup(t, p, q)
+	lookup(t, p, q)
+	if hits != 1 {
+		t.Errorf("fetched %d times, want 1 (a cached 404 should not be re-requested)", hits)
+	}
+}
+
+// scoresOf builds a scores slice from alternating (baseScore, vector) pairs, for
+// the table test above.
+func scoresOf(pairs ...any) []csafScore {
+	var out []csafScore
+	for i := 0; i+1 < len(pairs); i += 2 {
+		var s csafScore
+		s.CVSSV3.BaseScore = pairs[i].(float64)
+		s.CVSSV3.VectorString = pairs[i+1].(string)
+		out = append(out, s)
+	}
+	return out
+}
+
 func TestHandlesSUSEFamily(t *testing.T) {
 	p := New()
 	for _, id := range []string{"sles", "sled", "sles_sap", "sle_hpc", "sle-micro"} {
