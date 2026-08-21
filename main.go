@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -31,70 +32,61 @@ import (
 func main() {
 	// --version carries two meanings for one more release; see version.go.
 	var versionArg versionFlag
-	flag.Var(&versionArg, "version", "print vexscan's version and exit (deprecated: --version=VERSION still overrides a module version; use --module-version)")
+	flag.Var(&versionArg, "version", "print version and exit (deprecated: =VERSION overrides a module version; use --module-version)")
 
 	var packages, ecosystems, roots, vexhubs, severities, rpms, preferVendors stringList
-	flag.Var(&packages, "package", "package to check: a purl, an ecosystem:name shorthand (deb:openssl, golang:golang.org/x/net), or a bare name resolved against the inventory; repeatable")
-	flag.Var(&ecosystems, "ecosystem", "restrict the scan to these ecosystems (golang, os, pypi, npm, maven, or a distro family like debian); repeatable, default all")
-	flag.Var(&roots, "roots", "extra entrypoints for the reachability closures (shared libraries and language imports), for an image whose real command comes from outside its config; repeatable")
-	flag.Var(&rpms, "rpm", "rpm package file to scan without installing it -- a path, a directory of them, or a URL; repeatable "+
-		"(mutually exclusive with --image, --rootfs and --repo; reads only the header, so a URL costs kilobytes not megabytes)")
-	flag.Var(&vexhubs, "vexhub", "VEX Hub repository to check findings against, e.g. https://github.com/rancher/vexhub (also accepts a raw base URL or a local directory); repeatable, earliest wins")
-	flag.Var(&severities, "severity", "only report findings at these severities: "+
-		strings.Join(cvss.Labels, ", ")+"; comma-separated or repeatable "+
-		"(UNKNOWN means no rating was published, and must be named to be shown -- "+
-		"every --repo finding is UNKNOWN, because govulncheck's OpenVEX carries no severity)")
+	flag.Var(&packages, "package", "package to check: a purl, an ecosystem:name shorthand (deb:openssl), or a bare name; repeatable")
+	flag.Var(&ecosystems, "ecosystem", "restrict to these ecosystems (golang, os, pypi, npm, maven, or a distro like debian); repeatable")
+	flag.Var(&roots, "roots", "extra entrypoints for the reachability closures when the image config declares none; repeatable")
+	flag.Var(&rpms, "rpm", "rpm file to scan without installing: a path, a directory, or a URL; repeatable (reads only the header)")
+	flag.Var(&vexhubs, "vexhub", "VEX Hub repo, raw URL, or local dir to check findings against; repeatable, earliest wins")
+	flag.Var(&severities, "severity", "only report these severities: "+
+		strings.Join(cvss.Labels, ", ")+"; comma-separated or repeatable (UNKNOWN must be named to be shown)")
 	var (
-		image  = flag.String("image", "", "container image reference to inspect (mutually exclusive with --rootfs and --repo)")
-		rootfs = flag.String("rootfs", "", "filesystem tree already on disk to inspect -- an unpacked image, a mounted volume, a machine's own / (mutually exclusive with --image and --repo)")
-		repo   = flag.String("repo", "", "git source repo to analyze via govulncheck source mode, e.g. github.com/rancher/rancher (mutually exclusive with --image and --rootfs)")
-		sbom   = flag.String("sbom", "", "CycloneDX JSON bill of materials to scan -- a path, or '-' for stdin "+
-			"(mutually exclusive with the other targets; a component names a package and nothing else, so every finding is undetermined)")
+		image      = flag.String("image", "", "container image reference to inspect")
+		rootfs     = flag.String("rootfs", "", "filesystem tree on disk to inspect: an unpacked image, a mounted volume, a machine's own /")
+		repo       = flag.String("repo", "", "git source repo to analyze via govulncheck source mode, e.g. github.com/rancher/rancher")
+		sbom       = flag.String("sbom", "", "CycloneDX JSON bill of materials to scan: a path, or '-' for stdin (every finding is undetermined)")
 		ref        = flag.String("ref", "", "branch, tag, or commit to check out for --repo (default: repo default branch)")
 		repoPath   = flag.String("repo-path", ".", "module subdirectory within --repo to scan")
 		module     = flag.String("module", "", "deprecated alias for --package golang:MODULE")
-		all        = flag.Bool("all", false, "check everything each ecosystem can inventory, instead of named packages (the default in --image mode when no --package/--cves is given)")
-		cvesFlag   = flag.String("cves", "", "comma-separated CVE/GHSA/GO ids to check; alone, they are resolved against the whole target")
-		cvesFile   = flag.String("cves-file", "", "path to a file with one CVE/GHSA/GO id per line (merged with --cves)")
-		modVersion = flag.String("module-version", "", "override the module version (image mode only; default: read from each binary's build info)")
-		showVer    = flag.Bool("V", false, "print vexscan's version and exit")
-		goVersion  = flag.String("go-version", "", "pin the Go toolchain for --repo analysis, e.g. 1.24.0 (useful with --package golang:stdlib)")
-		goos       = flag.String("os", "linux", "image OS variant to pull (image mode)")
-		arch       = flag.String("arch", "amd64", "image architecture variant to pull (image mode)")
-		osvEco     = flag.String("osv-ecosystem", "", "override the OSV ecosystem derived from the image's os-release, e.g. 'Debian:12'")
-		osvURL     = flag.String("osv-url", "", "OSV API root to query instead of "+osv.DefaultBaseURL+" -- a caching proxy or a mirror serving the same v1 API. For a scan with no network at all use --osv-dir, which reads OSV's published data export directly (env: VEXSCAN_OSV_URL)")
-		osvDir     = flag.String("osv-dir", "", "answer advisory lookups from a local copy of OSV's data export instead of the API: a directory of per-ecosystem JSON (gsutil -m rsync -r gs://osv-vulnerabilities DIR), or an all.zip. Version matching then happens here rather than on osv.dev, so read the NOTE the report prints about it (env: VEXSCAN_OSV_DIR)")
+		all        = flag.Bool("all", false, "check everything each ecosystem can inventory (the default in --image mode with no --package/--cves)")
+		cvesFlag   = flag.String("cves", "", "comma-separated CVE/GHSA/GO ids to check; alone, resolved against the whole target")
+		cvesFile   = flag.String("cves-file", "", "file with one CVE/GHSA/GO id per line (merged with --cves)")
+		modVersion = flag.String("module-version", "", "override the module version (image mode; default: read from each binary's build info)")
+		showVer    = flag.Bool("V", false, "print version and exit")
+		goVersion  = flag.String("go-version", "", "pin the Go toolchain for --repo, e.g. 1.24.0 (useful with --package golang:stdlib)")
+		goos       = flag.String("os", "linux", "image OS variant to pull")
+		arch       = flag.String("arch", "amd64", "image architecture variant to pull")
+		osvEco     = flag.String("osv-ecosystem", "", "override the OSV ecosystem derived from os-release, e.g. 'Debian:12'")
+		osvURL     = flag.String("osv-url", "", "OSV API root to query instead of "+osv.DefaultBaseURL+": a caching proxy or a mirror (env: VEXSCAN_OSV_URL)")
+		osvDir     = flag.String("osv-dir", "", "answer lookups from a local OSV data export (a directory or an all.zip) for offline use; version matching then happens here (env: VEXSCAN_OSV_DIR)")
 		dlopen     = flag.String("dlopen-policy", "taint", "what a reachable dlopen does to the closure: taint (block conclusions) or assume-none")
-		dynamic    = flag.String("dynamic-import-policy", "taint", "what an import of a computed name does to a language import graph: taint (block conclusions) or assume-none; these are far more common than dlopen, so assume-none discards much more")
-		triageOn   = flag.Bool("triage", false, "order findings by exploitation evidence: EPSS scores and CISA's known-exploited catalog. Adds two columns and sorts known-exploited first, then by EPSS percentile; nothing is hidden, and no severity changes. Downloads two public feeds (~4 MB, cached under VEXSCAN_TRIAGE_CACHE)")
-		mine       = flag.Bool("mine-advisories", false, "with --llm, let the model read each advisory's prose for symbols to check against the image")
-		rpmDeep    = flag.Bool("rpm-deep", false, "with --rpm, decompress each package's payload and extract its ELF objects so the dynsym-absent test can run (needs --mine-advisories to have a symbol to look for; costs the whole download, and still cannot run the reachability closure)")
-		trustAbs   = flag.Bool("trust-import-absence", false, "let a missing dynamic import of the vulnerable symbol conclude not_in_execute_path (see README: this is weaker than it looks)")
-		useLLM     = flag.Bool("llm", false, "consult a chat model on genuinely-affected CVEs for exploitability (needs a provider: --llm-endpoint or --llm-command; implies --details for --format text so the verdicts are shown)")
-		llmURL     = flag.String("llm-endpoint", "", "OpenAI-compatible chat/completions URL for --llm -- an API provider, or a local Ollama (env: VEXSCAN_LLM_ENDPOINT; credential: VEXSCAN_LLM_TOKEN)")
+		dynamic    = flag.String("dynamic-import-policy", "taint", "what an import of a computed name does to the import graph: taint (block conclusions) or assume-none")
+		triageOn   = flag.Bool("triage", false, "order findings by exploitation evidence (EPSS + CISA known-exploited); adds columns, hides nothing, changes no severity")
+		mine       = flag.Bool("mine-advisories", false, "with --llm, let the model read each advisory's prose for symbols to check against the target")
+		rpmDeep    = flag.Bool("rpm-deep", false, "with --rpm, extract ELF objects so the dynsym-absent test can run (needs --mine-advisories)")
+		trustAbs   = flag.Bool("trust-import-absence", false, "let a missing dynamic import conclude not_in_execute_path (weaker than it looks; see README)")
+		useLLM     = flag.Bool("llm", false, "consult a chat model on affected CVEs for exploitability (needs --llm-endpoint or --llm-command; implies --details)")
+		llmURL     = flag.String("llm-endpoint", "", "OpenAI-compatible chat/completions URL for --llm (env: VEXSCAN_LLM_ENDPOINT; token: VEXSCAN_LLM_TOKEN)")
 		llmModel   = flag.String("llm-model", "", "model id for --llm-endpoint (env: VEXSCAN_LLM_MODEL; default gpt-4o)")
-		llmCommand = flag.String("llm-command", "", "for --llm, run this installed CLI instead of calling an endpoint, e.g. 'claude -p'; the prompt arrives on its stdin (env: VEXSCAN_LLM_COMMAND)")
-		format     = flag.String("format", "text", "output format: text, json, sarif (SARIF 2.1.0 for code-scanning dashboards), fixplan (a remediation-first view of the fixable findings), or inventory (list the image's OS packages and exit)")
-		details    = flag.Bool("details", false, "with --format text, print the full evidence block under each row instead of the table alone")
+		llmCommand = flag.String("llm-command", "", "run this installed CLI for --llm instead of an endpoint, e.g. 'claude -p' (env: VEXSCAN_LLM_COMMAND)")
+		format     = flag.String("format", "text", "output format: text, json, sarif, fixplan, or inventory")
+		details    = flag.Bool("details", false, "with --format text, print the full evidence block under each row")
 		out        = flag.String("out", "", "write output to this file instead of stdout")
-		gistFlag   = flag.Bool("gist", false, "also upload the output to a public GitHub gist and print its URL (needs GITHUB_TOKEN/GH_TOKEN with gist scope)")
-		gistSecret = flag.Bool("gist-secret", false, "with --gist, create a secret (unlisted) gist instead of a public one")
-		vexOut     = flag.String("vex-out", "", "write OpenVEX not_affected documents for every finding vexscan ruled out into this directory, laid out as a VEX hub; with --vexhub they are merged into what that hub already publishes, so the directory can be a clone of it (see contrib/vexhub-pr.sh)")
-		vexAuthor  = flag.String("vex-author", "", "with --vex-out, the OpenVEX author to record on the statements -- required, and it is you: a not_affected claim is someone's assertion")
+		gistFlag   = flag.Bool("gist", false, "also upload the output to a public GitHub gist (needs GITHUB_TOKEN/GH_TOKEN with gist scope)")
+		gistSecret = flag.Bool("gist-secret", false, "with --gist, create a secret (unlisted) gist")
+		vexOut     = flag.String("vex-out", "", "write OpenVEX not_affected documents for ruled-out findings into this directory, laid out as a VEX hub")
+		vexAuthor  = flag.String("vex-author", "", "with --vex-out, the OpenVEX author to record on the statements (required)")
 		failOnSev  = flag.String("fail-on", "", "exit 3 if any counted finding is at or above this severity: "+
-			strings.Join(cvss.Labels, ", ")+", or 'any'. Off by default; see --fail-on-status for what counts")
-		failOnStat = flag.String("fail-on-status", "", "which findings --fail-on weighs: a comma-separated list of "+
-			"affected, undetermined, vexed, cleared, or 'all' (default affected -- vulnerable code present and loadable, "+
-			"which is the gate no version-matching scanner can offer)")
-		colorMode = flag.String("color", "auto", "colourise the text report: auto, always, never. "+
-			"auto colours only a terminal, and never a file (--out), a gist (--gist), JSON output, or a run with NO_COLOR set")
+			strings.Join(cvss.Labels, ", ")+", or 'any' (off by default; see --fail-on-status)")
+		failOnStat  = flag.String("fail-on-status", "", "which findings --fail-on weighs: affected, undetermined, vexed, cleared, or 'all' (default affected)")
+		colorMode   = flag.String("color", "auto", "colourise the text report: auto, always, never")
 		quiet       = flag.Bool("quiet", false, "suppress progress logging on stderr")
-		noPager     = flag.Bool("no-pager", false, "never page the output, even when stdout is a terminal (VEXSCAN_PAGER picks the pager; setting it empty turns paging off for good)")
-		distroFeeds = flag.Bool("distro-feeds", false, "clear OS-package false positives with the distribution's own security feed: a vendor <not-affected> or an already-shipped fix moves a row to ALREADY VEXED, and like --vexhub never changes a status. Debian's security tracker and SUSE's CSAF-VEX today; network, off by default")
+		noPager     = flag.Bool("no-pager", false, "never page the output, even when stdout is a terminal")
+		distroFeeds = flag.Bool("distro-feeds", false, "clear OS-package false positives with the distribution's own security feed (Debian, SUSE; network, off by default)")
 	)
-	flag.Var(&preferVendors, "prefer-vendor", "favour this security vendor's own CVSS score over the OSV-derived one, e.g. 'suse'; "+
-		"repeatable for a priority order, and unlike --severity it can lower a rating (the vendor's score is authoritative when present). "+
-		"Keyed by CVE, so it rescores findings in any ecosystem (Go modules included), not just OS packages; network, SUSE today")
+	flag.Var(&preferVendors, "prefer-vendor", "favour this vendor's own CVSS score over the OSV-derived one, e.g. 'suse'; repeatable for priority, can lower a rating (network)")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -534,10 +526,11 @@ func pick(vals ...string) string {
 	return ""
 }
 
-// fail prints a usage error and exits 2.
+// fail prints a usage error and exits 2. It shows only the short synopsis, not
+// the whole manual: someone who mistyped one flag does not need every other one.
 func fail(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "error: "+format+"\n", args...)
-	flag.Usage()
+	usageShort()
 	os.Exit(2)
 }
 
@@ -695,201 +688,163 @@ func parseCVEs(flagVal, file string) []string {
 	return out
 }
 
-func usage() {
-	// WriteString rather than Fprint: the purl example contains %2F, which vet
-	// reads as a stray formatting directive in anything Printf-shaped.
-	os.Stderr.WriteString(`vexscan - check whether a CVE's vulnerable code is actually present in an image, a filesystem, or a source repo
-
-Every ecosystem brings its own deterministic presence test: pclntab
-dead-code-elimination evidence and govulncheck for Go, the dynamic linker's
-DT_NEEDED closure for OS packages, and the installed-distribution manifest plus
-a static import closure for Python and npm. The LLM, if enabled, only ever
-comments on what those tests could not rule out.
-
-Usage:
-  vexscan --image  REF  (--package SPEC... | --cves LIST | --all) [flags]
-  vexscan --rootfs DIR  (--package SPEC... | --cves LIST | --all) [flags]
-  vexscan --repo   REPO (--package SPEC... | --cves LIST | --all) [flags]
-  vexscan --rpm    FILE (--package SPEC... | --cves LIST | --all) [flags]
-  vexscan --sbom   FILE (--package SPEC... | --cves LIST | --all) [flags]
+// synopsis is the target/selection summary shown both on a command-line error
+// and at the top of the full help.
+//
+// WriteString rather than Fprint: the purl example elsewhere contains %2F, which
+// vet reads as a stray formatting directive in anything Printf-shaped.
+const synopsis = `Usage:
+  vexscan <target> <selection> [flags]
   vexscan --version
 
---rootfs runs the same analysis against a tree already on disk. It arrives with
-no image config, so nothing declares an entrypoint: the language plugins mark
-their conclusions undetermined and the shared-library closure falls back to
-rooting every program it finds. Pass --roots to say what actually runs.
+Target (choose one):   --image REF | --rootfs DIR | --repo REPO | --rpm FILE | --sbom FILE
+Selection:             --package SPEC... | --cves LIST | --all
+`
 
---rpm and --sbom scan packages nobody installed, so there is no filesystem to
-trace and no reachability test can run. --rpm still reads each header's file
-list, which is enough to rule out a package that ships no executable code at
-all; a CycloneDX component carries no file list, so --sbom can rule out nothing
-and every finding it produces is undetermined. The report says so at both ends.
-Use them to triage a build artifact or a bill of materials; scan the image or
-the tree when you want an answer about whether the code can run.
+// usageShort is printed on a command-line error: the synopsis and a pointer to
+// the full help, never the whole manual.
+func usageShort() {
+	os.Stderr.WriteString(synopsis)
+	os.Stderr.WriteString("\nRun 'vexscan -h' for the full list of flags and examples.\n")
+}
 
-  syft debian:12 -o cyclonedx-json | vexscan --sbom - --all
-  vexscan --sbom bom.json --all --ecosystem golang
+// flagGroups gives the -h flag list an order and headings, instead of the flat
+// alphabetical dump flag.PrintDefaults produces.
+var flagGroups = []struct {
+	title string
+	names []string
+}{
+	{"Targets (choose exactly one)", []string{"image", "rootfs", "repo", "rpm", "sbom"}},
+	{"What to check", []string{"package", "cves", "cves-file", "all", "ecosystem", "severity", "module"}},
+	{"Source repo (--repo)", []string{"ref", "repo-path", "go-version"}},
+	{"Container image", []string{"os", "arch", "module-version"}},
+	{"Reachability", []string{"roots", "dlopen-policy", "dynamic-import-policy", "trust-import-absence"}},
+	{"Advisory sources", []string{"osv-url", "osv-dir", "osv-ecosystem", "prefer-vendor", "distro-feeds"}},
+	{"VEX", []string{"vexhub", "vex-out", "vex-author"}},
+	{"Triage", []string{"triage"}},
+	{"LLM exploitability", []string{"llm", "llm-endpoint", "llm-model", "llm-command", "mine-advisories", "rpm-deep"}},
+	{"Output", []string{"format", "details", "out", "color", "no-pager", "quiet", "gist", "gist-secret"}},
+	{"CI gate", []string{"fail-on", "fail-on-status"}},
+	{"Info", []string{"version", "V"}},
+}
 
---llm has no default provider. Point it at any OpenAI-compatible endpoint, at a
-model running on this machine, or at a CLI you already have logged in:
+func usage() {
+	os.Stderr.WriteString(`vexscan - check whether a CVE's vulnerable code is actually present, and can
+actually run, in a container image, a filesystem tree, a source repo, an
+uninstalled RPM, or an SBOM. Version scanners flag a vulnerable version; vexscan
+runs a per-ecosystem presence test and reports what it could not rule out.
 
-  --llm-endpoint https://api.openai.com/v1/chat/completions   # VEXSCAN_LLM_TOKEN
-  --llm-endpoint http://localhost:11434/v1/chat/completions --llm-model llama3.1
-  --llm-command 'claude -p'
+`)
+	os.Stderr.WriteString(synopsis)
 
-Whichever you pick cannot change a deterministic conclusion: the verdict is an
-overlay on a finding that already has a status, and a mined symbol is checked
-against the artifact before it can support one.
-
-A --package SPEC is a purl, an "ecosystem:name" shorthand, or a bare name
-resolved against whatever inventory contains it:
-
-  golang:golang.org/x/net    deb:openssl    apk:musl    openssl
-  pypi:PyYAML                pkg:pypi/pyyaml@6.0.1
-  npm:@babel/traverse        pkg:npm/lodash@4.17.20
+	os.Stderr.WriteString(`
+A --package SPEC is a purl, an "ecosystem:name" shorthand, or a bare name:
+  golang:golang.org/x/net   deb:openssl   pypi:PyYAML   npm:@babel/traverse
   pkg:golang/golang.org%2Fx%2Fnet@v0.17.0
 
 Examples:
-  # One Go module in a container image (pclntab + govulncheck binary mode)
-  vexscan --image rancher/hardened-kubernetes:v1.30.1 \
-    --package golang:golang.org/x/net --cves CVE-2023-39325,CVE-2023-44487
-
   # Where does this CVE land, anywhere in the image? (searches every ecosystem)
   vexscan --image debian:12 --cves CVE-2024-5535
 
-  # One OS package, with the shared-library closure as the presence test
-  vexscan --image debian:12 --package deb:openssl
+  # One Go module in an image, with govulncheck reachability
+  vexscan --image rancher/hardened-kubernetes:v1.30.1 \
+    --package golang:golang.org/x/net --cves CVE-2023-39325,CVE-2023-44487
 
-  # Everything the image installs, OS packages only -- a table sorted by severity
-  vexscan --image registry.access.redhat.com/ubi9/ubi:latest --all --ecosystem os
+  # Everything the image installs, OS packages only, worst first
+  vexscan --image registry.access.redhat.com/ubi9/ubi:latest \
+    --all --ecosystem os --severity CRITICAL,HIGH
 
-  # ... and the evidence behind every row of it
-  vexscan --image registry.access.redhat.com/ubi9/ubi:latest --all --ecosystem os --details
-
-  # ... or just the ones worth waking someone for (the report says what it hid)
-  vexscan --image debian:12 --all --ecosystem os --severity CRITICAL,HIGH
-
-  # ... or ordered by whether anyone is actually exploiting them, which is a
-  # different question from severity and often a differently-ordered table
-  vexscan --image debian:12 --all --ecosystem os --triage
-
-  # One Python distribution, by any spelling of its name
-  vexscan --image python:3.12-slim --package pypi:PyYAML
-
-  # Every Node package the image installs, with the require closure applied
-  vexscan --image node:22-slim --all --ecosystem npm
-
-  # A filesystem tree rather than an image, with the entrypoint supplied
-  vexscan --rootfs /mnt/rootfs --all --roots /usr/bin/myapp
-
-  # Source repo (govulncheck source-mode reachability)
-  vexscan --repo github.com/rancher/rancher \
-    --package golang:golang.org/x/net --cves CVE-2023-39325
-
-  # Standard library CVEs
-  vexscan --image myorg/app:latest --package golang:stdlib --cves CVE-2025-22870
-  vexscan --repo github.com/rancher/rancher --package golang:stdlib --go-version 1.24.0
-
-  # A bill of materials from a build, with no image to hand
-  vexscan --sbom sbom.cdx.json --all
+  # A source repo, or an SBOM when there is no image to hand
+  vexscan --repo github.com/rancher/rancher --package golang:golang.org/x/net
   syft myorg/app:latest -o cyclonedx-json | vexscan --sbom - --all
-
-  # List the packages in an image, with the names OSV will be queried by
-  vexscan --image debian:12 --format inventory
-  vexscan --rootfs /mnt/rootfs --format inventory
-
-  # A remediation-first view: which packages to upgrade, and to what
-  # (a current debian:12 is fully patched, so pick a tag that is behind)
-  vexscan --image debian:bookworm-20230919 --all --format fixplan
 
   # SARIF for a code-scanning dashboard; ruled-out findings arrive suppressed
   vexscan --image myorg/app:latest --all --format sarif --out results.sarif
 
-  # With an exploitability overlay, from a model running locally
-  vexscan --image myorg/app:latest --all --llm \
-    --llm-endpoint http://localhost:11434/v1/chat/completions --llm-model llama3.1
-
-  # ... or from a CLI already installed and logged in
-  vexscan --image myorg/app:latest --all --llm --llm-command 'claude -p'
-
-  # Share the report as a public gist (needs GITHUB_TOKEN/GH_TOKEN with gist scope)
-  vexscan --image rancher/hardened-kubernetes:v1.30.1 \
-    --package golang:golang.org/x/net --cves CVE-2023-39325 --gist
-
-  # Write what this scan ruled out into a clone of the hub, ready to review
-  gh repo clone rancher/vexhub
-  vexscan --image rancher/hardened-kubernetes:v1.30.1 --all \
-    --vexhub ./vexhub --vex-out ./vexhub --vex-author 'Acme Security'
-  git -C vexhub diff        # then contrib/vexhub-pr.sh, or commit it yourself
-
---triage answers a question severity does not: is anyone exploiting this? It
-downloads EPSS (a 30-day exploitation-activity forecast, per CVE) and CISA's
-known-exploited catalog, and reorders the table by them. Neither feed changes a
-status or a severity: whether a vulnerability is being exploited elsewhere says
-nothing about whether the code is present here. Both are keyed by CVE, so an
-advisory that never got one cannot be scored, and the report names those rather
-than filing them as zero. Absence from the KEV catalog means nothing at all.
-
-Advisories come from api.osv.dev unless you say otherwise. Two flags say
-otherwise, and they differ in who decides which advisories apply, not just in
-where the bytes come from:
-
-  vexscan --image myorg/app:latest --all --osv-url http://osv-proxy.corp:8000
-  gsutil -m rsync -r gs://osv-vulnerabilities /srv/osv
-  vexscan --image myorg/app:latest --all --osv-dir /srv/osv
-
---osv-url still queries a v1 OSV API, just a different one: a caching proxy in
-front of osv.dev, or a mirror serving your own feed. osv.dev still matches the
-installed version against each advisory's ranges. Use it to cut egress or to
-pin a scan to a vendor's advisory set.
-
---osv-dir needs no server at all. It reads OSV's published data export -- the
-same records the API serves -- from a directory or an all.zip, which makes it
-the flag for a host with no network. The version matching then happens on this
-machine, against dpkg, rpm, apk and semver ordering. Where no comparator can
-order an ecosystem the advisory is kept rather than dropped, and the report
-says how many and which: over-matching costs a reader a dismissal, and
-under-matching costs them the vulnerability. Pass one or the other, never both.
-
---version prints vexscan's own version and exits. It used to mean "override the
-module version read from a binary's build info"; that setting is now spelled
---module-version, and --version=VERSION still works with a warning for one more
-release. vexscan takes no positional arguments, so "--version 1.2.3" is an
-error rather than a scan of the wrong version.
-
-A report longer than one screen is paged through $VEXSCAN_PAGER, $PAGER or
-less, and repeats its summary and any INCOMPLETE notes at the bottom. Piped,
-redirected or written with --out it is never paged, and the bytes are the same
-either way. --no-pager turns it off for one run; VEXSCAN_PAGER= for good.
-
---color auto (the default) colours the text report on a terminal and nowhere
-else: not into a pipe, not into --out, not into a --gist, not into JSON, and
-not when NO_COLOR is set. --color always overrides all of that except JSON, for
-piping into "less -R". Nothing is said in colour alone -- stripping the escapes
-from a coloured report reproduces the plain one byte for byte.
-
---fail-on gates a pipeline on the findings. It is off by default, and it counts
-only findings whose vulnerable code is present and loadable, unless
---fail-on-status widens it:
-
+  # Gate a pipeline on code that is actually present and loadable
   vexscan --image myorg/app:latest --all --fail-on high
-  vexscan --image myorg/app:latest --all --fail-on any --fail-on-status affected,undetermined
 
-That default is the difference worth having. "--fail-on high" here means a HIGH
-whose code the closure actually reached, not a HIGH whose version string
-appears in a package database -- so a passing gate is a statement about the
-image rather than about a filter. Severities order as the table orders them, so
-an unrated finding counts from MEDIUM down; above that it cannot be weighed,
-and the run says how many it could not weigh rather than passing quietly.
+Flags:
+`)
+	printFlagGroups(os.Stderr)
 
+	os.Stderr.WriteString(`
 Exit status:
   0  the scan completed
   1  the scan failed, or an ecosystem could not be read (the report says which)
   2  the command line was wrong
-  3  the scan completed and --fail-on matched (never mixed with 1: a broken
-     scan is not a clean gate, and its findings are not counted at all)
+  3  the scan completed and --fail-on matched
 
-Flags:
+For the deterministic presence tests, offline/mirrored OSV data, VEX output,
+triage, LLM providers, and paging/colour details, see the README:
+https://github.com/cwayne18/vexscan
 `)
-	flag.PrintDefaults()
+}
+
+// printFlagGroups renders the registered flags in labelled groups, wrapping each
+// description under an aligned column.
+func printFlagGroups(w io.Writer) {
+	const col = 26
+	for _, g := range flagGroups {
+		fmt.Fprintf(w, "\n%s:\n", g.title)
+		for _, name := range g.names {
+			f := flag.Lookup(name)
+			if f == nil {
+				continue
+			}
+			ph, u := flag.UnquoteUsage(f)
+			dash := "--"
+			if len(f.Name) == 1 {
+				dash = "-"
+			}
+			label := dash + f.Name
+			// --version takes an optional value; the derived "value" placeholder
+			// would misread as required, so drop it.
+			if ph != "" && f.Name != "version" {
+				label += " " + ph
+			}
+			writeFlag(w, label, withDefault(u, f), col)
+		}
+	}
+}
+
+// withDefault appends a "(default X)" note for a flag whose default is not the
+// zero value, matching what flag.PrintDefaults would show.
+func withDefault(u string, f *flag.Flag) string {
+	if d := f.DefValue; d != "" && d != "false" && d != "0" {
+		if u != "" {
+			u += " "
+		}
+		u += "(default " + d + ")"
+	}
+	return u
+}
+
+// writeFlag prints one flag: its label in a fixed column, then the description
+// word-wrapped and aligned beneath it.
+func writeFlag(w io.Writer, label, usage string, col int) {
+	indent := strings.Repeat(" ", col)
+	prefix := "  " + label
+	if len(prefix) < col {
+		prefix += strings.Repeat(" ", col-len(prefix))
+	} else {
+		fmt.Fprintln(w, prefix)
+		prefix = indent
+	}
+	const width = 96
+	line := prefix
+	cur := ""
+	for _, word := range strings.Fields(usage) {
+		switch {
+		case cur == "":
+			cur = word
+		case len(line)+len(cur)+1+len(word) > width:
+			fmt.Fprintln(w, line+cur)
+			line = indent
+			cur = word
+		default:
+			cur += " " + word
+		}
+	}
+	fmt.Fprintln(w, strings.TrimRight(line+cur, " "))
 }
