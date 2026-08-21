@@ -71,7 +71,7 @@ func main() {
 		llmURL     = flag.String("llm-endpoint", "", "OpenAI-compatible chat/completions URL for --llm (env: VEXSCAN_LLM_ENDPOINT; token: VEXSCAN_LLM_TOKEN)")
 		llmModel   = flag.String("llm-model", "", "model id for --llm-endpoint (env: VEXSCAN_LLM_MODEL; default gpt-4o)")
 		llmCommand = flag.String("llm-command", "", "run this installed CLI for --llm instead of an endpoint, e.g. 'claude -p' (env: VEXSCAN_LLM_COMMAND)")
-		format     = flag.String("format", "text", "output format: text, json, sarif, fixplan, or inventory")
+		format     = flag.String("format", "text", "output format: text, summary, json, sarif, fixplan, or inventory")
 		details    = flag.Bool("details", false, "with --format text, print the full evidence block under each row")
 		out        = flag.String("out", "", "write output to this file instead of stdout")
 		gistFlag   = flag.Bool("gist", false, "also upload the output to a public GitHub gist (needs GITHUB_TOKEN/GH_TOKEN with gist scope)")
@@ -134,9 +134,9 @@ func main() {
 		}
 	}
 	switch *format {
-	case "text", "json", "sarif", "fixplan", "inventory":
+	case "text", "summary", "json", "sarif", "fixplan", "inventory":
 	default:
-		fail("unknown --format %q; want text, json, sarif, fixplan, or inventory", *format)
+		fail("unknown --format %q; want text, summary, json, sarif, fixplan, or inventory", *format)
 	}
 	// Caught here so a missing author is a command-line error before the scan,
 	// not after it.
@@ -327,6 +327,8 @@ func main() {
 		rendered = b
 	case "fixplan":
 		rendered = renderFixPlan(res, renderOpts{pal: pal})
+	case "summary":
+		rendered = renderSummary(res, renderOpts{pal: pal})
 	default: // --format was validated up front; inventory returned earlier
 		rendered = renderText(res, renderOpts{details: *details, pal: pal})
 	}
@@ -753,6 +755,9 @@ Examples:
   # Everything the image installs, OS packages only, worst first
   vexscan --image registry.access.redhat.com/ubi9/ubi:latest \
     --all --ecosystem os --severity CRITICAL,HIGH
+
+  # A one-screen count of what was found, per ecosystem (present vs ruled out)
+  vexscan --image debian:12 --all --format summary
 
   # A source repo, or an SBOM when there is no image to hand
   vexscan --repo github.com/rancher/rancher --package golang:golang.org/x/net

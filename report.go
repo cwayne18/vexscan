@@ -791,14 +791,12 @@ func alreadyVexed(f analyze.Finding) bool {
 func sections(res *analyze.Result) []section {
 	var affected, vexed, undetermined, ruledOut []analyze.Finding
 	for _, f := range res.Findings {
-		switch f.Status {
-		case analyze.StatusLinked, analyze.StatusReachable:
-			if alreadyVexed(f) {
-				vexed = append(vexed, f)
-			} else {
-				affected = append(affected, f)
-			}
-		case analyze.StatusNotPresent, analyze.StatusNotInPath:
+		switch bucketOf(f) {
+		case bucketAffected:
+			affected = append(affected, f)
+		case bucketVexed:
+			vexed = append(vexed, f)
+		case bucketRuledOut:
 			ruledOut = append(ruledOut, f)
 		default:
 			undetermined = append(undetermined, f)
