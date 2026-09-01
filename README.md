@@ -1256,8 +1256,36 @@ is non-fatal either way: the finding is still reported, just without a verdict.
 
 ## Output
 
-`--format text` is for reading; `--format json` is for keeping; `--format
-sarif` is for a code-scanning dashboard; `--format fixplan` is for acting.
+`--format text` is for reading; `--format summary` is for a one-screen count;
+`--format json` is for keeping; `--format sarif` is for a code-scanning
+dashboard; `--format fixplan` is for acting.
+
+### The summary
+
+`--format summary` is the count at the top of the report without the report:
+one row per ecosystem, plus a total, so a scan of hundreds of findings fits a
+few lines. It carries the number no version scanner can give — `RULED OUT`, the
+findings a version match would have raised that the presence test cleared — next
+to `AFFECTED`, the ones that need action.
+
+```console
+$ vexscan --image debian:12 --all --format summary
+vexscan report (image) for debian:12
+scanned by: vexscan vX.Y.Z -- advisories from https://api.osv.dev/v1
+
+SUMMARY
+ECOSYSTEM       COMPONENTS  AFFECTED  RULED OUT
+os (Debian:12)  88          165       7
+
+affected by severity: 10 critical, 26 high, 38 unknown, 82 medium, 9 low
+```
+
+`VEXED` and `UNDETERMINED` columns appear only when a scan has any, and an
+ecosystem that found no inventory is left out — the same "earns its place" rule
+the findings table uses. The buckets are exactly the sections of `--format
+text`, counted rather than listed, so the two never disagree. The header and its
+`INCOMPLETE` caveats are shared with every other format, so a summary of a scan
+that could not read part of the target still says so rather than reading clean.
 
 ### The text report
 
@@ -2246,7 +2274,7 @@ Three properties are deliberate:
 | `--llm-model` | `gpt-4o` | Model id for `--llm-endpoint` |
 | `--llm-command` | | Run this installed CLI instead of an endpoint, e.g. `'claude -p'` |
 | `--mine-advisories` | `false` | With `--llm`, mine advisory prose for symbols and module paths to check |
-| `--format` | `text` | `text`, `json`, `sarif`, `fixplan`, or `inventory` |
+| `--format` | `text` | `text`, `summary`, `json`, `sarif`, `fixplan`, or `inventory` |
 | `--details` | `false` | With `--format text`, print the full evidence block under each row instead of the table alone |
 | `--out` | *(stdout)* | Write output to a file |
 | `--gist` | `false` | Also upload the output to a public gist and print its URL (token needs `gist` scope) |
