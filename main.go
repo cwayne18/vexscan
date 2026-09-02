@@ -34,7 +34,8 @@ func main() {
 	var versionArg versionFlag
 	flag.Var(&versionArg, "version", "print version and exit (deprecated: =VERSION overrides a module version; use --module-version)")
 
-	var packages, ecosystems, roots, vexhubs, severities, rpms, preferVendors stringList
+	var packages, ecosystems, roots, vexhubs, severities, rpms, preferVendors, images stringList
+	flag.Var(&images, "image", "container image reference to inspect; repeatable")
 	flag.Var(&packages, "package", "package to check: a purl, an ecosystem:name shorthand (deb:openssl), or a bare name; repeatable")
 	flag.Var(&ecosystems, "ecosystem", "restrict to these ecosystems (golang, os, pypi, npm, maven, or a distro like debian); repeatable")
 	flag.Var(&roots, "roots", "extra entrypoints for the reachability closures when the image config declares none; repeatable")
@@ -43,7 +44,7 @@ func main() {
 	flag.Var(&severities, "severity", "only report these severities: "+
 		strings.Join(cvss.Labels, ", ")+"; comma-separated or repeatable (UNKNOWN must be named to be shown)")
 	var (
-		image      = flag.String("image", "", "container image reference to inspect")
+		imagesFrom = flag.String("images-from", "", "scan every image named in this list: a file with one reference per line, a URL, or '-' for stdin")
 		rootfs     = flag.String("rootfs", "", "filesystem tree on disk to inspect: an unpacked image, a mounted volume, a machine's own /")
 		repo       = flag.String("repo", "", "git source repo to analyze via govulncheck source mode, e.g. github.com/rancher/rancher")
 		sbom       = flag.String("sbom", "", "CycloneDX JSON bill of materials to scan: a path, or '-' for stdin (every finding is undetermined)")
@@ -114,12 +115,19 @@ func main() {
 	// needs no subject and no advisory lookup.
 	inventoryMode := *format == "inventory"
 
-	named := countNamed(*image, *rootfs, *repo, *sbom)
+	// --image and --images-from name the same kind of target -- one image, or a
+	// list of them -- so they combine and count as a single choice. Everything
+	// else stays mutually exclusive, because a run that mixed an image with a
+	// source repo would have two answers to every question the report asks.
+	named := countNamed(*rootfs, *repo, *sbom)
+	if len(images) > 0 || *imagesFrom != "" {
+		named++
+	}
 	if len(rpms) > 0 {
 		named++
 	}
 	if named != 1 {
-		fail("set exactly one of --image, --rootfs, --repo, --rpm or --sbom")
+		fail("set exactly one of --image, --images-from, --rootfs, --repo, --rpm or --sbom")
 	}
 	if *rpmDeep {
 		if len(rpms) == 0 {
@@ -179,7 +187,7 @@ func main() {
 	// A named --package/--module/--cves still narrows the scan, and --all with
 	// those is an error caught just below, so only fill it in when nothing else
 	// selects a subject.
-	if *image != "" && !*all && len(packages) == 0 && *module == "" && len(cves) == 0 {
+	if (len(images) > 0 || *imagesFrom != "") && !*all && len(packages) == 0 && *module == "" && len(cves) == 0 {
 		*all = true
 	}
 	// --llm's verdicts live in the per-finding evidence block, which only the
@@ -236,9 +244,38 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// The list is read here -- after the command line is checked, before
+	// anything is pulled -- so an unreadable list is an error reported in the
+	// first second of the run rather than one discovered between image three
+	// and image four.
+	if *imagesFrom != "" {
+		list, err := readImageList(ctx, *imagesFrom)
+		if err != nil {
+			fail("read --images-from: %v", err)
+		}
+		if len(list) == 0 {
+			fail("--images-from %s named no images", *imagesFrom)
+		}
+		images = append(images, list...)
+	}
+	// A reference given twice is scanned once. Two identical rows in a fleet
+	// table say nothing the first one did not, and the pull behind the second
+	// is minutes nobody asked for.
+	images = dedupe(images)
+
+	// Whether the report is a batch is decided by the flags, not by how many
+	// lines the list happened to have. A pipeline whose fleet.txt drops to one
+	// image should not silently change output shape underneath the thing that
+	// parses it.
+	batchMode := *imagesFrom != "" || len(images) > 1
+	var firstImage string
+	if len(images) > 0 {
+		firstImage = images[0]
+	}
+
 	if inventoryMode {
-		runInventory(ctx, analyze.Options{
-			Image:        *image,
+		invOpts := analyze.Options{
+			Image:        firstImage,
 			RootFS:       *rootfs,
 			Repo:         *repo,
 			RPM:          rpms,
@@ -247,12 +284,17 @@ func main() {
 			Arch:         *arch,
 			OSVEcosystem: *osvEco,
 			Logf:         logf,
-		}, *out, *noPager, logf)
+		}
+		if batchMode {
+			runInventoryBatch(ctx, invOpts, images, *out, *noPager, logf)
+			return
+		}
+		runInventory(ctx, invOpts, *out, *noPager, logf)
 		return
 	}
 
 	opts := analyze.Options{
-		Image:              *image,
+		Image:              firstImage,
 		RootFS:             *rootfs,
 		Repo:               *repo,
 		RPM:                rpms,
@@ -297,17 +339,39 @@ func main() {
 	// The command owns the clock; see analyze.Descriptor for why the package
 	// does not read one.
 	started := time.Now().UTC()
+
+	// Resolved here and not in the writers, because the escapes have to be in
+	// the string before emit decides where it goes -- and where it goes is half
+	// of what decides whether they belong in it.
+	pal := colors.palette(destination{file: *out != "", gist: *gistFlag, json: *format == "json" || *format == "sarif"})
+	ropts := renderOpts{details: *details, pal: pal}
+
+	if batchMode {
+		runBatch(ctx, batchRun{
+			opts:    opts,
+			images:  images,
+			format:  *format,
+			render:  ropts,
+			out:     *out,
+			noPager: *noPager,
+			gist:    *gistFlag,
+			gistPub: !*gistSecret,
+			vexOut:  *vexOut,
+			vexHubs: vexhubs,
+			vexAuth: *vexAuthor,
+			gate:    gate,
+			started: started,
+			logf:    logf,
+		})
+		return // runBatch owns the exit status
+	}
+
 	res, err := analyze.Run(ctx, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 	stampDescriptor(res, started, time.Since(started))
-
-	// Resolved here and not in the writers, because the escapes have to be in
-	// the string before emit decides where it goes -- and where it goes is half
-	// of what decides whether they belong in it.
-	pal := colors.palette(destination{file: *out != "", gist: *gistFlag, json: *format == "json" || *format == "sarif"})
 
 	var rendered string
 	switch *format {
@@ -330,13 +394,13 @@ func main() {
 	case "summary":
 		rendered = renderSummary(res, renderOpts{pal: pal})
 	default: // --format was validated up front; inventory returned earlier
-		rendered = renderText(res, renderOpts{details: *details, pal: pal})
+		rendered = renderText(res, ropts)
 	}
 
 	emit(rendered, *out, *noPager, logf)
 
 	if *gistFlag {
-		url, err := uploadGist(ctx, res, rendered, *format, !*gistSecret)
+		url, err := uploadGist(ctx, gistDescription(res), rendered, *format, !*gistSecret)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: gist upload failed: %v\n", err)
 			os.Exit(1)
@@ -641,7 +705,10 @@ func renderInventory(inv *analyze.InventoryResult) string {
 }
 
 // uploadGist pushes the rendered report to a GitHub gist and returns its URL.
-func uploadGist(ctx context.Context, res *analyze.Result, rendered, format string, public bool) (string, error) {
+//
+// The description is passed in rather than derived here, because a batch report
+// describes a fleet and has no single target to name.
+func uploadGist(ctx context.Context, desc, rendered, format string, public bool) (string, error) {
 	client, err := gist.NewClient("")
 	if err != nil {
 		return "", err
@@ -653,11 +720,31 @@ func uploadGist(ctx context.Context, res *analyze.Result, rendered, format strin
 	case "sarif":
 		filename = "vexscan-report.sarif"
 	}
+	return client.Create(ctx, filename, desc, rendered, public)
+}
+
+// gistDescription titles the gist of a single-target scan.
+func gistDescription(res *analyze.Result) string {
 	desc := fmt.Sprintf("vexscan %s report for %s", res.Mode, res.Target)
 	if res.Module != "" {
 		desc += fmt.Sprintf(" (module %s)", res.Module)
 	}
-	return client.Create(ctx, filename, desc, rendered, public)
+	return desc
+}
+
+// dedupe drops repeats while keeping the first occurrence's position, so a list
+// still renders in the order it was written.
+func dedupe(vals []string) []string {
+	seen := make(map[string]bool, len(vals))
+	out := make([]string, 0, len(vals))
+	for _, v := range vals {
+		if seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
 }
 
 func parseCVEs(flagVal, file string) []string {
@@ -699,7 +786,8 @@ const synopsis = `Usage:
   vexscan <target> <selection> [flags]
   vexscan --version
 
-Target (choose one):   --image REF | --rootfs DIR | --repo REPO | --rpm FILE | --sbom FILE
+Target (choose one):   --image REF... | --images-from LIST | --rootfs DIR |
+                       --repo REPO | --rpm FILE | --sbom FILE
 Selection:             --package SPEC... | --cves LIST | --all
 `
 
@@ -716,7 +804,7 @@ var flagGroups = []struct {
 	title string
 	names []string
 }{
-	{"Targets (choose exactly one)", []string{"image", "rootfs", "repo", "rpm", "sbom"}},
+	{"Targets (choose exactly one)", []string{"image", "images-from", "rootfs", "repo", "rpm", "sbom"}},
 	{"What to check", []string{"package", "cves", "cves-file", "all", "ecosystem", "severity", "module"}},
 	{"Source repo (--repo)", []string{"ref", "repo-path", "go-version"}},
 	{"Container image", []string{"os", "arch", "module-version"}},
@@ -758,6 +846,11 @@ Examples:
 
   # A one-screen count of what was found, per ecosystem (present vs ruled out)
   vexscan --image debian:12 --all --format summary
+
+  # A whole fleet in one run: one row per image, advisories fetched once
+  vexscan --images-from fleet.txt --format summary
+  kubectl get pods -A -o jsonpath='{..image}' | tr ' ' '\n' | \
+    vexscan --images-from - --format summary
 
   # A source repo, or an SBOM when there is no image to hand
   vexscan --repo github.com/rancher/rancher --package golang:golang.org/x/net
