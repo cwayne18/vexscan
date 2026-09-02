@@ -100,6 +100,24 @@ type sarifArtifact struct {
 
 // renderSARIF turns a scan result into a SARIF 2.1.0 document.
 func renderSARIF(res *analyze.Result) (string, error) {
+	return marshalSARIF([]sarifRun{sarifRunFor(res)})
+}
+
+// marshalSARIF wraps runs in a document. Split out from renderSARIF so a batch
+// scan can put one run per image in a single document -- which is what SARIF's
+// runs array is for, and what lets a code-scanning dashboard tell which image
+// an alert came from.
+func marshalSARIF(runs []sarifRun) (string, error) {
+	doc := sarifLog{Schema: sarifSchema, Version: sarifVersion, Runs: runs}
+	b, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("sarif: %w", err)
+	}
+	return string(b) + "\n", nil
+}
+
+// sarifRunFor maps one scan result to one SARIF run.
+func sarifRunFor(res *analyze.Result) sarifRun {
 	var version string
 	if res.Descriptor != nil {
 		version = res.Descriptor.Version
@@ -121,7 +139,7 @@ func renderSARIF(res *analyze.Result) (string, error) {
 		results = append(results, resultFor(f, id, idx))
 	}
 
-	run := sarifRun{
+	return sarifRun{
 		Tool: sarifTool{Driver: sarifDriver{
 			Name:           "vexscan",
 			Version:        version,
@@ -131,13 +149,6 @@ func renderSARIF(res *analyze.Result) (string, error) {
 		Results: results,
 		Props:   runProperties(res),
 	}
-	doc := sarifLog{Schema: sarifSchema, Version: sarifVersion, Runs: []sarifRun{run}}
-
-	b, err := json.MarshalIndent(doc, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("sarif: %w", err)
-	}
-	return string(b) + "\n", nil
 }
 
 // ruleID is the advisory id a finding is reported under. It matches the id the
