@@ -128,6 +128,16 @@ func mainModulePath(bin binscan.Binary) string {
 	return bin.Info.Main.Path
 }
 
+// mainModuleRawVersion is the version build info stamped on a binary's own main
+// module, before any recovery -- "" for a binary with no build info, and quite
+// possibly "(devel)", which is what mainModuleVersion is for.
+func mainModuleRawVersion(bin binscan.Binary) string {
+	if bin.Info == nil {
+		return ""
+	}
+	return bin.Info.Main.Version
+}
+
 // buildSettings is a binary's recorded build settings, or nil when it carries
 // no build info at all.
 func buildSettings(bin binscan.Binary) []debug.BuildSetting {
@@ -153,6 +163,17 @@ type state struct {
 	// it as evidence to every finding so a reader can never mistake a recovered
 	// version for one the build info stated outright.
 	inferred inference
+
+	// uncomparable, when set, records that this component's Version is one OSV
+	// cannot range-match and no recovery could replace -- and holds the account
+	// of that. The analysis phase demotes the component's affected verdicts to
+	// undetermined, because a presence test that found the code proves nothing
+	// on its own when nothing can say whether the code found is already the
+	// fixed code. See uncomparableVersion.
+	//
+	// Never set together with inferred: a version that was recovered is
+	// comparable by construction, and one that was not is what this records.
+	uncomparable string
 }
 
 // inference is a main-module version that build info did not supply, and the
@@ -232,6 +253,32 @@ func (p *Plugin) mainModuleVersion(modulePath, rawVersion string, settings []deb
 		origin: "image-tag-version",
 		detail: fmt.Sprintf("version not in build info (reported %s); inferred from image tag %q -- %s", reported, tag, why),
 	}
+}
+
+// depVersion resolves the version to report for one of a binary's *dependency*
+// modules, given the resolved version of the binary's own main module.
+//
+// The comment mainModuleVersion grew up next to says dependencies carry real
+// versions. Nearly all of them do, and the ones that do not are the reason this
+// exists: a module the main module vendors out of its own tree through a
+// directory replace is stamped "(devel)" exactly like a main module built from
+// a checkout, with none of the recoveries pointed at it. See stagingversion.go
+// for what that costs on a Kubernetes image.
+//
+// Exactly one of the two accounts comes back set, and they are opposites.
+// `from` means a comparable version was recovered and says where it came from.
+// `uncomparable` means none could be, and says what that leaves unanswered --
+// which the caller must not treat as a version, only as a key to look the
+// module up under, since dropping the component entirely would turn a module
+// nothing could decide into a module with nothing against it.
+func (p *Plugin) depVersion(mainPath, mainVersion, depPath, depVersion string) (version string, from inference, uncomparable string) {
+	if !isDevelVersion(depVersion) {
+		return depVersion, inference{}, ""
+	}
+	if v, from := stagingModuleVersion(mainPath, mainVersion, depPath, depVersion); v != "" {
+		return v, from, ""
+	}
+	return depVersion, inference{}, uncomparableDetail(depPath, depVersion)
 }
 
 // DetectImage implements ecosystem.ImageAnalyzer.
@@ -340,18 +387,22 @@ func (p *Plugin) groupAll(root string, bins []binscan.Binary) []ecosystem.Compon
 		// enumeration that left it out would miss the CVEs most likely to
 		// apply to all of them at once.
 		g.add(StdlibModule, binscan.NormalizeGoVersion(bin.Info.GoVersion), rel, bin.Path, main)
+
+		// The main module is resolved first because its version is what the
+		// dependency loop below measures a vendored staging module against.
+		var mainVer string
 		if m := bin.Info.Main; m.Path != "" {
 			// The main module's build-info version can be "(devel)" for a
 			// binary built from a checkout, which OSV cannot match; recover a
 			// comparable version from the binary's linker flags or the image
-			// tag when it is safe to. Only the main module is treated this way
-			// -- dependencies carry real versions -- and the provenance is kept
-			// so the recovery is visible.
+			// tag when it is safe to, and keep the provenance so the recovery
+			// is visible.
 			ver, from := p.mainModuleVersion(m.Path, m.Version, bin.Info.Settings)
 			if ver != "" {
 				g.add(m.Path, ver, rel, bin.Path, main)
 				g.markInferred(m.Path, ver, from)
 			}
+			mainVer = ver
 		}
 		for _, dep := range bin.Info.Deps {
 			m := dep
@@ -361,7 +412,13 @@ func (p *Plugin) groupAll(root string, bins []binscan.Binary) []ecosystem.Compon
 			if m.Path == "" || m.Version == "" {
 				continue
 			}
-			g.add(m.Path, m.Version, rel, bin.Path, main)
+			// Nearly every dependency states a real version and comes through
+			// depVersion untouched. The exception is a module the main module
+			// vendors out of its own tree, which is stamped "(devel)".
+			ver, from, why := p.depVersion(main, mainVer, m.Path, m.Version)
+			g.add(m.Path, ver, rel, bin.Path, main)
+			g.markInferred(m.Path, ver, from)
+			g.markUncomparable(m.Path, ver, why)
 		}
 	}
 	return g.components()
@@ -372,24 +429,32 @@ func (p *Plugin) group(root string, bins []binscan.Binary, modules []string) []e
 	g := newGrouper()
 	for _, bin := range bins {
 		rel := target.Rel(root, bin.Path)
+		main := mainModulePath(bin)
 		for _, module := range modules {
 			version := p.VersionOverride
 			var from inference
+			var why string
 			if version == "" {
 				version = bin.ModuleVersion(module)
-				// The requested module can be this binary's own main module,
-				// which has the same "(devel)" defect groupAll works around;
-				// give it the same recoveries so a targeted scan is not stuck
-				// with a version OSV cannot match.
-				if mainModulePath(bin) == module {
+				// The requested module can be this binary's own main module or
+				// one it vendors from its own tree, both of which have the
+				// "(devel)" defect groupAll works around; give a targeted scan
+				// the same recoveries rather than leaving it stuck with a
+				// version OSV cannot match.
+				switch {
+				case main == module:
 					version, from = p.mainModuleVersion(module, version, buildSettings(bin))
+				case version != "":
+					mainVer, _ := p.mainModuleVersion(main, mainModuleRawVersion(bin), buildSettings(bin))
+					version, from, why = p.depVersion(main, mainVer, module, version)
 				}
 			}
 			if version == "" {
 				continue // module not linked into this binary
 			}
-			g.add(module, version, rel, bin.Path, mainModulePath(bin))
+			g.add(module, version, rel, bin.Path, main)
 			g.markInferred(module, version, from)
+			g.markUncomparable(module, version, why)
 		}
 	}
 	return g.components()
@@ -456,6 +521,20 @@ func (g *grouper) markInferred(module, version string, from inference) {
 	}
 	if c, ok := g.byKey[module+"@"+version]; ok {
 		c.Extra.(*state).inferred = from
+	}
+}
+
+// markUncomparable records on an already-added component that its version is
+// one OSV cannot range-match and nothing could recover. The empty account is a
+// no-op for the same reason the zero inference is: the component is keyed by
+// module@version, so every binary that reached it reached it with the same
+// version and either all of them could not compare it or none of them could.
+func (g *grouper) markUncomparable(module, version, why string) {
+	if why == "" {
+		return
+	}
+	if c, ok := g.byKey[module+"@"+version]; ok {
+		c.Extra.(*state).uncomparable = why
 	}
 }
 
@@ -574,6 +653,9 @@ func (p *Plugin) AnalyzeImage(ctx context.Context, img *target.Image, items []ec
 						Origin: st.inferred.origin,
 						Detail: st.inferred.detail,
 					})
+				}
+				if st.uncomparable != "" {
+					f = uncomparableVersion(f, st.uncomparable)
 				}
 				out = append(out, f)
 			}

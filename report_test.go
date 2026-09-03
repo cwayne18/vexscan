@@ -2056,3 +2056,45 @@ func TestReportDoesNotDoubleReportAnUnreadableDistroFeed(t *testing.T) {
 		t.Errorf("an unreadable feed also drew the matched-nothing note:\n%s", out)
 	}
 }
+
+// A report full of undetermined rows with no explanation reads as the tool
+// having got vaguer. The caveat is what says the opposite: it stopped claiming
+// something it could not support, and names the modules so the claim is
+// checkable against `go version -m`.
+func TestTheUncomparableCaveatNamesTheModules(t *testing.T) {
+	demoted := func(cve, module string) analyze.Finding {
+		return analyze.Finding{
+			Ecosystem: "golang", CVE: cve, ID: cve,
+			Module: module, Version: "(devel)",
+			Status: analyze.StatusUndetermined,
+			Reason: ecosystem.ReasonUncomparableVersion,
+			Evidence: []ecosystem.Evidence{{
+				Origin: ecosystem.OriginUncomparableVersion,
+				Detail: "build info reports (devel) for " + module,
+			}},
+		}
+	}
+	out := report(t, false,
+		demoted("GO-2022-0965", "k8s.io/apimachinery"),
+		demoted("GO-2024-2748", "k8s.io/apimachinery"),
+		demoted("GO-2023-1111", "k8s.io/client-go"))
+
+	if !strings.Contains(out, "3 finding(s) are undetermined") {
+		t.Errorf("the caveat does not count the rows it explains:\n%s", out)
+	}
+	if !strings.Contains(out, "not one OSV can range-match") {
+		t.Errorf("the caveat does not say why:\n%s", out)
+	}
+	// Deduped: two advisories against one module are one module.
+	if !strings.Contains(out, "Affected module(s): k8s.io/apimachinery, k8s.io/client-go") {
+		t.Errorf("the caveat does not name the modules once each:\n%s", out)
+	}
+}
+
+// The absence of the reason is the whole signal; a report that could compare
+// every version must not warn that it could not.
+func TestTheUncomparableCaveatIsAbsentWhenVersionsCompare(t *testing.T) {
+	if out := report(t, false, gccTrio...); strings.Contains(out, "are undetermined because their module") {
+		t.Errorf("a report with comparable versions carried the uncomparable caveat:\n%s", out)
+	}
+}

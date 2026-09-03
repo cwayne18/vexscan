@@ -70,6 +70,20 @@ const (
 	// ReasonUnprovenClean is the reason on a finding the guard demoted to
 	// undetermined because nothing deterministic underwrote its clean verdict.
 	ReasonUnprovenClean = "clean_status_without_manifest_grade_evidence"
+
+	// OriginUncomparableVersion marks a finding whose component carries a
+	// version OSV could not range-match, and ReasonUncomparableVersion is the
+	// reason it was demoted to undetermined for it.
+	//
+	// Here rather than in the golang plugin for the same reason as the two
+	// above: the plugin writes them and the report counts them. The count
+	// matters more here than anywhere else, because the demotion is the whole
+	// of what a reader sees. A Kubernetes image turns dozens of confident
+	// AFFECTED rows into dozens of undetermined ones, and without a caveat
+	// sized off this origin that reads as the tool having got vaguer rather
+	// than as it having stopped claiming something it could not support.
+	OriginUncomparableVersion = "uncomparable-version"
+	ReasonUncomparableVersion = "version_not_range_matchable"
 )
 
 // SBOMFinding is the verdict for a component that a bill of materials named.
