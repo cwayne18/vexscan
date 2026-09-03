@@ -228,6 +228,7 @@ func writeCaveats(dst *strings.Builder, res *analyze.Result, pal palette) {
 	writeOfflineCaveat(b, res)
 	writeMetadataCaveat(b, res)
 	writeGovulncheckCaveat(b, res)
+	writeUncomparableCaveat(b, res)
 	writeTriageCaveats(b, res)
 }
 
@@ -283,6 +284,59 @@ func writeGovulncheckCaveat(b *strings.Builder, res *analyze.Result) {
 	b.WriteString("      tested for reachability. Install govulncheck and re-run to let any whose\n")
 	b.WriteString("      vulnerable code is unreachable be ruled not_in_execute_path:\n")
 	b.WriteString("      go install golang.org/x/vuln/cmd/govulncheck@latest\n")
+}
+
+// writeUncomparableCaveat explains the rows that are undetermined because their
+// component's version could not be compared against the advisory's ranges.
+//
+// A NOTE and not an INCOMPLETE banner: nothing failed to be read, and every
+// status is sound. What is missing is upstream of this tool -- the build did
+// not stamp a version OSV can range-match on a module it vendored out of its
+// own tree, so OSV answered with that module's entire advisory history and the
+// only honest thing to do with the answer is decline to conclude from it.
+//
+// It has to be said out loud because the demotion is invisible otherwise. On a
+// Kubernetes image this is dozens of rows that a version-matching scanner
+// reports as confident HIGHs, and a reader who does not know why they are
+// undetermined here cannot tell whether this tool is being careful or is simply
+// worse at the job. Naming the modules is what makes the claim checkable: each
+// one is a `go version -m` away from the "(devel)" this describes.
+func writeUncomparableCaveat(b *strings.Builder, res *analyze.Result) {
+	n := 0
+	seen := map[string]bool{}
+	var modules []string
+	for _, f := range res.Findings {
+		if f.Reason != ecosystem.ReasonUncomparableVersion {
+			continue
+		}
+		n++
+		name := f.Module
+		if name == "" {
+			name = f.Package
+		}
+		if name != "" && !seen[name] {
+			seen[name] = true
+			modules = append(modules, name)
+		}
+	}
+	if n == 0 {
+		return
+	}
+	fmt.Fprintf(b, "NOTE: %d finding(s) are undetermined because their module's build-info version\n", n)
+	b.WriteString("      is not one OSV can range-match, so every advisory ever filed against the\n")
+	b.WriteString("      module came back and none of them could be placed against this build.\n")
+	// Capped, with the remainder counted rather than dropped, for the same
+	// reason listCVEs counts its own: a list that stopped silently would read
+	// as the whole list, and the number of modules affected is part of how bad
+	// this is.
+	const maxModules = 8
+	if len(modules) > maxModules {
+		modules = append(modules[:maxModules:maxModules],
+			fmt.Sprintf("(+%d more)", len(modules)-maxModules))
+	}
+	fmt.Fprintf(b, "      Affected module(s): %s\n", strings.Join(modules, ", "))
+	b.WriteString("      These are neither confirmed nor cleared. To decide them, check the\n")
+	b.WriteString("      module's real version in the source the image was built from.\n")
 }
 
 // writeCorrectionsCaveat names the advisories the database matched and this

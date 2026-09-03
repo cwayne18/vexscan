@@ -1135,8 +1135,8 @@ module, including the ones fixed long before the build. This is by far the
 largest source of Go false positives, because it lands on the one module whose
 code is unquestionably present.
 
-vexscan tries two recoveries, strongest first, and only for the main module —
-dependencies always carry real versions in build info.
+vexscan tries two recoveries for the main module, strongest first, and a third
+for the one shape of *dependency* that has the same defect.
 
 **1. The binary's own linker flags.** A project that versions itself with
 `-ldflags "-X .../version.Version=v1.36.2+k3s1"` never gets that into
@@ -1170,15 +1170,54 @@ after the module (`prom/prometheus`, `rancher/hardened-kubernetes`). Nothing
 connects `python:3.12.1` to a Go binary that happens to live inside it, so no
 version is inferred there.
 
-**When neither applies, `(devel)` is sent to OSV unchanged and the module
-over-reports.** That is deliberate. A version that reads too *high* ranges past
-a real advisory and marks a vulnerable binary clean, which is the one direction
-this tool must never go silently, so every gate above fails closed.
+**3. The main module's own release, for a vendored staging module.** A monorepo
+that publishes some of its own subdirectories as separate modules wires them up
+with a directory replace — `replace k8s.io/apimachinery =>
+./staging/src/k8s.io/apimachinery` — and there is no tag on a directory, so the
+*dependency* is stamped `(devel)` too. On
+`rancher/hardened-kubernetes:v1.36.4-rke2r1-build20260821`, `go version -m
+/usr/local/bin/kubectl` reports a real `k8s.io/kubernetes v1.36.4+dirty` and
+nine staging modules at `(devel)`:
+
+```
+mod  k8s.io/kubernetes    v1.36.4+dirty
+dep  k8s.io/api           (devel)
+dep  k8s.io/apimachinery  (devel)
+dep  k8s.io/client-go     (devel)
+... six more
+```
+
+Kubernetes' convention here is exact and published: the staging module cut
+alongside `k8s.io/kubernetes vX.Y.Z` is released as `v0.Y.Z`. So `v1.36.4`
+gives `k8s.io/apimachinery v0.36.4`, a real tag on the module proxy and a
+version OSV ranges against cleanly. This is fenced to `k8s.io/kubernetes` at
+major 1 with a `k8s.io/*` dependency that is itself uncomparable — which is
+precisely the staging set, since `k8s.io/klog`, `k8s.io/utils` and
+`k8s.io/kube-openapi` live in their own repositories and so state real versions
+already.
+
+Without it, `GO-2022-0965` — unbounded recursion in JSON parsing, **fixed in
+September 2019** — comes back HIGH against a 2026 build of Kubernetes, once per
+binary, alongside every other advisory ever filed against those nine modules.
+
+**When no recovery applies, the module is not silently believed either.** A
+version that reads too *high* ranges past a real advisory and marks a vulnerable
+binary clean, which is the one direction this tool must never go, so every gate
+above fails closed. The component is kept under its uncomparable version —
+dropping it would leave a module nothing could decide looking like a module
+with nothing filed against it — and its **affected verdicts are demoted to
+`undetermined`** with reason `version_not_range_matchable`. The report counts
+them in a `NOTE` and names the modules.
+
+Only the affected verdicts move. A `not_present` finding was decided by reading
+the binary's symbol table: the vulnerable package is not linked, which is true
+at every version, so an uncomparable version takes nothing away from it.
 
 **Every recovered version is on the finding.** Findings decided against one
 carry an evidence entry naming both the version and where it came from —
-`ldflags-version` with the exact `-X` key, or `image-tag-version` with the tag
-and why the tag was believed — so no reader has to take a version build info
+`ldflags-version` with the exact `-X` key, `image-tag-version` with the tag and
+why the tag was believed, or `staging-module-version` with the main-module
+release it was derived from — so no reader has to take a version build info
 never stated on trust.
 
 On the k3s binary above, the two mechanisms compose: the ldflags stamp turns
