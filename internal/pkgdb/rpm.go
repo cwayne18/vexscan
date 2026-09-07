@@ -63,7 +63,7 @@ func (r *RPM) Read(fsys target.RootFS) ([]Package, error) {
 	}
 	defer handle.Close()
 
-	infos, err := handle.ListPackages()
+	infos, err := listPackages(handle)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", db, err)
 	}
@@ -88,7 +88,7 @@ func (r *RPM) Read(fsys target.RootFS) ([]Package, error) {
 		// A package with no file list is normal (metapackages own nothing),
 		// but a header that fails to decode is not, and silently dropping its
 		// files would make the package look like docs-only.
-		files, err := info.InstalledFileNames()
+		files, err := installedFileNames(info)
 		if err != nil {
 			return nil, fmt.Errorf("%s: file list for %s: %w", db, info.Name, err)
 		}
@@ -105,3 +105,31 @@ func (r *RPM) Read(fsys target.RootFS) ([]Package, error) {
 // rpmEVR, SourceRPMName and normalizePaths live in rpmfile.go, which carries no
 // build tag: the file reader needs them too, and it has to keep working in the
 // norpm build that omits everything above.
+
+// listPackages wraps go-rpmdb's ListPackages so a parser panic becomes an
+// error. go-rpmdb v0.1.1 slices a header region as peList[1:ril] at
+// entry.go:170 without checking ril >= 1, so a header whose region index length
+// is zero -- as occurs in some rpm databases in the wild -- panics with "slice
+// bounds out of range [1:0]" rather than returning an error. A database we
+// cannot parse is a scan failure, not a crash of the whole run.
+func listPackages(handle *rpmdb.RpmDB) (infos []*rpmdb.PackageInfo, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			infos = nil
+			err = fmt.Errorf("go-rpmdb panicked parsing the database: %v", r)
+		}
+	}()
+	return handle.ListPackages()
+}
+
+// installedFileNames wraps InstalledFileNames for the same reason: it decodes
+// the package's header on demand and can panic on the same malformed input.
+func installedFileNames(info *rpmdb.PackageInfo) (names []string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			names = nil
+			err = fmt.Errorf("go-rpmdb panicked reading the file list: %v", r)
+		}
+	}()
+	return info.InstalledFileNames()
+}
