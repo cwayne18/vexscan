@@ -7,45 +7,64 @@ import (
 	"strings"
 )
 
-// docFileName is the file every product's document is stored under, per the VEX
-// Repository layout internal/vex documents.
-const docFileName = "scan.openvex.json"
+// productParts splits a product purl into the two pieces the hub layout is
+// built from: the purl type, and the name filed under it.
+//
+//	pkg:golang/github.com/Altinity/clickhouse-backup/v2
+//	  -> golang, github.com/Altinity/clickhouse-backup/v2
+//	pkg:oci/hardened-kubernetes?repository_url=index.docker.io/rancher/hardened-kubernetes
+//	  -> oci, index.docker.io/rancher/hardened-kubernetes
+//
+// The two product types vexscan ever produces are golang (a Go main module, via
+// vex.GoProduct) and oci (a scanned image, via vex.ImageProduct); anything else
+// is a caller error rather than a case to guess a path for. The oci name is the
+// repository_url qualifier, decoded, not the bare purl name -- that is how the
+// hub's own index writes it.
+//
+// It is separate from productLocation because two things are derived from it:
+// where a document goes, and -- for CSAF -- the tracking id it is published
+// under. Both have to agree about what a product is called, and deriving them
+// from one split is how they stay agreeing.
+func productParts(purl string) (typ, name string, err error) {
+	t, body, ok := splitPurl(purl)
+	if !ok {
+		return "", "", fmt.Errorf("vexpr: %q: not a package URL", purl)
+	}
+	switch t {
+	case "golang":
+		n, _ := splitQualifiers(body)
+		n = strings.Trim(n, "/")
+		if n == "" {
+			return "", "", fmt.Errorf("vexpr: %q: no module path", purl)
+		}
+		return t, n, nil
+	case "oci":
+		repo := repositoryURL(body)
+		if repo == "" {
+			return "", "", fmt.Errorf("vexpr: %q: no repository_url qualifier", purl)
+		}
+		return t, repo, nil
+	default:
+		return "", "", fmt.Errorf("vexpr: %q: unsupported product type %q", purl, t)
+	}
+}
 
 // productLocation is the path inside the hub a product's document lives at,
 // relative to the repository root.
 //
 //	pkg:golang/github.com/Altinity/clickhouse-backup/v2
-//	  -> pkg/golang/github.com/Altinity/clickhouse-backup/v2/scan.openvex.json
+//	  -> pkg/golang/github.com/Altinity/clickhouse-backup/v2/<fileName>
 //	pkg:oci/hardened-kubernetes?repository_url=index.docker.io/rancher/hardened-kubernetes
-//	  -> pkg/oci/index.docker.io/rancher/hardened-kubernetes/scan.openvex.json
+//	  -> pkg/oci/index.docker.io/rancher/hardened-kubernetes/<fileName>
 //
-// The two product types vexscan ever produces are golang (a Go main module, via
-// vex.GoProduct) and oci (a scanned image, via vex.ImageProduct); anything else
-// is a caller error rather than a case to guess a path for. The oci path is the
-// repository_url qualifier, decoded, not the bare purl name -- that is how the
-// hub's own index writes it.
-func productLocation(purl string) (string, error) {
-	typ, body, ok := splitPurl(purl)
-	if !ok {
-		return "", fmt.Errorf("vexpr: %q: not a package URL", purl)
+// fileName is the chosen format's document name, so the two serialisations sit
+// side by side in a directory rather than fighting over one path.
+func productLocation(purl, fileName string) (string, error) {
+	typ, name, err := productParts(purl)
+	if err != nil {
+		return "", err
 	}
-	switch typ {
-	case "golang":
-		name, _ := splitQualifiers(body)
-		name = strings.Trim(name, "/")
-		if name == "" {
-			return "", fmt.Errorf("vexpr: %q: no module path", purl)
-		}
-		return hubPath("golang", name, purl)
-	case "oci":
-		repo := repositoryURL(body)
-		if repo == "" {
-			return "", fmt.Errorf("vexpr: %q: no repository_url qualifier", purl)
-		}
-		return hubPath("oci", repo, purl)
-	default:
-		return "", fmt.Errorf("vexpr: %q: unsupported product type %q", purl, typ)
-	}
+	return hubPath(typ, name, purl, fileName)
 }
 
 // hubRoot is the directory inside the hub every product document lives under.
@@ -62,11 +81,11 @@ const hubRoot = "pkg"
 // their way to becoming a file path in somebody else's repository. path.Join
 // resolves "../.." rather than objecting to it, so a name that climbs out is
 // refused before the join instead of silently cleaned into an escape.
-func hubPath(typ, name, purl string) (string, error) {
+func hubPath(typ, name, purl, fileName string) (string, error) {
 	if err := checkProductName(name, purl); err != nil {
 		return "", err
 	}
-	loc := path.Join(hubRoot, typ, name) + "/" + docFileName
+	loc := path.Join(hubRoot, typ, name) + "/" + fileName
 	// Belt to checkProductName's braces. Whatever the name turned out to be,
 	// the result has to land under pkg/ -- if it does not, the checks above
 	// have a hole, and the consequence worth preventing is the write, not the

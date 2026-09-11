@@ -2,7 +2,7 @@
 #
 # vexhub-pr.sh -- contribute the findings a vexscan run ruled out to a VEX hub.
 #
-# vexscan writes the OpenVEX documents; this does the git and gh steps around
+# vexscan writes the VEX documents; this does the git and gh steps around
 # them. The split is deliberate: gh already knows about forks, commit signing,
 # branch protection, 2FA and org policy, and it is the tool whose behaviour you
 # can predict. The one thing this script will not do is skip the review -- it
@@ -20,7 +20,18 @@
 #
 # Options:
 #   --hub OWNER/REPO   the hub to contribute to (required)
-#   --author NAME      the OpenVEX author to record (required)
+#   --author NAME      the VEX author to record (required)
+#   --format FORMAT    the serialisation to write: openvex (default) or csaf.
+#                      Match what the hub already publishes -- a hub's index
+#                      points each product at one document, so vexscan will
+#                      decline to write the other format over it
+#   --publisher-namespace URI
+#                      with --format csaf, the URI identifying the publisher,
+#                      e.g. 'https://acme.example' (required for csaf)
+#   --publisher-category CATEGORY
+#                      with --format csaf, the CSAF publisher category:
+#                      coordinator, discoverer, other, translator, user, vendor
+#                      (default other)
 #   --fork OWNER/REPO  push the branch to this fork instead of to the hub. Only
 #                      needed to name a specific one: without it the branch goes
 #                      to the hub when you can push there, and to a fork of your
@@ -39,19 +50,30 @@ note() { printf 'vexhub-pr: %s\n' "$*" >&2; }
 
 hub=""
 author=""
+format="openvex"
+pub_ns=""
+pub_cat=""
 fork=""
 workdir=""
 assume_yes=0
+
+# The help text is the comment block at the top of this file, printed up to the
+# first line that is not a comment. Reading it rather than a line range means
+# adding an option here cannot silently truncate it.
+usage() { awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"; }
 
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--hub)     hub="${2:-}"; shift 2 ;;
 		--author)  author="${2:-}"; shift 2 ;;
+		--format)  format="${2:-}"; shift 2 ;;
+		--publisher-namespace) pub_ns="${2:-}"; shift 2 ;;
+		--publisher-category)  pub_cat="${2:-}"; shift 2 ;;
 		--fork)    fork="${2:-}"; shift 2 ;;
 		--workdir) workdir="${2:-}"; shift 2 ;;
 		--yes)     assume_yes=1; shift ;;
 		--)        shift; break ;;
-		-h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+		-h|--help) usage; exit 0 ;;
 		*)         die "unknown option $1 (scan flags go after --)" ;;
 	esac
 done
@@ -105,22 +127,52 @@ fi
 
 [ -f "$clone/index.json" ] || die "$hub has no index.json; is it a VEX hub?"
 
-# Merge against the clone and write back into it, so the result is a git diff.
-note "scanning"
-vexscan "$@" \
-	--vexhub "$clone" \
-	--vex-out "$clone" \
-	--vex-author "$author"
+# The publisher flags are passed through only when given, and none of these
+# combinations are checked here: vexscan validates them before it pulls
+# anything, and duplicating its rules would be a second place to keep in step
+# with them.
+scan_flags=(--vexhub "$clone" --vex-out "$clone" --vex-author "$author" --vex-format "$format")
+if [ -n "$pub_ns" ]; then
+	scan_flags+=(--vex-publisher-namespace "$pub_ns")
+fi
+if [ -n "$pub_cat" ]; then
+	scan_flags+=(--vex-publisher-category "$pub_cat")
+fi
 
-if git -C "$clone" diff --quiet; then
+# Merge against the clone and write back into it, so the result is a git diff.
+#
+# The scan is teed to a log because an empty diff has two meanings and only
+# vexscan knows which one happened -- see below.
+note "scanning"
+scan_log="$workdir/scan.log"
+vexscan "$@" "${scan_flags[@]}" 2>&1 | tee "$scan_log"
+
+# Stage first, and diff what is staged.
+#
+# A product the hub has never carried before arrives as an untracked file, which
+# a plain `git diff` does not show. Committing it anyway would put a document in
+# the pull request that nobody saw during the review this script exists to
+# insist on.
+git -C "$clone" add -A
+
+if git -C "$clone" diff --cached --quiet; then
+	# An empty diff is usually the good outcome: the hub already says everything
+	# this scan would have said. But it is also what a declined document looks
+	# like -- a product filed under the other serialisation, or an advisory
+	# published by somebody else -- and that is a failure, because the scan's
+	# conclusions about those products went nowhere. vexscan names each one, so
+	# stop rather than report success over the top of it.
+	if grep -q 'left untouched' "$scan_log"; then
+		die "nothing to contribute: vexscan left every document it had statements for untouched (see above)"
+	fi
 	note "no changes; the hub already covers everything this scan ruled out"
 	exit 0
 fi
 
 printf '\n'
-git -C "$clone" --no-pager diff --stat
+git -C "$clone" --no-pager diff --cached --stat
 printf '\n'
-git -C "$clone" --no-pager diff
+git -C "$clone" --no-pager diff --cached
 printf '\n'
 
 if [ "$assume_yes" -ne 1 ]; then
@@ -133,7 +185,15 @@ if [ "$assume_yes" -ne 1 ]; then
 fi
 
 branch="vexscan/ruled-out-$(date -u +%Y%m%d%H%M%S)"
-files="$(git -C "$clone" diff --name-only | sed 's/^/- /')"
+files="$(git -C "$clone" diff --cached --name-only | sed 's/^/- /')"
+
+# Both serialisations record the same verdict; they spell the reason for it in
+# different fields, so the review note points at the one a reader will find.
+case "$format" in
+	csaf) doc_kind="CSAF 2.0 VEX"; reason_field="\`flags[].label\`" ;;
+	*)    doc_kind="OpenVEX";      reason_field="\`justification\`" ;;
+esac
+
 subject="Add vexscan not_affected statements"
 body="$(cat <<EOF
 Automated by [vexscan](https://github.com/cwayne18/vexscan) ($(vexscan --version)).
@@ -141,9 +201,9 @@ Automated by [vexscan](https://github.com/cwayne18/vexscan) ($(vexscan --version
 Scan: \`vexscan $*\`
 
 These \`not_affected\` statements record findings vexscan ruled out because the
-vulnerable code is not present or cannot be reached. Each carries the OpenVEX
-justification behind the verdict and a sentence saying how the verdict was
-reached; review before merging.
+vulnerable code is not present or cannot be reached. They are written as
+$doc_kind documents; each carries the $reason_field behind the verdict and a
+sentence saying how the verdict was reached. Review before merging.
 
 Files changed:
 $files
@@ -151,7 +211,6 @@ EOF
 )"
 
 git -C "$clone" checkout -q -b "$branch"
-git -C "$clone" add -A
 git -C "$clone" commit -q -m "$subject" -m "$body"
 
 # The branch has to exist on GitHub before a pull request can name it. This is

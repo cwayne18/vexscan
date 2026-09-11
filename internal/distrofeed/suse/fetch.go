@@ -2,7 +2,6 @@ package suse
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,62 +9,16 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/cwayne18/vexscan/internal/csaf"
 	"github.com/cwayne18/vexscan/internal/distrofeed"
 	"github.com/cwayne18/vexscan/internal/rpmver"
 )
 
-// csafDocument is the slice of a CSAF-VEX document this provider reads.
-type csafDocument struct {
-	ProductTree     csafProductTree     `json:"product_tree"`
-	Vulnerabilities []csafVulnerability `json:"vulnerabilities"`
-}
-
-type csafProductTree struct {
-	Branches []csafBranch `json:"branches"`
-}
-
-// csafBranch is a node in the product tree. A node either names a product (with
-// a CPE helper this provider joins on) or nests further branches.
-type csafBranch struct {
-	Category string       `json:"category"`
-	Name     string       `json:"name"`
-	Product  *csafProduct `json:"product"`
-	Branches []csafBranch `json:"branches"`
-}
-
-type csafProduct struct {
-	ProductID string `json:"product_id"`
-	Helper    struct {
-		CPE string `json:"cpe"`
-	} `json:"product_identification_helper"`
-}
-
-type csafVulnerability struct {
-	CVE           string            `json:"cve"`
-	ProductStatus csafProductStatus `json:"product_status"`
-	// Scores is SUSE's own CVSS rating(s) for the CVE. A VEX document carries
-	// product status; a SUSE one also carries the score, which --prefer-vendor
-	// reads to favour SUSE's rating over the OSV-derived one.
-	Scores []csafScore `json:"scores"`
-}
-
-// csafScore is one CVSS entry in a vulnerability's scores array. Only the v3
-// vector is read: internal/cvss scores v3.0/v3.1 and nothing else, matching how
-// every other advisory in this tool is rated.
-type csafScore struct {
-	CVSSV3 struct {
-		BaseScore    float64 `json:"baseScore"`
-		VectorString string  `json:"vectorString"`
-	} `json:"cvss_v3"`
-}
-
-// csafProductStatus is the per-product verdict lists. Each entry is a composite
-// "<product>:<package-ref>" product id.
-type csafProductStatus struct {
-	KnownAffected    []string `json:"known_affected"`
-	KnownNotAffected []string `json:"known_not_affected"`
-	Recommended      []string `json:"recommended"`
-}
+// The document shape lives in internal/csaf, which is the same decoder
+// internal/vex reads hub documents with. What is SUSE-specific is not the format
+// but the join: this provider matches on the CPE in a product's identification
+// helper and on the composite "<product>:<package-ref>" product ids in the
+// status lists, neither of which means anything to a reader joining on purls.
 
 // fetchAll fetches and parses the document for each CVE, bounded to maxParallel
 // concurrent requests. It returns every advisory it could read keyed by
@@ -171,15 +124,8 @@ func (p *Provider) store(key string, adv *advisory) {
 // requiring a single well-formed JSON object and nothing after it so a truncated
 // or trailing-garbage response is rejected rather than half-trusted.
 func parseDocument(r io.Reader, url string) (*advisory, error) {
-	dec := json.NewDecoder(r)
-	var doc csafDocument
-	if err := dec.Decode(&doc); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", url, err)
-	}
-	if _, err := dec.Token(); err != io.EOF {
-		if err == nil {
-			return nil, fmt.Errorf("parse %s: unexpected trailing data", url)
-		}
+	doc, err := csaf.Decode(r)
+	if err != nil {
 		return nil, fmt.Errorf("parse %s: %w", url, err)
 	}
 
@@ -208,7 +154,7 @@ func parseDocument(r io.Reader, url string) (*advisory, error) {
 // normally one entry; should a document ever carry several, the highest base
 // score wins, the same fail-towards-severe rule the rest of this tool uses when
 // two sources rate one vulnerability differently.
-func bestVector(scores []csafScore) string {
+func bestVector(scores []csaf.Score) string {
 	var best string
 	var bestScore float64 = -1
 	for _, s := range scores {
@@ -225,10 +171,10 @@ func bestVector(scores []csafScore) string {
 
 // collectCPEs walks the product tree and records, for every product that carries
 // a CPE helper, the CPE to the product name(s) that use it.
-func collectCPEs(branches []csafBranch, out map[string][]string) {
+func collectCPEs(branches []csaf.Branch, out map[string][]string) {
 	for _, b := range branches {
-		if b.Product != nil && b.Product.Helper.CPE != "" && b.Product.ProductID != "" {
-			cpe := b.Product.Helper.CPE
+		if b.Product != nil && b.Product.CPE() != "" && b.Product.ProductID != "" {
+			cpe := b.Product.CPE()
 			out[cpe] = append(out[cpe], b.Product.ProductID)
 		}
 		if len(b.Branches) > 0 {
@@ -239,7 +185,7 @@ func collectCPEs(branches []csafBranch, out map[string][]string) {
 
 // buildVulnStatus indexes one vulnerability's product-status lists by
 // (product, package) for O(1) lookup during classification.
-func buildVulnStatus(ps csafProductStatus) *vulnStatus {
+func buildVulnStatus(ps csaf.ProductStatus) *vulnStatus {
 	vs := &vulnStatus{
 		notAffected: map[string]map[string]bool{},
 		affected:    map[string]map[string]bool{},

@@ -1942,6 +1942,19 @@ confirming a finding must not make it quieter. The flag is repeatable and the
 earliest hub to speak wins, so an internal hub listed first overrides a
 vendor's.
 
+**Either serialisation is read.** A hub's documents may be OpenVEX or
+[CSAF 2.0](https://docs.oasis-open.org/csaf/csaf/v2.0/csaf-v2.0.html) VEX
+advisories, and which one is decided from the bytes rather than from the file
+name — a hub's `index.json` publishes locations, not a naming convention, so the
+name at the end of one is data and not a promise. CSAF's indirection is resolved
+on the way in: `product_tree` branches and `full_product_names` are walked down
+to the purls in their `product_identification_helper`, and a
+`default_component_of` relationship becomes exactly the subcomponent scope
+OpenVEX states directly. A CSAF `flags[].label` is the same five-value
+vocabulary as an OpenVEX `justification`, byte for byte. Both formats therefore
+arrive at the matcher as the same thing, and an `ALREADY VEXED` row looks the
+same whichever one the vendor published.
+
 What is looked up: the scanned image (`pkg:oci/…`) and each Go binary's own main
 module (`pkg:golang/…`), which is how a hub actually files Go statements. The
 hub's `index.json` is fetched once and only the documents for products actually
@@ -2146,8 +2159,9 @@ rating on its absence.
 
 `--vexhub` *reads* a hub. `--vex-out` *writes* the other direction: it turns
 every finding this scan **ruled out** — the `RULED OUT` section, where the
-vulnerable code is not present or cannot run — into an OpenVEX `not_affected`
-statement, and lays the documents out in a directory as a VEX hub.
+vulnerable code is not present or cannot run — into a `not_affected` statement,
+and lays the documents out in a directory as a VEX hub. OpenVEX by default,
+CSAF 2.0 with [`--vex-format csaf`](#writing-csaf-instead---vex-format).
 
 It writes files and stops there. Getting them into somebody else's hub is a pull
 request, and that is git's job and `gh`'s job — both of which already know about
@@ -2173,9 +2187,9 @@ command.
 
 Each ruled-out finding becomes one statement, filed under the artifact it was
 found in (`pkg:oci/…` or a Go binary's `pkg:golang/…`), scoped to the component
-purl, and carrying the OpenVEX justification the plugin already recorded
+purl, and carrying the justification the plugin already recorded
 (`component_not_present`, `vulnerable_code_not_present`,
-`vulnerable_code_not_in_execute_path`) plus a one-line `impact_statement` saying
+`vulnerable_code_not_in_execute_path`) plus a one-line impact statement saying
 how vexscan reached the verdict.
 
 - **The diff is the product.** Existing documents are merged, not overwritten,
@@ -2190,7 +2204,7 @@ how vexscan reached the verdict.
   exits 1 and `--vex-out` does not run: a `not_affected` claim from a partial
   scan is exactly the kind of wrong this tool must never publish.
 - **`--vex-author` is required, and it is you.** There is no default, because the
-  author of an OpenVEX statement is whoever is answerable for it and a
+  author of a VEX statement is whoever is answerable for it and a
   `not_affected` claim is what tells other people's scanners to stop reporting a
   vulnerability. `"vexscan"` is not an answer to who said so. `--vex-author`
   without `--vex-out` is a command-line error (exit 2) rather than a silent
@@ -2207,6 +2221,70 @@ how vexscan reached the verdict.
 No token is needed: `--vex-out` writes to the filesystem, and every read of the
 hub goes over the same read-only path `--vexhub` already uses, so a local
 directory, a raw base URL and a `github.com` URL all work as the merge base.
+
+#### Writing CSAF instead (`--vex-format`)
+
+`--vex-format csaf` writes the same verdicts as
+[CSAF 2.0](https://docs.oasis-open.org/csaf/csaf/v2.0/csaf-v2.0.html) VEX
+advisories — `scan.csaf.json` next to where `scan.openvex.json` would have gone,
+in the same `pkg/` tree, indexed the same way. Which findings are selected, how
+they are deduplicated against the hub, and everything the bullets above say are
+identical; only the serialisation differs.
+
+```sh
+vexscan --image rancher/hardened-kubernetes:v1.34.10-rke2r1-build20260724 --all \
+  --vexhub ./vexhub \
+  --vex-out ./vexhub \
+  --vex-author 'Acme Security' \
+  --vex-format csaf \
+  --vex-publisher-namespace https://acme.example \
+  --vex-publisher-category vendor
+```
+
+CSAF asks for an identity OpenVEX does not. Its `publisher` block is mandatory
+and has three members, so `--vex-publisher-namespace` — the URI that says who
+published the advisory — is **required** and has no default, for the same reason
+`--vex-author` does not. `--vex-publisher-category` defaults to `other`; the
+values CSAF defines are `coordinator`, `discoverer`, `other`, `translator`,
+`user` and `vendor`. Both flags are an error without `--vex-format csaf`, rather
+than being quietly ignored.
+
+The mapping is one-to-one in both directions, which is what makes a document
+written here readable by `--vexhub` and by anything else that reads CSAF:
+
+| OpenVEX | CSAF |
+|---|---|
+| `status: not_affected` | `product_status.known_not_affected` |
+| `products[].@id` | a `full_product_names` entry whose `product_identification_helper.purl` is the purl |
+| `products[].subcomponents[].@id` | a `default_component_of` relationship from the component to the product |
+| `justification` | `flags[].label` — the same five values, spelled identically |
+| `impact_statement` | `threats[]` with `category: impact` |
+| `vulnerability.name` / `.aliases` | `cve` when one of them is a CVE, and `ids[]` with a `system_name` for the rest |
+| `author` / `timestamp` | `document.publisher` / `document.tracking` |
+
+Two consequences of CSAF's own model are worth knowing before you use it:
+
+- **A CSAF document is an advisory, and amending one issues a new version of it
+  in its publisher's name.** So only a document vexscan itself wrote is added
+  to. Ownership is decided by `document.tracking.id`, which is derived from the
+  product (`VEXSCAN-OCI-INDEX-DOCKER-IO-EXAMPLE-SYNTHETIC`): if the id on the
+  hub's document is not the one this run would have generated, nothing is
+  written for that product and a `warning:` on stderr says whose advisory it is.
+  When the id does match, the version is incremented, a `revision_history` entry
+  is appended and `current_release_date` moves — which is what CSAF requires of
+  an amended advisory, and is why a re-run that adds nothing writes nothing at
+  all rather than bumping a date.
+- **A hub points each product at one document, so the two formats do not mix per
+  product.** Asking for CSAF where the hub already publishes OpenVEX for that
+  product leaves the OpenVEX file alone and prints a `warning:` naming the flag
+  that would have worked, rather than writing a second document the hub's
+  `index.json` never points at. Products the hub has not seen before are filed
+  in whichever format you asked for, so a hub can hold both — just not two for
+  the same product.
+
+`contrib/vexhub-pr.sh` takes the same three settings as `--format`,
+`--publisher-namespace` and `--publisher-category`, and stops with an error if
+every document it had statements for was left untouched.
 
 ### JSON
 
@@ -2417,8 +2495,11 @@ Three properties are deliberate:
 | `--roots` | | Extra entrypoints for the closures — shared libraries and language imports; repeatable |
 | `--vexhub` | | VEX Repository to check findings against, e.g. `https://github.com/rancher/vexhub` (also a raw base URL or a local directory); repeatable, earliest wins — see [VEX hubs](#vex-hubs---vexhub) |
 | `--distro-feeds` | off | Clear OS-package false positives with the distribution's own security feed: a vendor not-affected or an already-shipped fix moves a row to `ALREADY VEXED`, and like `--vexhub` never changes a `status`. Debian's security tracker and SUSE's CSAF-VEX today; network — see [Distribution security feeds](#distribution-security-feeds---distro-feeds) |
-| `--vex-out` | | Write OpenVEX `not_affected` documents for the findings ruled out into this directory, laid out as a VEX hub; with `--vexhub` they are merged into what that hub publishes, so it can be a clone of it — see [Contributing ruled-out findings back](#contributing-ruled-out-findings-back---vex-out) |
-| `--vex-author` | | With `--vex-out`, the OpenVEX `author` to record on the statements — **required**, and an error without `--vex-out` |
+| `--vex-out` | | Write `not_affected` documents for the findings ruled out into this directory, laid out as a VEX hub; with `--vexhub` they are merged into what that hub publishes, so it can be a clone of it — see [Contributing ruled-out findings back](#contributing-ruled-out-findings-back---vex-out) |
+| `--vex-author` | | With `--vex-out`, the author to record on the statements — **required**, and an error without `--vex-out` |
+| `--vex-format` | `openvex` | With `--vex-out`, the serialisation to write: `openvex` or `csaf`. A hub indexes one document per product, so a product the hub already publishes in the other format is left untouched with a `warning:` — see [Writing CSAF instead](#writing-csaf-instead---vex-format) |
+| `--vex-publisher-namespace` | | With `--vex-format csaf`, the URI identifying the publisher, e.g. `https://acme.example` — **required** for CSAF, and an error without it |
+| `--vex-publisher-category` | `other` | With `--vex-format csaf`, the CSAF publisher category: `coordinator`, `discoverer`, `other`, `translator`, `user`, `vendor` |
 | `--severity` | *(all)* | Only report findings at these severities: `CRITICAL`, `HIGH`, `UNKNOWN`, `MEDIUM`, `LOW`, `NONE`; comma-separated or repeatable. `UNKNOWN` must be named to be shown — see [Filtering by severity](#filtering-by-severity---severity) |
 | `--triage` | `false` | Order findings by exploitation evidence — EPSS scores and CISA's known-exploited catalog. Adds two columns and re-sorts; hides nothing and changes no severity — see [Prioritising by exploitation evidence](#prioritising-by-exploitation-evidence---triage) |
 | `--dlopen-policy` | `taint` | `taint` (block conclusions) or `assume-none` |

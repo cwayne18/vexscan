@@ -28,14 +28,14 @@ func TestSelectProposalsPicksRuledOutOnly(t *testing.T) {
 	if len(props) != 1 {
 		t.Fatalf("got %d product proposals, want 1", len(props))
 	}
-	if got := len(props[0].Statements); got != 2 {
-		t.Fatalf("got %d statements, want 2 (the ruled-out ones)", got)
+	if got := len(props[0].Claims); got != 2 {
+		t.Fatalf("got %d claims, want 2 (the ruled-out ones)", got)
 	}
-	if s := props[0].Statements[0]; s.Status != StatusNotAffected {
-		t.Errorf("status = %q, want not_affected", s.Status)
+	if c := props[0].Claims[0]; c.Status != StatusNotAffected {
+		t.Errorf("status = %q, want not_affected", c.Status)
 	}
-	if s := props[0].Statements[1]; s.Justification != "vulnerable_code_not_in_execute_path" {
-		t.Errorf("justification = %q, want the finding's own", s.Justification)
+	if c := props[0].Claims[1]; c.Justification != "vulnerable_code_not_in_execute_path" {
+		t.Errorf("justification = %q, want the finding's own", c.Justification)
 	}
 }
 
@@ -63,8 +63,8 @@ func TestSelectProposalsDedupesWithinScan(t *testing.T) {
 		{ID: "CVE-1", CVE: "CVE-1", Product: testProduct, PURL: "pkg:deb/debian/a@1", Status: analyze.StatusNotPresent},
 	}}
 	props, _ := selectProposals(res, testTime)
-	if len(props) != 1 || len(props[0].Statements) != 1 {
-		t.Fatalf("expected one deduped statement, got %+v", props)
+	if len(props) != 1 || len(props[0].Claims) != 1 {
+		t.Fatalf("expected one deduped claim, got %+v", props)
 	}
 }
 

@@ -8,16 +8,17 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/cwayne18/vexscan/internal/csaf"
 	"github.com/cwayne18/vexscan/internal/distrofeed"
 )
 
-// csaf is a compact CSAF-VEX document with the exact shape the real feed uses:
+// csafFixture is a compact CSAF-VEX document with the exact shape the real feed uses:
 // a product tree mapping two products to CPEs, and one vulnerability whose
 // product_status splits openssl into a not-affected 1.1 line, an affected 1.0
 // line, and a recommended (fixed) version for each. The Desktop product carries
 // a deliberately different verdict for libopenssl1_1 so a wrong-product match
 // would be caught.
-const csaf = `{
+const csafFixture = `{
   "product_tree": {
     "branches": [
       { "category": "vendor", "name": "SUSE", "branches": [
@@ -103,7 +104,7 @@ func only(t *testing.T, stmts []distrofeed.Statement) distrofeed.Statement {
 }
 
 func docs() map[string]string {
-	return map[string]string{"cve-2023-0464.json": csaf}
+	return map[string]string{"cve-2023-0464.json": csafFixture}
 }
 
 // A package SUSE marks not-affected clears regardless of version: the CVE is in
@@ -204,7 +205,7 @@ func TestOnlyCVEsAreFetched(t *testing.T) {
 // A malformed or truncated document is rejected rather than half-trusted, so a
 // short read can never clear a finding.
 func TestMalformedDocumentRejected(t *testing.T) {
-	truncated := csaf[:len(csaf)-40]
+	truncated := csafFixture[:len(csafFixture)-40]
 	p := &Provider{BaseURL: serve(t, map[string]string{"cve-2023-0464.json": truncated}, nil)}
 	_, err := p.Lookup(context.Background(), pkgQuery(bookwormCPE(), "libopenssl1_1", "1.1.1k", "CVE-2023-0464"))
 	if err == nil {
@@ -214,7 +215,7 @@ func TestMalformedDocumentRejected(t *testing.T) {
 
 // Trailing data after the JSON object is malformed and must be rejected.
 func TestTrailingDataRejected(t *testing.T) {
-	p := &Provider{BaseURL: serve(t, map[string]string{"cve-2023-0464.json": csaf + "  garbage"}, nil)}
+	p := &Provider{BaseURL: serve(t, map[string]string{"cve-2023-0464.json": csafFixture + "  garbage"}, nil)}
 	_, err := p.Lookup(context.Background(), pkgQuery(bookwormCPE(), "libopenssl1_1", "1.1.1k", "CVE-2023-0464"))
 	if err == nil {
 		t.Fatal("trailing data after the document should be rejected")
@@ -270,7 +271,7 @@ func TestScoresIgnoresNonCVEAndUnscored(t *testing.T) {
 func TestBestVector(t *testing.T) {
 	cases := []struct {
 		name   string
-		scores []csafScore
+		scores []csaf.Score
 		want   string
 	}{
 		{"none", nil, ""},
@@ -315,10 +316,10 @@ func TestMissingDocumentIsCached(t *testing.T) {
 
 // scoresOf builds a scores slice from alternating (baseScore, vector) pairs, for
 // the table test above.
-func scoresOf(pairs ...any) []csafScore {
-	var out []csafScore
+func scoresOf(pairs ...any) []csaf.Score {
+	var out []csaf.Score
 	for i := 0; i+1 < len(pairs); i += 2 {
-		var s csafScore
+		var s csaf.Score
 		s.CVSSV3.BaseScore = pairs[i].(float64)
 		s.CVSSV3.VectorString = pairs[i+1].(string)
 		out = append(out, s)

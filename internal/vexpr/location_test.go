@@ -1,6 +1,7 @@
 package vexpr
 
 import (
+	"path"
 	"strings"
 	"testing"
 )
@@ -25,7 +26,7 @@ func TestProductLocation(t *testing.T) {
 		},
 	}
 	for _, tc := range cases {
-		got, err := productLocation(tc.purl)
+		got, err := productLocation(tc.purl, openVEXFileName)
 		if err != nil {
 			t.Errorf("productLocation(%q) error: %v", tc.purl, err)
 			continue
@@ -36,13 +37,34 @@ func TestProductLocation(t *testing.T) {
 	}
 }
 
+// TestProductLocationVariesOnlyByFileName pins that the two serialisations
+// share a directory and differ only in the name at the end of it, which is what
+// lets a hub carry both without either format needing its own tree.
+func TestProductLocationVariesOnlyByFileName(t *testing.T) {
+	const purl = "pkg:oci/hardened-kubernetes?repository_url=index.docker.io/rancher/hardened-kubernetes"
+	openvex, err := productLocation(purl, openVEXFileName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csafLoc, err := productLocation(purl, csafFileName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "pkg/oci/index.docker.io/rancher/hardened-kubernetes/scan.csaf.json"; csafLoc != want {
+		t.Errorf("csaf location = %q, want %q", csafLoc, want)
+	}
+	if path.Dir(openvex) != path.Dir(csafLoc) {
+		t.Errorf("the two formats file %q in different directories: %q and %q", purl, openvex, csafLoc)
+	}
+}
+
 func TestProductLocationRejectsUnsupported(t *testing.T) {
 	for _, purl := range []string{
 		"pkg:deb/debian/openssl@3.0.11-1",
 		"not-a-purl",
 		"pkg:oci/thing", // no repository_url
 	} {
-		if _, err := productLocation(purl); err == nil {
+		if _, err := productLocation(purl, openVEXFileName); err == nil {
 			t.Errorf("productLocation(%q) = nil error, want error", purl)
 		}
 	}
@@ -67,7 +89,7 @@ func TestProductLocationRejectsEscapes(t *testing.T) {
 		"pkg:oci/x?repository_url=../../../.github/workflows",
 		"pkg:oci/x?repository_url=%2E%2E%2F%2E%2E%2Fetc",
 	} {
-		got, err := productLocation(purl)
+		got, err := productLocation(purl, openVEXFileName)
 		if err == nil {
 			t.Errorf("productLocation(%q) = %q, want an error", purl, got)
 		}
@@ -84,7 +106,7 @@ func TestProductLocationStaysUnderHubRoot(t *testing.T) {
 		"pkg:oci/x?repository_url=../../../etc",
 		"pkg:oci/x?repository_url=/etc/passwd",
 	} {
-		loc, err := productLocation(purl)
+		loc, err := productLocation(purl, openVEXFileName)
 		if err != nil {
 			continue // refused, which is the other acceptable outcome
 		}

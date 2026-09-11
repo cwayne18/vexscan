@@ -87,20 +87,23 @@ func (br *batchReport) failed() bool {
 // than fifteen parameters, and only because the flag block it comes from is
 // already fifteen lines long.
 type batchRun struct {
-	opts    analyze.Options // the shared scan settings; Image is set per image
-	images  []string
-	format  string
-	render  renderOpts
-	out     string
-	noPager bool
-	gist    bool
-	gistPub bool
-	vexOut  string
-	vexHubs []string
-	vexAuth string
-	gate    failOn
-	started time.Time
-	logf    func(string, ...any)
+	opts      analyze.Options // the shared scan settings; Image is set per image
+	images    []string
+	format    string
+	render    renderOpts
+	out       string
+	noPager   bool
+	gist      bool
+	gistPub   bool
+	vexOut    string
+	vexHubs   []string
+	vexAuth   string
+	vexFmt    string
+	vexPubNS  string
+	vexPubCat string
+	gate      failOn
+	started   time.Time
+	logf      func(string, ...any)
 }
 
 // runBatch scans a fleet and exits. It never returns: like the single-image
@@ -147,6 +150,9 @@ func runBatch(ctx context.Context, r batchRun) {
 			if err := runVexOut(ctx, res, vexOutOptions{
 				dir:       r.vexOut,
 				author:    r.vexAuth,
+				format:    r.vexFmt,
+				pubNS:     r.vexPubNS,
+				pubCat:    r.vexPubCat,
 				hubs:      r.vexHubs,
 				timestamp: r.started.UTC().Format(time.RFC3339),
 				logf:      r.logf,

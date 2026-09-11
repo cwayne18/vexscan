@@ -8,13 +8,41 @@ import (
 	"github.com/cwayne18/vexscan/internal/analyze"
 )
 
-// ProductProposal is every statement proposed for one product's document.
-type ProductProposal struct {
-	// Product is the artifact purl the statements are filed under.
+// Claim is one thing this scan wants a hub to record, in the terms both
+// serialisations share.
+//
+// It exists so that deciding what to say happens once. A claim carries a
+// vulnerability, the artifact and the component inside it, a verdict and the
+// reasoning -- which is the entire content of a VEX statement, and is identical
+// whether it ends up as an OpenVEX statement or as an entry in a CSAF
+// product_status. Nothing about either format's spelling reaches this far.
+type Claim struct {
+	// Vuln is the id the claim is filed under, preferring a CVE.
+	Vuln string
+	// Aliases are the other ids the same vulnerability is known by, so a lookup
+	// keyed on any of them still lands.
+	Aliases []string
+	// Product is the artifact purl -- a scanned image, a Go main module.
 	Product string
-	// Statements are the not_affected claims, one per ruled-out finding, sorted
-	// so a repeated run produces a byte-identical document.
-	Statements []Statement
+	// Subcomponent is the dependency inside it the vulnerability is filed
+	// against, which is what a vexscan finding actually is.
+	Subcomponent string
+
+	Status        string
+	Justification string
+	// Impact is the sentence explaining, to whoever reviews the pull request,
+	// how vexscan reached the verdict.
+	Impact    string
+	Timestamp string
+}
+
+// ProductProposal is every claim proposed for one product's document.
+type ProductProposal struct {
+	// Product is the artifact purl the claims are filed under.
+	Product string
+	// Claims are the not_affected claims, one per ruled-out finding, sorted so
+	// a repeated run produces a byte-identical document.
+	Claims []Claim
 }
 
 // selectProposals turns the ruled-out findings in a result into per-product
@@ -31,7 +59,7 @@ type ProductProposal struct {
 // that would never be found again. The dropped count is returned so the caller
 // can say so instead of silently proposing fewer than the report ruled out.
 func selectProposals(res *analyze.Result, timestamp string) (proposals []ProductProposal, skipped int) {
-	byProduct := map[string][]Statement{}
+	byProduct := map[string][]Claim{}
 	seen := map[string]bool{}
 	for _, f := range res.Findings {
 		if !ruledOut(f) {
@@ -41,29 +69,29 @@ func selectProposals(res *analyze.Result, timestamp string) (proposals []Product
 			// The hub has already spoken to this finding; --vexhub matched it.
 			continue
 		}
-		st, ok := statementFor(f, timestamp)
+		c, ok := claimFor(f, timestamp)
 		if !ok {
 			skipped++
 			continue
 		}
 		// Dedupe within a single scan: two binaries can rule out the same CVE in
 		// the same product, and the document should carry it once.
-		dk := dedupeKey(f.Product, st.Vulnerability.Name, subcomponentID(st))
+		dk := dedupeKey(c.Product, c.Vuln, c.Subcomponent)
 		if seen[dk] {
 			continue
 		}
 		seen[dk] = true
-		byProduct[f.Product] = append(byProduct[f.Product], st)
+		byProduct[f.Product] = append(byProduct[f.Product], c)
 	}
 
-	for product, sts := range byProduct {
-		sort.Slice(sts, func(i, j int) bool {
-			if a, b := sts[i].Vulnerability.Name, sts[j].Vulnerability.Name; a != b {
+	for product, claims := range byProduct {
+		sort.Slice(claims, func(i, j int) bool {
+			if a, b := claims[i].Vuln, claims[j].Vuln; a != b {
 				return a < b
 			}
-			return subcomponentID(sts[i]) < subcomponentID(sts[j])
+			return claims[i].Subcomponent < claims[j].Subcomponent
 		})
-		proposals = append(proposals, ProductProposal{Product: product, Statements: sts})
+		proposals = append(proposals, ProductProposal{Product: product, Claims: claims})
 	}
 	sort.Slice(proposals, func(i, j int) bool { return proposals[i].Product < proposals[j].Product })
 	return proposals, skipped
@@ -75,28 +103,26 @@ func ruledOut(f analyze.Finding) bool {
 	return f.Status == analyze.StatusNotPresent || f.Status == analyze.StatusNotInPath
 }
 
-// statementFor builds the OpenVEX statement a ruled-out finding becomes, or
-// reports ok=false when the finding lacks what a matchable statement needs.
-func statementFor(f analyze.Finding, timestamp string) (Statement, bool) {
+// claimFor builds the claim a ruled-out finding becomes, or reports ok=false
+// when the finding lacks what a matchable statement needs.
+func claimFor(f analyze.Finding, timestamp string) (Claim, bool) {
 	if f.Product == "" || f.PURL == "" {
-		return Statement{}, false
+		return Claim{}, false
 	}
 	name, aliases := vulnIDs(f)
 	if name == "" {
-		return Statement{}, false
+		return Claim{}, false
 	}
-	st := Statement{
-		Vulnerability: Vulnerability{Name: name, Aliases: aliases},
-		Products: []Product{{
-			ID:            f.Product,
-			Subcomponents: []Subcomponent{{ID: f.PURL}},
-		}},
-		Status:          StatusNotAffected,
-		Justification:   justification(f),
-		ImpactStatement: impact(f),
-		Timestamp:       timestamp,
-	}
-	return st, true
+	return Claim{
+		Vuln:          name,
+		Aliases:       aliases,
+		Product:       f.Product,
+		Subcomponent:  f.PURL,
+		Status:        StatusNotAffected,
+		Justification: justification(f),
+		Impact:        impact(f),
+		Timestamp:     timestamp,
+	}, true
 }
 
 // vulnIDs is the id a statement is filed under and the aliases it is also known
@@ -136,13 +162,15 @@ func vulnIDs(f analyze.Finding) (name string, aliases []string) {
 	return name, aliases
 }
 
-// justification is the OpenVEX justification for a ruled-out finding.
+// justification is the justification label for a ruled-out finding.
 //
 // Every plugin already records a valid OpenVEX justification on the findings it
 // rules out (component_not_present, vulnerable_code_not_present,
 // vulnerable_code_not_in_execute_path), so the finding's own field is used as
-// written. The status-derived fallback only fires for a finding that somehow
-// carries none, and picks the weakest defensible label for its verdict.
+// written -- and CSAF's flag labels are the same five strings, so the value
+// needs no translation on the way to either format. The status-derived fallback
+// only fires for a finding that somehow carries none, and picks the weakest
+// defensible label for its verdict.
 func justification(f analyze.Finding) string {
 	if f.Justification != "" {
 		return f.Justification
@@ -170,13 +198,6 @@ func impact(f analyze.Finding) string {
 		}
 	}
 	return b.String()
-}
-
-func subcomponentID(s Statement) string {
-	if len(s.Products) == 0 || len(s.Products[0].Subcomponents) == 0 {
-		return ""
-	}
-	return s.Products[0].Subcomponents[0].ID
 }
 
 func dedupeKey(product, vuln, sub string) string {

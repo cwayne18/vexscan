@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/cwayne18/vexscan/internal/analyze"
+	"github.com/cwayne18/vexscan/internal/csaf"
 	"github.com/cwayne18/vexscan/internal/vex"
 	"github.com/cwayne18/vexscan/internal/vexpr"
 )
@@ -14,13 +16,16 @@ import (
 type vexOutOptions struct {
 	dir       string
 	author    string
+	format    string
+	pubNS     string
+	pubCat    string
 	hubs      []string
 	timestamp string
 	logf      func(string, ...any)
 }
 
-// runVexOut writes the OpenVEX documents for this scan's ruled-out findings
-// into a directory, laid out as a VEX hub.
+// runVexOut writes the VEX documents for this scan's ruled-out findings into a
+// directory, laid out as a VEX hub.
 //
 // When a --vexhub is given the documents are merged into what that hub already
 // publishes -- read-only, over the same transport the scan used -- so the output
@@ -39,20 +44,30 @@ func runVexOut(ctx context.Context, res *analyze.Result, opts vexOutOptions) err
 	}
 
 	plan, err := vexpr.Propose(ctx, res, vexpr.Options{
-		Hub:       hub,
-		Author:    opts.author,
-		Timestamp: opts.timestamp,
-		Logf:      opts.logf,
+		Hub:                hub,
+		Format:             vexpr.Format(opts.format),
+		Author:             opts.author,
+		Timestamp:          opts.timestamp,
+		PublisherCategory:  opts.pubCat,
+		PublisherNamespace: opts.pubNS,
+		Logf:               opts.logf,
 	})
 	if err != nil {
 		return err
 	}
 
-	reportUnparsable(plan, opts.logf)
+	skippedDocs := reportSkippedDocuments(plan, opts.logf)
 	if plan.Empty() {
-		if plan.Skipped > 0 {
+		switch {
+		case skippedDocs > 0:
+			// Saying the hub already covers everything would contradict the
+			// warnings just printed: nothing was written because every document
+			// this had statements for was left alone, not because there was
+			// nothing to say.
+			opts.logf("vex-out: nothing written; all %d document(s) with statements to add were left untouched", skippedDocs)
+		case plan.Skipped > 0:
 			opts.logf("vex-out: nothing to write (%d ruled-out finding(s) lacked a product, component or id)", plan.Skipped)
-		} else {
+		default:
 			opts.logf("vex-out: nothing to write; no ruled-out findings the hub does not already cover")
 		}
 		return nil
@@ -80,19 +95,29 @@ func runVexOut(ctx context.Context, res *analyze.Result, opts vexOutOptions) err
 	return nil
 }
 
-// reportUnparsable names every hub document the proposal declined to touch
-// because it could not be read.
+// reportSkippedDocuments names every hub document the proposal declined to
+// touch.
 //
-// This is a warning, not a footnote. Each entry is a product whose statements
-// are missing from the output, and the reason is a document vexscan could not
-// decode -- either a hub using something this version does not understand or a
-// genuinely broken file. Either way whoever reviews the result needs to know
-// the omission was deliberate, and the operator needs to know their scan's
+// These are warnings, not footnotes. Each entry is a product whose statements
+// are missing from the output, and whoever reviews the result needs to know the
+// omission was deliberate -- the operator needs to know their scan's
 // conclusions about those products went nowhere.
-func reportUnparsable(plan *vexpr.Plan, logf func(string, ...any)) {
+//
+// The two reasons are kept apart because they ask different things. An
+// unreadable document is a broken hub or a format this version does not
+// understand, and there is nothing to do about it here. A declined one is
+// usually a flag away from working, so its own reason is printed rather than a
+// generic line.
+// It returns how many there were, so the summary line can tell "nothing to add"
+// apart from "nothing got through".
+func reportSkippedDocuments(plan *vexpr.Plan, logf func(string, ...any)) int {
 	for _, loc := range plan.Unparsable {
 		logf("warning: vex-out: %s could not be parsed and was left untouched; nothing written for it", loc)
 	}
+	for _, u := range plan.Untouched {
+		logf("warning: vex-out: %s left untouched: %s; nothing written for %s", u.Location, u.Reason, u.Product)
+	}
+	return len(plan.Unparsable) + len(plan.Untouched)
 }
 
 // checkVexOut validates the --vex-out flags before the scan runs, so a missing
@@ -100,19 +125,47 @@ func reportUnparsable(plan *vexpr.Plan, logf func(string, ...any)) {
 // image pull.
 //
 // --vex-author has no default because there is nobody to derive one from. The
-// author of an OpenVEX statement is whoever is answerable for the claim, and a
+// author of a VEX statement is whoever is answerable for the claim, and a
 // not_affected claim is one that tells other people's scanners to stop
 // reporting a vulnerability. "vexscan" is not an answer to who said so.
-func checkVexOut(dir, author string) error {
+// --vex-publisher-namespace is the same question in CSAF's terms, which is why
+// it has no default either.
+func checkVexOut(dir, author, format, pubNS, pubCat string) error {
+	f, err := vexpr.ParseFormat(format)
+	if err != nil {
+		return fmt.Errorf("--vex-format: %w", err)
+	}
+	publisher := []struct{ name, val string }{
+		{"--vex-publisher-namespace", pubNS},
+		{"--vex-publisher-category", pubCat},
+	}
 	if dir == "" {
-		if author != "" {
-			return fmt.Errorf("--vex-author has no effect without --vex-out")
+		for _, fl := range append([]struct{ name, val string }{{"--vex-author", author}}, publisher...) {
+			if fl.val != "" {
+				return fmt.Errorf("%s has no effect without --vex-out", fl.name)
+			}
 		}
 		return nil
 	}
 	if author == "" {
 		return fmt.Errorf("--vex-out needs --vex-author to record on the statements, " +
 			`e.g. --vex-author "Acme Security"`)
+	}
+	if f != vexpr.FormatCSAF {
+		for _, fl := range publisher {
+			if fl.val != "" {
+				return fmt.Errorf("%s describes a CSAF publisher and has no effect on --vex-format %s", fl.name, f)
+			}
+		}
+		return nil
+	}
+	if pubNS == "" {
+		return fmt.Errorf("--vex-format csaf needs --vex-publisher-namespace to identify the publisher, " +
+			`e.g. --vex-publisher-namespace "https://acme.example"`)
+	}
+	if pubCat != "" && !csaf.ValidPublisherCategory(pubCat) {
+		return fmt.Errorf("--vex-publisher-category %q is not one CSAF allows: %s",
+			pubCat, strings.Join(csaf.PublisherCategories, ", "))
 	}
 	return nil
 }
