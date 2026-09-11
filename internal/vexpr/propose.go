@@ -2,6 +2,7 @@ package vexpr
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -30,13 +31,20 @@ type Options struct {
 	// Hub is the hub to merge against, read-only. Nil starts from an empty
 	// index, which is how a hub gets bootstrapped rather than added to.
 	Hub HubReader
-	// Author is the OpenVEX author recorded on every statement written. It has
-	// no default: an author is a claim of responsibility for the assertion, and
+	// Format is the serialisation to write. The zero value is OpenVEX.
+	Format Format
+	// Author is the author recorded on every statement written. It has no
+	// default: an author is a claim of responsibility for the assertion, and
 	// there is nobody but the caller who can make it.
 	Author string
 	// Timestamp is the scan time, used on every statement so a re-run of the
 	// same scan produces the same document.
 	Timestamp string
+	// PublisherCategory and PublisherNamespace are the rest of the identity
+	// CSAF requires of a publisher. They are ignored by, and rejected for, any
+	// other format.
+	PublisherCategory  string
+	PublisherNamespace string
 	// Logf receives progress lines. Nil discards them.
 	Logf func(string, ...any)
 }
@@ -65,6 +73,19 @@ type Plan struct {
 	// about, and a reader would otherwise have no way to tell that from a
 	// product with nothing to say.
 	Unparsable []string
+	// Untouched is every hub document that decoded perfectly well and was still
+	// left alone -- because it is in the other serialisation, or because it is
+	// an advisory somebody else published. Separate from Unparsable because the
+	// two ask different things of the operator, and the reason says which.
+	Untouched []Untouched
+}
+
+// Untouched is one document the proposal deliberately left as published, and
+// why.
+type Untouched struct {
+	Product  string
+	Location string
+	Reason   string
 }
 
 // ProductChange records, for the summary, which vulnerabilities were added to
@@ -85,8 +106,22 @@ func Propose(ctx context.Context, res *analyze.Result, opts Options) (*Plan, err
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	if opts.Author == "" {
-		return nil, fmt.Errorf("vexpr: no author to record on the statements")
+	format, err := ParseFormat(string(opts.Format))
+	if err != nil {
+		return nil, err
+	}
+	meta := Meta{
+		Author:             opts.Author,
+		Timestamp:          opts.Timestamp,
+		PublisherCategory:  opts.PublisherCategory,
+		PublisherNamespace: opts.PublisherNamespace,
+	}
+	if err := checkMeta(format, meta); err != nil {
+		return nil, err
+	}
+	enc, err := encoderFor(format)
+	if err != nil {
+		return nil, err
 	}
 
 	proposals, skipped := selectProposals(res, opts.Timestamp)
@@ -103,62 +138,59 @@ func Propose(ctx context.Context, res *analyze.Result, opts Options) (*Plan, err
 		idx = parsed
 	}
 
-	var (
-		changes      []FileChange
-		productChgs  []ProductChange
-		unparsable   []string
-		stmtTotal    int
-		indexTouched bool
-	)
+	plan := &Plan{Skipped: skipped}
+	indexTouched := false
 	for _, prop := range proposals {
-		loc, idxChanged, err := idx.ensure(prop.Product)
+		loc, idxChanged, err := idx.ensure(prop.Product, enc.fileName())
 		if err != nil {
 			logf("  ! vex-out: %s skipped: %v", prop.Product, err)
 			continue
 		}
 
-		doc, ok, err := readDoc(ctx, opts.Hub, loc)
+		raw, err := hubRaw(ctx, opts.Hub, loc)
 		if err != nil {
 			return nil, err
 		}
-		if !ok {
+
+		content, added, err := enc.merge(raw, prop, meta)
+		switch {
+		case errors.Is(err, errUnreadable):
 			// The file is there and this cannot read it, which is not the same
 			// as it not being there. Starting a fresh document would overwrite
 			// whatever the file said: a statement vexscan cannot decode is
 			// still one its publisher meant, and quite possibly one another
 			// reader acts on. Leave it exactly as it is, and account for it.
 			logf("  ! vex-out: %s: %s exists but could not be parsed; left untouched", prop.Product, loc)
-			unparsable = append(unparsable, loc)
+			plan.Unparsable = append(plan.Unparsable, loc)
+			continue
+		case err != nil:
+			var d *declineError
+			if !errors.As(err, &d) {
+				return nil, err
+			}
+			logf("  ! vex-out: %s: %s left untouched: %s", prop.Product, loc, d.reason)
+			plan.Untouched = append(plan.Untouched, Untouched{
+				Product: prop.Product, Location: loc, Reason: d.reason,
+			})
 			continue
 		}
-		if doc == nil {
-			doc = NewDoc(opts.Author, opts.Timestamp)
-		}
-
-		before := len(doc.Statements)
-		added := mergeStatements(doc, prop, opts.Author, opts.Timestamp)
-		if added == 0 {
+		if len(added) == 0 {
 			// Nothing new for this product: leave the index untouched even if
 			// ensure would have added a key (it only does so for a product with
-			// no document, which always yields added > 0, so this is a guard).
+			// no document, which always yields something added, so this is a
+			// guard).
 			continue
 		}
 		indexTouched = indexTouched || idxChanged
 
-		content, err := doc.Marshal()
-		if err != nil {
-			return nil, err
-		}
-		changes = append(changes, FileChange{Path: loc, Content: content})
-		stmtTotal += added
-		productChgs = append(productChgs, ProductChange{
-			Product: prop.Product,
-			Vulns:   addedVulns(doc.Statements[before:]),
-		})
+		sort.Strings(added)
+		plan.Changes = append(plan.Changes, FileChange{Path: loc, Content: content})
+		plan.Statements += len(added)
+		plan.Products = append(plan.Products, ProductChange{Product: prop.Product, Vulns: added})
 	}
 
-	if len(changes) == 0 {
-		return &Plan{Skipped: skipped, Unparsable: unparsable}, nil
+	if len(plan.Changes) == 0 {
+		return plan, nil
 	}
 	// A hub being bootstrapped has no index.json on disk yet, so it is written
 	// even when no product was added to it -- otherwise the output would be a
@@ -168,39 +200,38 @@ func Propose(ctx context.Context, res *analyze.Result, opts Options) (*Plan, err
 		if err != nil {
 			return nil, err
 		}
-		changes = append(changes, FileChange{Path: "index.json", Content: idxContent})
+		plan.Changes = append(plan.Changes, FileChange{Path: "index.json", Content: idxContent})
 	}
-
-	return &Plan{
-		Changes:    changes,
-		Products:   productChgs,
-		Statements: stmtTotal,
-		Skipped:    skipped,
-		Unparsable: unparsable,
-	}, nil
+	return plan, nil
 }
 
-// readDoc fetches and decodes the hub's existing document for a location.
-//
-// The three outcomes are distinct and the caller acts differently on each: a
-// decoded document to merge into (doc != nil, ok), no document there at all
-// (nil, ok), and a document that exists but does not decode (nil, !ok).
-func readDoc(ctx context.Context, hub HubReader, loc string) (*Doc, bool, error) {
+// checkMeta rejects a run that cannot produce a valid document, before the work
+// rather than after it.
+func checkMeta(f Format, m Meta) error {
+	if m.Author == "" {
+		return fmt.Errorf("vexpr: no author to record on the statements")
+	}
+	if f == FormatCSAF {
+		return checkCSAFMeta(m)
+	}
+	if m.PublisherNamespace != "" || m.PublisherCategory != "" {
+		return fmt.Errorf("vexpr: the publisher fields describe a CSAF publisher and %s carries none", f)
+	}
+	return nil
+}
+
+// hubRaw fetches the hub's existing document for a location, returning nil
+// bytes when there is none -- which is the same thing an encoder does with a
+// hub that was never given.
+func hubRaw(ctx context.Context, hub HubReader, loc string) ([]byte, error) {
 	if hub == nil {
-		return nil, true, nil
+		return nil, nil
 	}
 	raw, exists, err := hub.Raw(ctx, loc)
-	if err != nil {
-		return nil, false, err
+	if err != nil || !exists {
+		return nil, err
 	}
-	if !exists {
-		return nil, true, nil
-	}
-	doc, ok := ParseDoc(raw)
-	if !ok {
-		return nil, false, nil
-	}
-	return doc, true, nil
+	return raw, nil
 }
 
 // Write puts the plan on disk under dir, creating parent directories as needed.
@@ -232,15 +263,4 @@ func (p *Plan) Write(dir string) error {
 		}
 	}
 	return nil
-}
-
-// addedVulns lists the vulnerability names of a slice of statements, for the
-// summary.
-func addedVulns(sts []Statement) []string {
-	out := make([]string, 0, len(sts))
-	for _, s := range sts {
-		out = append(out, s.Vulnerability.Name)
-	}
-	sort.Strings(out)
-	return out
 }

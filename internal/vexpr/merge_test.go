@@ -1,26 +1,41 @@
 package vexpr
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
 
-func TestMergeStatementsDedupesAgainstExistingDoc(t *testing.T) {
+// testMeta is the identity a test run writes under.
+func testMeta(timestamp string) Meta {
+	return Meta{Author: "Author", Timestamp: timestamp}
+}
+
+// claim is one ruled-out finding, spelled the short way the tests need it.
+func claim(vuln, sub string, aliases ...string) Claim {
+	return Claim{
+		Vuln: vuln, Aliases: aliases,
+		Product: testProduct, Subcomponent: sub,
+		Status: StatusNotAffected,
+	}
+}
+
+func TestMergeClaimsDedupesAgainstExistingDoc(t *testing.T) {
 	doc := NewDoc("Someone", testTime)
 	doc.Statements = []Statement{{
 		Vulnerability: Vulnerability{Name: "CVE-1", Aliases: []string{"GHSA-x"}},
 		Products:      []Product{{ID: testProduct, Subcomponents: []Subcomponent{{ID: "pkg:deb/debian/a@1"}}}},
 		Status:        StatusNotAffected,
 	}}
-	prop := ProductProposal{Product: testProduct, Statements: []Statement{
+	prop := ProductProposal{Product: testProduct, Claims: []Claim{
 		// Same vuln (by alias) + same subcomponent -> already covered.
-		{Vulnerability: Vulnerability{Name: "GHSA-x"}, Products: []Product{{ID: testProduct, Subcomponents: []Subcomponent{{ID: "pkg:deb/debian/a@1"}}}}, Status: StatusNotAffected},
+		claim("GHSA-x", "pkg:deb/debian/a@1"),
 		// New vuln -> added.
-		{Vulnerability: Vulnerability{Name: "CVE-2"}, Products: []Product{{ID: testProduct, Subcomponents: []Subcomponent{{ID: "pkg:deb/debian/b@1"}}}}, Status: StatusNotAffected},
+		claim("CVE-2", "pkg:deb/debian/b@1"),
 	}}
-	added := mergeStatements(doc, prop, "Author", "2026-08-06T11:00:00Z")
-	if added != 1 {
-		t.Fatalf("added = %d, want 1", added)
+	added := mergeClaims(doc, prop, testMeta("2026-08-06T11:00:00Z"))
+	if len(added) != 1 || added[0] != "CVE-2" {
+		t.Fatalf("added = %v, want [CVE-2]", added)
 	}
 	if len(doc.Statements) != 2 {
 		t.Fatalf("doc has %d statements, want 2", len(doc.Statements))
@@ -30,26 +45,24 @@ func TestMergeStatementsDedupesAgainstExistingDoc(t *testing.T) {
 	}
 }
 
-func TestMergeStatementsProductWideCovers(t *testing.T) {
+func TestMergeClaimsProductWideCovers(t *testing.T) {
 	doc := NewDoc("Someone", testTime)
 	doc.Statements = []Statement{{
 		Vulnerability: Vulnerability{Name: "CVE-1"},
 		Products:      []Product{{ID: testProduct}}, // no subcomponents -> whole product
 		Status:        StatusNotAffected,
 	}}
-	prop := ProductProposal{Product: testProduct, Statements: []Statement{
-		{Vulnerability: Vulnerability{Name: "CVE-1"}, Products: []Product{{ID: testProduct, Subcomponents: []Subcomponent{{ID: "pkg:deb/debian/a@1"}}}}, Status: StatusNotAffected},
-	}}
-	if added := mergeStatements(doc, prop, "A", testTime); added != 0 {
-		t.Fatalf("added = %d, want 0 (product-wide statement covers it)", added)
+	prop := ProductProposal{Product: testProduct, Claims: []Claim{claim("CVE-1", "pkg:deb/debian/a@1")}}
+	if added := mergeClaims(doc, prop, testMeta(testTime)); len(added) != 0 {
+		t.Fatalf("added = %v, want none (product-wide statement covers it)", added)
 	}
 }
 
-func TestMergeStatementsNoChangeNoTimestampBump(t *testing.T) {
+func TestMergeClaimsNoChangeNoTimestampBump(t *testing.T) {
 	doc := NewDoc("Someone", testTime)
-	prop := ProductProposal{Product: testProduct} // no statements
-	if added := mergeStatements(doc, prop, "A", "2026-09-09T09:09:09Z"); added != 0 {
-		t.Fatalf("added = %d, want 0", added)
+	prop := ProductProposal{Product: testProduct} // no claims
+	if added := mergeClaims(doc, prop, testMeta("2026-09-09T09:09:09Z")); len(added) != 0 {
+		t.Fatalf("added = %v, want none", added)
 	}
 	if doc.Timestamp != testTime {
 		t.Errorf("timestamp changed with no additions: %q", doc.Timestamp)
@@ -64,7 +77,7 @@ func TestIndexEnsure(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Existing product (given as the decoded purl) resolves without a change.
-	loc, changed, err := idx.ensure(testProduct)
+	loc, changed, err := idx.ensure(testProduct, openVEXFileName)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +90,7 @@ func TestIndexEnsure(t *testing.T) {
 
 	// New product gets an entry and reports the change.
 	newProd := "pkg:golang/github.com/foo/bar"
-	loc, changed, err = idx.ensure(newProd)
+	loc, changed, err = idx.ensure(newProd, openVEXFileName)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,6 +106,30 @@ func TestIndexEnsure(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "pkg:golang/github.com/foo/bar") {
 		t.Errorf("marshaled index missing new key:\n%s", out)
+	}
+}
+
+// TestIndexEnsureKeepsAnExistingLocation is what makes a format change safe: a
+// hub's index maps a product to one document, so a product already filed as
+// OpenVEX keeps that path even when CSAF is being written. The encoder then
+// sees the OpenVEX bytes and declines, rather than a second document being
+// written that the hub's index never points at.
+func TestIndexEnsureKeepsAnExistingLocation(t *testing.T) {
+	idx, err := parseIndex([]byte(`{"version":1,"packages":[
+		{"id":"pkg:oci/synthetic?repository_url=index.docker.io%2Fexample%2Fsynthetic","location":"pkg/oci/index.docker.io/example/synthetic/scan.openvex.json"}
+	]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	loc, changed, err := idx.ensure(testProduct, csafFileName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Error("ensure rewrote the index for a product it already carried")
+	}
+	if loc != "pkg/oci/index.docker.io/example/synthetic/scan.openvex.json" {
+		t.Errorf("location = %q, want the one the hub already published", loc)
 	}
 }
 
@@ -154,20 +191,13 @@ func TestMergePreservesExistingDocumentFields(t *testing.T) {
   ]
 }`)
 
-	doc, ok := ParseDoc(existing)
-	if !ok {
-		t.Fatal("ParseDoc returned ok=false on a valid document")
-	}
-	prop := ProductProposal{Product: testProduct, Statements: []Statement{
-		{Vulnerability: Vulnerability{Name: "CVE-2"}, Products: []Product{{ID: testProduct, Subcomponents: []Subcomponent{{ID: "pkg:deb/debian/b@1"}}}}, Status: StatusNotAffected},
-	}}
-	if added := mergeStatements(doc, prop, "vexscan", "2026-08-06T11:00:00Z"); added != 1 {
-		t.Fatalf("added = %d, want 1", added)
-	}
-
-	out, err := doc.Marshal()
+	prop := ProductProposal{Product: testProduct, Claims: []Claim{claim("CVE-2", "pkg:deb/debian/b@1")}}
+	out, added, err := openvexEncoder{}.merge(existing, prop, Meta{Author: "vexscan", Timestamp: "2026-08-06T11:00:00Z"})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(added) != 1 {
+		t.Fatalf("added = %v, want one vulnerability", added)
 	}
 	got := string(out)
 
@@ -202,5 +232,27 @@ func TestMergePreservesExistingDocumentFields(t *testing.T) {
 	}
 	if strings.Contains(got, `\u0026`) || strings.Contains(got, `\u003c`) {
 		t.Errorf("output contains HTML escapes:\n%s", got)
+	}
+}
+
+// TestOpenVEXEncoderDeclinesACSAFDocument is the hazard the format check exists
+// for. A CSAF document decodes as a perfectly valid OpenVEX document with no
+// statements, so without the check the merge would graft an OpenVEX statements
+// array onto somebody's advisory and write it back over the original.
+func TestOpenVEXEncoderDeclinesACSAFDocument(t *testing.T) {
+	existing := []byte(`{"document":{"category":"csaf_vex","csaf_version":"2.0",
+		"publisher":{"category":"vendor","name":"Acme","namespace":"https://acme.example"},
+		"title":"t","tracking":{"id":"ACME-1","initial_release_date":"2026-01-01T00:00:00Z",
+		"current_release_date":"2026-01-01T00:00:00Z","revision_history":[],"status":"final","version":"1"}},
+		"product_tree":{},"vulnerabilities":[]}`)
+	prop := ProductProposal{Product: testProduct, Claims: []Claim{claim("CVE-2", "pkg:deb/debian/b@1")}}
+
+	out, added, err := openvexEncoder{}.merge(existing, prop, testMeta(testTime))
+	var d *declineError
+	if !errors.As(err, &d) {
+		t.Fatalf("merge = (%q, %v, %v), want a refusal", out, added, err)
+	}
+	if !strings.Contains(d.reason, "--vex-format csaf") {
+		t.Errorf("reason = %q, want it to name the flag that would work", d.reason)
 	}
 }

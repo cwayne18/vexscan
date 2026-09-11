@@ -17,6 +17,7 @@ import (
 
 	"github.com/cwayne18/vexscan/internal/analyze"
 	"github.com/cwayne18/vexscan/internal/buildinfo"
+	"github.com/cwayne18/vexscan/internal/csaf"
 	"github.com/cwayne18/vexscan/internal/cvss"
 	"github.com/cwayne18/vexscan/internal/distrofeed"
 	"github.com/cwayne18/vexscan/internal/distrofeed/debian"
@@ -77,9 +78,13 @@ func main() {
 		out        = flag.String("out", "", "write output to this file instead of stdout")
 		gistFlag   = flag.Bool("gist", false, "also upload the output to a public GitHub gist (needs GITHUB_TOKEN/GH_TOKEN with gist scope)")
 		gistSecret = flag.Bool("gist-secret", false, "with --gist, create a secret (unlisted) gist")
-		vexOut     = flag.String("vex-out", "", "write OpenVEX not_affected documents for ruled-out findings into this directory, laid out as a VEX hub")
-		vexAuthor  = flag.String("vex-author", "", "with --vex-out, the OpenVEX author to record on the statements (required)")
-		failOnSev  = flag.String("fail-on", "", "exit 3 if any counted finding is at or above this severity: "+
+		vexOut     = flag.String("vex-out", "", "write not_affected VEX documents for ruled-out findings into this directory, laid out as a VEX hub")
+		vexAuthor  = flag.String("vex-author", "", "with --vex-out, the author to record on the statements (required)")
+		vexFormat  = flag.String("vex-format", "openvex", "with --vex-out, the serialisation to write: openvex or csaf")
+		vexPubNS   = flag.String("vex-publisher-namespace", "", "with --vex-format csaf, the URI identifying the publisher, e.g. 'https://acme.example' (required)")
+		vexPubCat  = flag.String("vex-publisher-category", "", "with --vex-format csaf, the CSAF publisher category: "+
+			strings.Join(csaf.PublisherCategories, ", ")+" (default other)")
+		failOnSev = flag.String("fail-on", "", "exit 3 if any counted finding is at or above this severity: "+
 			strings.Join(cvss.Labels, ", ")+", or 'any' (off by default; see --fail-on-status)")
 		failOnStat  = flag.String("fail-on-status", "", "which findings --fail-on weighs: affected, undetermined, vexed, cleared, or 'all' (default affected)")
 		colorMode   = flag.String("color", "auto", "colourise the text report: auto, always, never")
@@ -148,7 +153,7 @@ func main() {
 	}
 	// Caught here so a missing author is a command-line error before the scan,
 	// not after it.
-	if err := checkVexOut(*vexOut, *vexAuthor); err != nil {
+	if err := checkVexOut(*vexOut, *vexAuthor, *vexFormat, *vexPubNS, *vexPubCat); err != nil {
 		fail("%v", err)
 	}
 	// Canonicalized here, and strictly, so that a typo is a command-line error
@@ -348,20 +353,23 @@ func main() {
 
 	if batchMode {
 		runBatch(ctx, batchRun{
-			opts:    opts,
-			images:  images,
-			format:  *format,
-			render:  ropts,
-			out:     *out,
-			noPager: *noPager,
-			gist:    *gistFlag,
-			gistPub: !*gistSecret,
-			vexOut:  *vexOut,
-			vexHubs: vexhubs,
-			vexAuth: *vexAuthor,
-			gate:    gate,
-			started: started,
-			logf:    logf,
+			opts:      opts,
+			images:    images,
+			format:    *format,
+			render:    ropts,
+			out:       *out,
+			noPager:   *noPager,
+			gist:      *gistFlag,
+			gistPub:   !*gistSecret,
+			vexOut:    *vexOut,
+			vexHubs:   vexhubs,
+			vexAuth:   *vexAuthor,
+			vexFmt:    *vexFormat,
+			vexPubNS:  *vexPubNS,
+			vexPubCat: *vexPubCat,
+			gate:      gate,
+			started:   started,
+			logf:      logf,
 		})
 		return // runBatch owns the exit status
 	}
@@ -443,6 +451,9 @@ func main() {
 		if err := runVexOut(ctx, res, vexOutOptions{
 			dir:       *vexOut,
 			author:    *vexAuthor,
+			format:    *vexFormat,
+			pubNS:     *vexPubNS,
+			pubCat:    *vexPubCat,
 			hubs:      vexhubs,
 			timestamp: started.UTC().Format(time.RFC3339),
 			logf:      logf,
@@ -810,7 +821,7 @@ var flagGroups = []struct {
 	{"Container image", []string{"os", "arch", "module-version"}},
 	{"Reachability", []string{"roots", "dlopen-policy", "dynamic-import-policy", "trust-import-absence"}},
 	{"Advisory sources", []string{"osv-url", "osv-dir", "osv-ecosystem", "prefer-vendor", "distro-feeds"}},
-	{"VEX", []string{"vexhub", "vex-out", "vex-author"}},
+	{"VEX", []string{"vexhub", "vex-out", "vex-author", "vex-format", "vex-publisher-namespace", "vex-publisher-category"}},
 	{"Triage", []string{"triage"}},
 	{"LLM exploitability", []string{"llm", "llm-endpoint", "llm-model", "llm-command", "mine-advisories", "rpm-deep"}},
 	{"Output", []string{"format", "details", "out", "color", "no-pager", "quiet", "gist", "gist-secret"}},

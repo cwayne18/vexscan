@@ -94,14 +94,22 @@ func (idx *indexFile) location(product string) (string, bool) {
 
 // ensure adds a product to the index if it is not already there, returning the
 // location it should be written to and whether the index changed.
-func (idx *indexFile) ensure(product string) (location string, changed bool, err error) {
+//
+// fileName is the name the chosen format's documents are stored under, and it
+// only applies to a product the index does not carry. A product the index
+// already points somewhere keeps that location whatever format is being
+// written: the VEX Repository index maps a product to one document, so a hub
+// that files a product as OpenVEX has no room for a second CSAF one beside it.
+// The encoder sees the existing bytes and declines, which is a reported
+// no-change rather than a competing document the hub would never read.
+func (idx *indexFile) ensure(product, fileName string) (location string, changed bool, err error) {
 	if loc, ok := idx.location(product); ok {
 		if err := checkHubLocation(loc); err != nil {
 			return "", false, err
 		}
 		return loc, false, nil
 	}
-	loc, err := productLocation(product)
+	loc, err := productLocation(product, fileName)
 	if err != nil {
 		return "", false, err
 	}
@@ -167,76 +175,4 @@ func decodeKey(purl string) string {
 	name, _ := splitQualifiers(body)
 	repo := repositoryURL(body)
 	return fmt.Sprintf("pkg:oci/%s?repository_url=%s", name, repo)
-}
-
-// mergeStatements adds a proposal's statements to a document, skipping any the
-// document already answers, and returns how many were actually new.
-//
-// A statement is considered already present when the document holds one for the
-// same vulnerability (by name or alias, case-insensitively) that covers the same
-// subcomponent -- either by naming it or by covering the whole product. That is
-// the same notion of "covers" the reader matches on, so a merge never adds a
-// second statement the reader would treat as a duplicate of an existing one.
-//
-// The document's top-level timestamp is advanced only when something was added,
-// so a re-run that changes nothing produces no diff.
-func mergeStatements(doc *Doc, prop ProductProposal, author, timestamp string) int {
-	var added int
-	for _, st := range prop.Statements {
-		if documentCovers(doc, prop.Product, st) {
-			continue
-		}
-		doc.Statements = append(doc.Statements, st)
-		added++
-	}
-	if added > 0 {
-		doc.Timestamp = timestamp
-		if doc.Author == "" {
-			doc.Author = author
-		}
-	}
-	return added
-}
-
-// documentCovers reports whether the document already has a statement that would
-// make the proposed one redundant.
-func documentCovers(doc *Doc, product string, want Statement) bool {
-	wantIDs := append([]string{want.Vulnerability.Name}, want.Vulnerability.Aliases...)
-	wantSub := subcomponentID(want)
-	for _, s := range doc.Statements {
-		if !sharesVuln(s.Vulnerability, wantIDs) {
-			continue
-		}
-		for _, p := range s.Products {
-			if decodeKey(p.ID) != decodeKey(product) {
-				continue
-			}
-			if len(p.Subcomponents) == 0 {
-				return true // product-wide statement covers any subcomponent
-			}
-			for _, sc := range p.Subcomponents {
-				if sc.ID == wantSub {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
-// sharesVuln reports whether an existing vulnerability names any of the wanted
-// ids, comparing case-insensitively across name, @id and aliases.
-func sharesVuln(v Vulnerability, wantIDs []string) bool {
-	have := append([]string{v.Name, v.ID}, v.Aliases...)
-	for _, w := range wantIDs {
-		if w == "" {
-			continue
-		}
-		for _, h := range have {
-			if h != "" && strings.EqualFold(h, w) {
-				return true
-			}
-		}
-	}
-	return false
 }

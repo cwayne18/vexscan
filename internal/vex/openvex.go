@@ -1,5 +1,12 @@
-// Package vex reads OpenVEX documents from a VEX Hub repository and matches
-// their statements against findings.
+// Package vex reads VEX documents from a VEX Hub repository and matches their
+// statements against findings.
+//
+// Two serialisations are read, OpenVEX and CSAF-VEX, and the difference between
+// them stops at ParseDoc: both decode into the Doc below, so Match and every
+// caller past it never learn which one a hub published. The formats agree
+// exactly on the two vocabularies that matter -- the four statuses and the five
+// justification labels -- and disagree only about how a product is named, which
+// the CSAF reader resolves before anything downstream sees it.
 //
 // A VEX hub is a vendor saying, in public and in a machine-readable form, "we
 // looked at this CVE in this product and here is what we concluded". vexscan
@@ -25,9 +32,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/cwayne18/vexscan/internal/csaf"
 )
 
-// VEX statuses, as OpenVEX defines them.
+// VEX statuses. OpenVEX and CSAF spell these identically, which is why nothing
+// past the parse has to know which format a statement came from.
 const (
 	StatusNotAffected        = "not_affected"
 	StatusAffected           = "affected"
@@ -109,12 +119,28 @@ type wireDoc struct {
 	} `json:"statements"`
 }
 
-// ParseDoc decodes an OpenVEX document.
+// ParseDoc decodes a VEX document, in whichever serialisation it is written in.
+//
+// The format is sniffed, not declared. Both are JSON and both say what they are
+// -- an @context pointing at openvex.dev, a document.csaf_version -- so a flag
+// asking the operator which one a hub uses would add nothing but a way to get
+// it wrong, and would not survive a hub holding a mixture. Bytes that are
+// neither are decoded as OpenVEX: that was the right reading before CSAF was
+// understood here, and it stays right for a hub whose documents omit the
+// context.
+func ParseDoc(b []byte) (*Doc, error) {
+	if csaf.Looks(b) {
+		return parseCSAF(b)
+	}
+	return parseOpenVEX(b)
+}
+
+// parseOpenVEX decodes an OpenVEX document.
 //
 // A statement naming no vulnerability or no product cannot be matched against
 // anything, so it is dropped rather than carried as an entry that silently
 // never fires.
-func ParseDoc(b []byte) (*Doc, error) {
+func parseOpenVEX(b []byte) (*Doc, error) {
 	var w wireDoc
 	if err := json.Unmarshal(b, &w); err != nil {
 		return nil, fmt.Errorf("vex: parse document: %w", err)

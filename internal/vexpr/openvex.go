@@ -1,26 +1,12 @@
-// Package vexpr writes OpenVEX documents recording the findings vexscan ruled
-// out, laid out as a VEX Hub repository so they can be contributed to one.
-//
-// It is the write counterpart to internal/vex, which only reads. The split is
-// deliberate and matches the invariant that package documents: nothing that
-// reaches a verdict may also publish one. vexpr never touches a finding's
-// status -- it reads the verdict local evidence already produced and serialises
-// the ruled-out ones into the format a hub distributes, so the documents say
-// exactly what the scan said and nothing the scan did not.
-//
-// It writes to a directory and stops there. Getting those files into a hub is a
-// pull request against somebody else's repository, and that is git's job and
-// gh's job: they already handle forks, signing, branch protection and the
-// review itself, and a hand-rolled API client handles none of them. Splitting
-// there also puts a human in front of the diff, which for a statement that
-// tells other people's scanners to stop reporting a vulnerability is the point
-// rather than an inconvenience.
 package vexpr
 
 import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
+
+	"github.com/cwayne18/vexscan/internal/csaf"
 )
 
 // OpenVEX statuses and the context vexscan writes. Only not_affected is emitted
@@ -32,6 +18,48 @@ const (
 
 	StatusNotAffected = "not_affected"
 )
+
+// openVEXFileName is what a product's OpenVEX document is called in the hub,
+// per the VEX Repository layout internal/vex documents.
+const openVEXFileName = "scan.openvex.json"
+
+// openvexEncoder writes the OpenVEX serialisation.
+type openvexEncoder struct{}
+
+func (openvexEncoder) fileName() string { return openVEXFileName }
+
+// merge appends the proposal's claims to the hub's document, or builds a fresh
+// one when the hub has none.
+//
+// Bytes that are a CSAF document are declined rather than merged into. Nothing
+// in the OpenVEX decode below would object to one -- it would parse as a valid
+// document with no statements, and the merge would then graft an OpenVEX
+// statements array onto somebody's CSAF advisory and write it back. That
+// silently corrupts a file the hub publishes, so the format is checked before
+// the parse rather than trusted to fail.
+func (e openvexEncoder) merge(raw []byte, prop ProductProposal, meta Meta) ([]byte, []string, error) {
+	doc := NewDoc(meta.Author, meta.Timestamp)
+	if len(bytes.TrimSpace(raw)) > 0 {
+		if csaf.Looks(raw) {
+			return nil, nil, decline("it is a CSAF document; re-run with --vex-format csaf to add to it")
+		}
+		parsed, ok := ParseDoc(raw)
+		if !ok {
+			return nil, nil, errUnreadable
+		}
+		doc = parsed
+	}
+
+	added := mergeClaims(doc, prop, meta)
+	if len(added) == 0 {
+		return nil, nil, nil
+	}
+	content, err := doc.Marshal()
+	if err != nil {
+		return nil, nil, err
+	}
+	return content, added, nil
+}
 
 // Doc is an OpenVEX document as it is written to a hub.
 //
@@ -67,61 +95,6 @@ type Doc struct {
 	// layout is how the file it was parsed from was formatted, so re-emitting
 	// it does not reflow lines nothing changed.
 	layout layout
-}
-
-// layout is the whitespace of a JSON file this package rewrites: enough to put
-// back what was there rather than what encoding/json would have chosen.
-//
-// It exists because the diff is the product. A one-statement change to
-// rancher/vexhub's 4381-line index should be four added lines; re-indenting to
-// this package's taste would make it 4381 changed lines and bury the thing a
-// maintainer is being asked to review. Two spaces and a trailing newline are
-// the defaults, matching every published hub seen so far, and a file that
-// disagrees keeps its own.
-type layout struct {
-	indent  string
-	lastNL  bool
-	learned bool
-}
-
-// defaultLayout is what a file created here looks like.
-func defaultLayout() layout { return layout{indent: "  ", lastNL: true, learned: true} }
-
-// detectLayout reads a JSON file's formatting off the file.
-//
-// The indent is the leading whitespace of the first indented line, which is how
-// an indent unit is expressed in a pretty-printed object; a file that is not
-// pretty-printed leaves it empty and is re-emitted the same way.
-func detectLayout(b []byte) layout {
-	l := layout{lastNL: bytes.HasSuffix(b, []byte("\n")), learned: true}
-	for _, line := range bytes.Split(b, []byte("\n"))[1:] {
-		trimmed := bytes.TrimLeft(line, " \t")
-		if len(trimmed) == 0 {
-			continue
-		}
-		l.indent = string(line[:len(line)-len(trimmed)])
-		break
-	}
-	return l
-}
-
-// render pretty-prints compact JSON in this layout.
-func (l layout) render(compact []byte) ([]byte, error) {
-	if !l.learned {
-		l = defaultLayout()
-	}
-	out := compact
-	if l.indent != "" {
-		var buf bytes.Buffer
-		if err := json.Indent(&buf, compact, "", l.indent); err != nil {
-			return nil, err
-		}
-		out = buf.Bytes()
-	}
-	if l.lastNL {
-		out = append(out, '\n')
-	}
-	return out, nil
 }
 
 // docShape is the typed on-wire form of a Doc, used to marshal a freshly built
@@ -201,19 +174,6 @@ func (s Statement) MarshalJSON() ([]byte, error) {
 		ActionStatement: s.ActionStatement,
 		Timestamp:       s.Timestamp,
 	})
-}
-
-// marshalNoEscape renders v as compact JSON without HTML-escaping &, < and >, so
-// preserved bytes and URLs round-trip unchanged instead of turning into \u00xx
-// escapes that would show up as spurious diff noise on untouched vendor lines.
-func marshalNoEscape(v any) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return nil, err
-	}
-	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
 // Vulnerability is the id a statement is filed under plus every alias it is also
@@ -356,98 +316,92 @@ func (d *Doc) Marshal() ([]byte, error) {
 	return out, nil
 }
 
-// setRawField sets a field's value, appending its key to order only if it was
-// not already present so existing keys keep their position.
-func setRawField(order []string, fields map[string]json.RawMessage, key string, val json.RawMessage) []string {
-	if _, ok := fields[key]; !ok {
-		order = append(order, key)
-	}
-	fields[key] = val
-	return order
-}
-
-// marshalOrderedObject renders a JSON object with its keys in the given order,
-// writing each field's raw value verbatim.
-func marshalOrderedObject(order []string, fields map[string]json.RawMessage) ([]byte, error) {
-	var buf bytes.Buffer
-	buf.WriteByte('{')
-	seen := make(map[string]bool, len(order))
-	first := true
-	for _, k := range order {
-		v, ok := fields[k]
-		if !ok || seen[k] {
+// mergeClaims adds a proposal's claims to a document, skipping any the document
+// already answers, and returns the vulnerabilities that were actually new.
+//
+// A claim is considered already present when the document holds a statement for
+// the same vulnerability (by name or alias, case-insensitively) that covers the
+// same subcomponent -- either by naming it or by covering the whole product.
+// That is the same notion of "covers" the reader matches on, so a merge never
+// adds a second statement the reader would treat as a duplicate of an existing
+// one.
+//
+// The document's top-level timestamp is advanced only when something was added,
+// so a re-run that changes nothing produces no diff.
+func mergeClaims(doc *Doc, prop ProductProposal, meta Meta) []string {
+	var added []string
+	for _, c := range prop.Claims {
+		if documentCovers(doc, prop.Product, c) {
 			continue
 		}
-		seen[k] = true
-		if !first {
-			buf.WriteByte(',')
-		}
-		first = false
-		kb, err := json.Marshal(k)
-		if err != nil {
-			return nil, err
-		}
-		buf.Write(kb)
-		buf.WriteByte(':')
-		buf.Write(v)
+		doc.Statements = append(doc.Statements, claimStatement(c))
+		added = append(added, c.Vuln)
 	}
-	buf.WriteByte('}')
-	return buf.Bytes(), nil
+	if len(added) > 0 {
+		doc.Timestamp = meta.Timestamp
+		if doc.Author == "" {
+			doc.Author = meta.Author
+		}
+	}
+	return added
 }
 
-// objectKeyOrder returns the top-level keys of a JSON object in the order they
-// appear, so a re-marshaled document keeps the original field order.
-func objectKeyOrder(b []byte) ([]string, error) {
-	dec := json.NewDecoder(bytes.NewReader(b))
-	tok, err := dec.Token()
-	if err != nil {
-		return nil, err
+// claimStatement is the OpenVEX statement a claim becomes. The mapping is
+// one-to-one, which is what OpenVEX being the format this package grew up
+// writing amounts to.
+func claimStatement(c Claim) Statement {
+	prod := Product{ID: c.Product}
+	if c.Subcomponent != "" {
+		prod.Subcomponents = []Subcomponent{{ID: c.Subcomponent}}
 	}
-	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
-		return nil, nil
+	return Statement{
+		Vulnerability:   Vulnerability{Name: c.Vuln, Aliases: c.Aliases},
+		Products:        []Product{prod},
+		Status:          c.Status,
+		Justification:   c.Justification,
+		ImpactStatement: c.Impact,
+		Timestamp:       c.Timestamp,
 	}
-	var keys []string
-	for dec.More() {
-		keyTok, err := dec.Token()
-		if err != nil {
-			return nil, err
-		}
-		key, ok := keyTok.(string)
-		if !ok {
-			return nil, fmt.Errorf("vexpr: unexpected object key %v", keyTok)
-		}
-		keys = append(keys, key)
-		if err := skipJSONValue(dec); err != nil {
-			return nil, err
-		}
-	}
-	return keys, nil
 }
 
-// skipJSONValue consumes the next value from dec, descending through nested
-// objects and arrays so the decoder is left positioned after it.
-func skipJSONValue(dec *json.Decoder) error {
-	tok, err := dec.Token()
-	if err != nil {
-		return err
-	}
-	delim, ok := tok.(json.Delim)
-	if !ok || (delim != '{' && delim != '[') {
-		return nil
-	}
-	depth := 1
-	for depth > 0 {
-		t, err := dec.Token()
-		if err != nil {
-			return err
+// documentCovers reports whether the document already has a statement that would
+// make the proposed claim redundant.
+func documentCovers(doc *Doc, product string, want Claim) bool {
+	wantIDs := append([]string{want.Vuln}, want.Aliases...)
+	for _, s := range doc.Statements {
+		if !sharesVuln(s.Vulnerability, wantIDs) {
+			continue
 		}
-		if d, ok := t.(json.Delim); ok {
-			if d == '{' || d == '[' {
-				depth++
-			} else {
-				depth--
+		for _, p := range s.Products {
+			if decodeKey(p.ID) != decodeKey(product) {
+				continue
+			}
+			if len(p.Subcomponents) == 0 {
+				return true // product-wide statement covers any subcomponent
+			}
+			for _, sc := range p.Subcomponents {
+				if sc.ID == want.Subcomponent {
+					return true
+				}
 			}
 		}
 	}
-	return nil
+	return false
+}
+
+// sharesVuln reports whether an existing vulnerability names any of the wanted
+// ids, comparing case-insensitively across name, @id and aliases.
+func sharesVuln(v Vulnerability, wantIDs []string) bool {
+	have := append([]string{v.Name, v.ID}, v.Aliases...)
+	for _, w := range wantIDs {
+		if w == "" {
+			continue
+		}
+		for _, h := range have {
+			if h != "" && strings.EqualFold(h, w) {
+				return true
+			}
+		}
+	}
+	return false
 }
