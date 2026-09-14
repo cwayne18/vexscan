@@ -281,6 +281,12 @@ target. An image that could not be pulled says nothing about the thirty-nine
 read cleanly, so their statements are still written and the incomplete ones are
 skipped with a line on stderr saying so.
 
+The *write*, though, happens once for the whole run rather than once per image.
+Each image is still its own product with its own document — nothing is pooled
+that the hub keeps apart — but the hub is read once, the index resolved once and
+any [merged report](#merged-master-reports---vex-merge-into) rewritten once, so
+the cost of contributing a fleet is one hub round-trip, not forty.
+
 ## Scanning a filesystem instead of an image (`--rootfs`)
 
 `--rootfs DIR` runs everything image mode runs, against a tree already on disk:
@@ -2161,7 +2167,9 @@ rating on its absence.
 every finding this scan **ruled out** — the `RULED OUT` section, where the
 vulnerable code is not present or cannot run — into a `not_affected` statement,
 and lays the documents out in a directory as a VEX hub. OpenVEX by default,
-CSAF 2.0 with [`--vex-format csaf`](#writing-csaf-instead---vex-format).
+CSAF 2.0 with [`--vex-format csaf`](#writing-csaf-instead---vex-format), and for
+a hub that also keeps one merged report of everything,
+[`--vex-merge-into`](#merged-master-reports---vex-merge-into).
 
 It writes files and stops there. Getting them into somebody else's hub is a pull
 request, and that is git's job and `gh`'s job — both of which already know about
@@ -2221,6 +2229,79 @@ how vexscan reached the verdict.
 No token is needed: `--vex-out` writes to the filesystem, and every read of the
 hub goes over the same read-only path `--vexhub` already uses, so a local
 directory, a raw base URL and a `github.com` URL all work as the merge base.
+
+#### Merged "master" reports (`--vex-merge-into`)
+
+Some hubs publish, alongside the per-product tree, one document with *every*
+product's statements merged into it — [rancher/vexhub](https://github.com/rancher/vexhub)
+has three under `reports/`. A CI run that scans thirty images hands its scanner
+one `--vex reports/rancher.openvex.json` rather than assembling thirty
+documents, which is the whole reason the file exists. It is also the file most
+consumers actually read, so a contribution that updates `pkg/` and leaves it
+behind is a contribution that changes nothing for them.
+
+`--vex-merge-into` adds every statement to it as well:
+
+```sh
+vexscan --images-from fleet.txt --all \
+  --vexhub ./vexhub \
+  --vex-out ./vexhub \
+  --vex-author 'Acme Security' \
+  --vex-merge-into reports/rancher.openvex.json
+```
+
+```
+vex-out: wrote 41 statement(s) across 12 product(s) to ./vexhub
+  …
+  reports/rancher.openvex.json: +41 statement(s) across 12 product(s), merged
+```
+
+The merge is the same byte-preserving one the per-product documents get, which
+matters more here than anywhere else: rancher's merged report is 127 MB of
+statements on a single line, and it comes back out as 127 MB on a single line
+with the statements appended and `timestamp` moved. The hub's own `@id`,
+`author` and `version` are left alone — you are adding to their document, not
+reissuing it — and dedupe runs against everything already in it, so a claim the
+merged report already carries is not written a second time even when the
+per-product document is missing it.
+
+- **Aggregates are named, never discovered.** Nothing in the VEX Repository
+  spec describes them; `index.json` maps a product to one document, and none of
+  rancher's merged reports appear in it. From the outside they are
+  indistinguishable from any other JSON in the tree, so vexscan will not guess —
+  look in the hub, and pass the path. The flag is repeatable for a hub that
+  publishes several.
+- **They are never added to `index.json`.** Indexing one would tell every reader
+  that the merged report is *the* document for some single product, which is
+  exactly what it is not.
+- **A named aggregate that cannot be written fails the run,** where an
+  unreadable per-product document is warned about and stepped over. The
+  difference is who chose the file: you named this one because the contribution
+  is not useful without it. Nothing is on disk when the check runs, so the exit
+  leaves the clone untouched rather than half updated. The three cases are a
+  path the hub does not publish (usually a typo), a file that is not an OpenVEX
+  document, and an unfetched Git LFS pointer:
+
+  ```
+  error: vex-out: vexpr: --vex-merge-into reports/rancher.openvex.json: it is an
+  unfetched Git LFS pointer, not the document it stands for; fetch it
+  (git lfs pull --include=<path>) and re-run
+  ```
+
+- **CSAF has no shape for one.** A CSAF advisory is identified by
+  `document.tracking.id`, revised as a unit and attributed to one publisher, so
+  one holding every product's claims would be claiming authority over all of
+  them at once. `--vex-merge-into` with `--vex-format csaf` is a command-line
+  error (exit 2), not a silent no-op.
+
+`contrib/vexhub-pr.sh --merge-into PATH` does the same thing through the PR
+flow, and takes care of the LFS side: it clones with `GIT_LFS_SKIP_SMUDGE=1`,
+then fetches just the aggregates you named, so a 127 MB object is pulled only
+when you are actually merging into it. It excludes them from the diff it prints
+for review — a one-line 127 MB file has no reviewable diff — and lists them in
+the PR body instead. Worth knowing before you open the PR: **each such PR pushes
+a fresh copy of the whole object**, and that counts against the hub's Git LFS
+storage and bandwidth quota. The script says so before it asks.
 
 #### Writing CSAF instead (`--vex-format`)
 
@@ -2498,6 +2579,7 @@ Three properties are deliberate:
 | `--vex-out` | | Write `not_affected` documents for the findings ruled out into this directory, laid out as a VEX hub; with `--vexhub` they are merged into what that hub publishes, so it can be a clone of it — see [Contributing ruled-out findings back](#contributing-ruled-out-findings-back---vex-out) |
 | `--vex-author` | | With `--vex-out`, the author to record on the statements — **required**, and an error without `--vex-out` |
 | `--vex-format` | `openvex` | With `--vex-out`, the serialisation to write: `openvex` or `csaf`. A hub indexes one document per product, so a product the hub already publishes in the other format is left untouched with a `warning:` — see [Writing CSAF instead](#writing-csaf-instead---vex-format) |
+| `--vex-merge-into` | | With `--vex-out`, also add every statement to this merged "master" document in the hub, e.g. `reports/rancher.openvex.json`; repeatable, never added to `index.json`, OpenVEX only. A named aggregate that cannot be written fails the run — see [Merged "master" reports](#merged-master-reports---vex-merge-into) |
 | `--vex-publisher-namespace` | | With `--vex-format csaf`, the URI identifying the publisher, e.g. `https://acme.example` — **required** for CSAF, and an error without it |
 | `--vex-publisher-category` | `other` | With `--vex-format csaf`, the CSAF publisher category: `coordinator`, `discoverer`, `other`, `translator`, `user`, `vendor` |
 | `--severity` | *(all)* | Only report findings at these severities: `CRITICAL`, `HIGH`, `UNKNOWN`, `MEDIUM`, `LOW`, `NONE`; comma-separated or repeatable. `UNKNOWN` must be named to be shown — see [Filtering by severity](#filtering-by-severity---severity) |
@@ -2573,7 +2655,9 @@ over the same read-only path `--vexhub` uses.
 - Network access for OSV lookups, and for `--repo` cloning
 - `GITHUB_TOKEN` / `GH_TOKEN` for `--gist`
 - `git` and an authenticated `gh` — only for `contrib/vexhub-pr.sh`, which turns
-  a `--vex-out` directory into a pull request. `--vex-out` itself needs neither
+  a `--vex-out` directory into a pull request. `--vex-out` itself needs neither.
+  Add [`git-lfs`](https://git-lfs.com) for `--merge-into` against a hub that
+  stores its merged report in LFS, as rancher/vexhub does
 - An LLM provider for `--llm` — an endpoint and key, a local model, or an
   installed CLI. See [Choosing a provider](#choosing-a-provider); there is no
   default and nothing is required unless you pass `--llm`.

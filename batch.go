@@ -95,12 +95,7 @@ type batchRun struct {
 	noPager   bool
 	gist      bool
 	gistPub   bool
-	vexOut    string
-	vexHubs   []string
-	vexAuth   string
-	vexFmt    string
-	vexPubNS  string
-	vexPubCat string
+	vexOpts   vexOutOptions // timestamp and logf are filled in per run below
 	gate      failOn
 	started   time.Time
 	logf      func(string, ...any)
@@ -129,7 +124,8 @@ func runBatch(ctx context.Context, r batchRun) {
 		fmt.Println(url)
 	}
 
-	// --vex-out is decided per image, not per batch.
+	// Whether an image is eligible for --vex-out is decided per image; the
+	// writing is then done once for the batch.
 	//
 	// The single-image rule is that a scan with holes in it must not have
 	// not_affected statements written from it, because the component it failed
@@ -137,27 +133,31 @@ func runBatch(ctx context.Context, r batchRun) {
 	// That rule is about one target. An image that could not be pulled says
 	// nothing about the thirty-nine that were read cleanly, and withholding
 	// their statements would not make anything safer -- it would just make the
-	// flag useless on any fleet with one bad entry in it.
+	// flag useless on any fleet with one bad entry in it. So the incomplete ones
+	// are dropped here and the rest are proposed together.
+	//
+	// Together rather than one at a time because the cost of the hub is paid per
+	// call, not per image: the index is parsed once, and a merged "master"
+	// document named by --vex-merge-into is rewritten once for the run instead
+	// of once for every image in the list.
 	//
 	// It runs before the failures are reported for the same reason the report
 	// is written before them: the work that succeeded is still worth having.
-	if r.vexOut != "" {
+	if r.vexOpts.dir != "" {
+		vexOpts := r.vexOpts
+		vexOpts.timestamp = r.started.UTC().Format(time.RFC3339)
+		vexOpts.logf = r.logf
+		complete := make([]*analyze.Result, 0, len(br.Results))
 		for _, res := range br.Results {
 			if res.Failed() {
 				r.logf("Skipping --vex-out for %s: its scan did not complete", res.Target)
 				continue
 			}
-			if err := runVexOut(ctx, res, vexOutOptions{
-				dir:       r.vexOut,
-				author:    r.vexAuth,
-				format:    r.vexFmt,
-				pubNS:     r.vexPubNS,
-				pubCat:    r.vexPubCat,
-				hubs:      r.vexHubs,
-				timestamp: r.started.UTC().Format(time.RFC3339),
-				logf:      r.logf,
-			}); err != nil {
-				fmt.Fprintf(os.Stderr, "error: vex-out %s: %v\n", res.Target, err)
+			complete = append(complete, res)
+		}
+		if len(complete) > 0 {
+			if err := runVexOut(ctx, complete, vexOpts); err != nil {
+				fmt.Fprintf(os.Stderr, "error: vex-out: %v\n", err)
 				os.Exit(1)
 			}
 		}

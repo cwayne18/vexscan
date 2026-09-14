@@ -18,6 +18,13 @@
 #     --author 'Acme Security' \
 #     -- --image rancher/hardened-kubernetes:v1.34.10-rke2r1-build20260724 --all
 #
+# A fleet, contributed to a hub that also keeps a merged "master" report:
+#   contrib/vexhub-pr.sh \
+#     --hub rancher/vexhub \
+#     --author 'Acme Security' \
+#     --merge-into reports/rancher.openvex.json \
+#     -- --images-from fleet.txt --all
+#
 # Options:
 #   --hub OWNER/REPO   the hub to contribute to (required)
 #   --author NAME      the VEX author to record (required)
@@ -32,6 +39,12 @@
 #                      with --format csaf, the CSAF publisher category:
 #                      coordinator, discoverer, other, translator, user, vendor
 #                      (default other)
+#   --merge-into PATH  also add every statement to this merged "master" document
+#                      in the hub, e.g. reports/rancher.openvex.json; repeatable.
+#                      Some hubs publish one alongside the per-product tree so a
+#                      CI run scanning a fleet can pass a scanner a single --vex.
+#                      They are not listed in index.json -- look in the hub for
+#                      the path, and pick deliberately when it publishes several
 #   --fork OWNER/REPO  push the branch to this fork instead of to the hub. Only
 #                      needed to name a specific one: without it the branch goes
 #                      to the hub when you can push there, and to a fork of your
@@ -42,6 +55,7 @@
 #                      reviewed the diff some other way)
 #
 # Requires: vexscan, git, gh (authenticated: gh auth login).
+# With --merge-into, also git-lfs when the hub stores that document in LFS.
 
 set -euo pipefail
 
@@ -53,6 +67,7 @@ author=""
 format="openvex"
 pub_ns=""
 pub_cat=""
+merge_into=()
 fork=""
 workdir=""
 assume_yes=0
@@ -69,6 +84,7 @@ while [ $# -gt 0 ]; do
 		--format)  format="${2:-}"; shift 2 ;;
 		--publisher-namespace) pub_ns="${2:-}"; shift 2 ;;
 		--publisher-category)  pub_cat="${2:-}"; shift 2 ;;
+		--merge-into) merge_into+=("${2:-}"); shift 2 ;;
 		--fork)    fork="${2:-}"; shift 2 ;;
 		--workdir) workdir="${2:-}"; shift 2 ;;
 		--yes)     assume_yes=1; shift ;;
@@ -118,14 +134,45 @@ trap on_exit EXIT
 # A stale clone is the failure this whole flow is most likely to hit: a branch
 # based on an out-of-date default reverts everything the hub merged since. Clone
 # fresh, and sync a fork before basing anything on it.
+#
+# The smudge filter is off for the clone and the objects this run needs are
+# pulled back individually below. A hub that publishes a merged report stores it
+# in Git LFS -- rancher/vexhub's is 121 MB, beside 150 MB of CSVs -- and letting
+# the clone smudge everything would download all of it to rewrite one file.
 note "cloning $hub"
-gh repo clone "$hub" "$clone" -- --depth 1 --quiet
+GIT_LFS_SKIP_SMUDGE=1 gh repo clone "$hub" "$clone" -- --depth 1 --quiet
 if [ -n "$fork" ]; then
 	note "syncing $fork with $hub"
 	gh repo sync "$fork" --source "$hub" >/dev/null
 fi
 
 [ -f "$clone/index.json" ] || die "$hub has no index.json; is it a VEX hub?"
+
+# is_lfs_pointer reports whether a file is the 133 bytes that name an LFS object
+# rather than the object itself. 42 characters is the pointer's first line.
+is_lfs_pointer() {
+	[ -f "$1" ] && [ "$(head -c 42 "$1" 2>/dev/null)" = "version https://git-lfs.github.com/spec/v1" ]
+}
+
+# Fetch each aggregate, and refuse to go on without it.
+#
+# Merging into a pointer is the one mistake in this flow that is both easy and
+# unrecoverable in review: the result is a small JSON file where a 121 MB merged
+# report used to be, in a pull request that otherwise looks entirely normal.
+# vexscan refuses it too -- this is the check that says so before the scan
+# rather than after it.
+for p in ${merge_into[@]+"${merge_into[@]}"}; do
+	[ -f "$clone/$p" ] || die "$hub has no $p; aggregates are not listed in index.json, so check the path against the repository"
+	is_lfs_pointer "$clone/$p" || continue
+	git lfs version >/dev/null 2>&1 || die "$p is stored in Git LFS and git-lfs is not installed; get it from https://git-lfs.com and re-run"
+	# --local so this configures the clone and not the machine.
+	git -C "$clone" lfs install --local >/dev/null
+	note "fetching $p from LFS"
+	git -C "$clone" lfs pull --include="$p" >/dev/null
+	if is_lfs_pointer "$clone/$p"; then
+		die "git lfs pull did not fetch $p; it is still a pointer"
+	fi
+done
 
 # The publisher flags are passed through only when given, and none of these
 # combinations are checked here: vexscan validates them before it pulls
@@ -138,6 +185,9 @@ fi
 if [ -n "$pub_cat" ]; then
 	scan_flags+=(--vex-publisher-category "$pub_cat")
 fi
+for p in ${merge_into[@]+"${merge_into[@]}"}; do
+	scan_flags+=(--vex-merge-into "$p")
+done
 
 # Merge against the clone and write back into it, so the result is a git diff.
 #
@@ -172,8 +222,33 @@ fi
 printf '\n'
 git -C "$clone" --no-pager diff --cached --stat
 printf '\n'
-git -C "$clone" --no-pager diff --cached
+
+# Aggregates are kept out of the printed diff.
+#
+# A merged report is marked binary in .gitattributes (LFS sets -text), so git
+# renders it as one "Binary files differ" line whatever is asked of it -- and a
+# 121 MB minified document on a single line has nothing reviewable in it anyway.
+# What is reviewable is the list of statements vexscan printed above, which is
+# the same list that went into the aggregate. Excluding it keeps the per-product
+# diff -- the part a human can actually read -- from being the thing that scrolls
+# past.
+exclude_aggregates=()
+for p in ${merge_into[@]+"${merge_into[@]}"}; do
+	exclude_aggregates+=(":(exclude)$p")
+done
+git -C "$clone" --no-pager diff --cached -- . ${exclude_aggregates[@]+"${exclude_aggregates[@]}"}
 printf '\n'
+
+if [ "${#merge_into[@]}" -gt 0 ]; then
+	for p in "${merge_into[@]}"; do
+		note "merged report updated: $p (not shown above; see the statements vexscan listed)"
+	done
+	# Said before the prompt because it is part of what is being agreed to. A
+	# fresh copy of the whole object is pushed on every pull request, and on
+	# GitHub's free tier a 121 MB aggregate exhausts the 1 GiB monthly bandwidth
+	# allowance in about eight of them.
+	note "note: pushing an LFS object of this size counts against your account's LFS storage and bandwidth quota"
+fi
 
 if [ "$assume_yes" -ne 1 ]; then
 	printf 'vexhub-pr: open a pull request against %s with the above? [y/N] ' "$hub" >&2
@@ -194,6 +269,18 @@ case "$format" in
 	*)    doc_kind="OpenVEX";      reason_field="\`justification\`" ;;
 esac
 
+# A maintainer reading the diff sees a binary file change for an aggregate and
+# no way to tell what went into it, so the body says.
+aggregate_note=""
+if [ "${#merge_into[@]}" -gt 0 ]; then
+	aggregate_note="$(printf '%s\n' "" \
+		"The same statements were also merged into the aggregate report(s) below, so" \
+		"the merged file stays in step with the per-product tree. They are not added" \
+		"to \`index.json\`:" \
+		"" \
+		"$(printf -- "- \`%s\`\n" "${merge_into[@]}")")"
+fi
+
 subject="Add vexscan not_affected statements"
 body="$(cat <<EOF
 Automated by [vexscan](https://github.com/cwayne18/vexscan) ($(vexscan --version)).
@@ -204,6 +291,7 @@ These \`not_affected\` statements record findings vexscan ruled out because the
 vulnerable code is not present or cannot be reached. They are written as
 $doc_kind documents; each carries the $reason_field behind the verdict and a
 sentence saying how the verdict was reached. Review before merging.
+$aggregate_note
 
 Files changed:
 $files

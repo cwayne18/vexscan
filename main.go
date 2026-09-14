@@ -35,13 +35,15 @@ func main() {
 	var versionArg versionFlag
 	flag.Var(&versionArg, "version", "print version and exit (deprecated: =VERSION overrides a module version; use --module-version)")
 
-	var packages, ecosystems, roots, vexhubs, severities, rpms, preferVendors, images stringList
+	var packages, ecosystems, roots, vexhubs, severities, rpms, preferVendors, images, vexMergeInto stringList
 	flag.Var(&images, "image", "container image reference to inspect; repeatable")
 	flag.Var(&packages, "package", "package to check: a purl, an ecosystem:name shorthand (deb:openssl), or a bare name; repeatable")
 	flag.Var(&ecosystems, "ecosystem", "restrict to these ecosystems (golang, os, pypi, npm, maven, or a distro like debian); repeatable")
 	flag.Var(&roots, "roots", "extra entrypoints for the reachability closures when the image config declares none; repeatable")
 	flag.Var(&rpms, "rpm", "rpm file to scan without installing: a path, a directory, or a URL; repeatable (reads only the header)")
 	flag.Var(&vexhubs, "vexhub", "VEX Hub repo, raw URL, or local dir to check findings against; repeatable, earliest wins")
+	flag.Var(&vexMergeInto, "vex-merge-into", "with --vex-out, also add every statement to this merged \"master\" document in the hub, "+
+		"e.g. reports/rancher.openvex.json; repeatable, never added to index.json")
 	flag.Var(&severities, "severity", "only report these severities: "+
 		strings.Join(cvss.Labels, ", ")+"; comma-separated or repeatable (UNKNOWN must be named to be shown)")
 	var (
@@ -153,7 +155,16 @@ func main() {
 	}
 	// Caught here so a missing author is a command-line error before the scan,
 	// not after it.
-	if err := checkVexOut(*vexOut, *vexAuthor, *vexFormat, *vexPubNS, *vexPubCat); err != nil {
+	vexOpts := vexOutOptions{
+		dir:       *vexOut,
+		author:    *vexAuthor,
+		format:    *vexFormat,
+		pubNS:     *vexPubNS,
+		pubCat:    *vexPubCat,
+		mergeInto: vexMergeInto,
+		hubs:      vexhubs,
+	}
+	if err := checkVexOut(vexOpts); err != nil {
 		fail("%v", err)
 	}
 	// Canonicalized here, and strictly, so that a typo is a command-line error
@@ -361,12 +372,7 @@ func main() {
 			noPager:   *noPager,
 			gist:      *gistFlag,
 			gistPub:   !*gistSecret,
-			vexOut:    *vexOut,
-			vexHubs:   vexhubs,
-			vexAuth:   *vexAuthor,
-			vexFmt:    *vexFormat,
-			vexPubNS:  *vexPubNS,
-			vexPubCat: *vexPubCat,
+			vexOpts:   vexOpts,
 			gate:      gate,
 			started:   started,
 			logf:      logf,
@@ -448,16 +454,9 @@ func main() {
 	// gate decides a build's fate, which is unrelated to whether a hub should
 	// learn what was ruled out.
 	if *vexOut != "" {
-		if err := runVexOut(ctx, res, vexOutOptions{
-			dir:       *vexOut,
-			author:    *vexAuthor,
-			format:    *vexFormat,
-			pubNS:     *vexPubNS,
-			pubCat:    *vexPubCat,
-			hubs:      vexhubs,
-			timestamp: started.UTC().Format(time.RFC3339),
-			logf:      logf,
-		}); err != nil {
+		vexOpts.timestamp = started.UTC().Format(time.RFC3339)
+		vexOpts.logf = logf
+		if err := runVexOut(ctx, []*analyze.Result{res}, vexOpts); err != nil {
 			fmt.Fprintf(os.Stderr, "error: vex-out: %v\n", err)
 			os.Exit(1)
 		}
@@ -821,7 +820,8 @@ var flagGroups = []struct {
 	{"Container image", []string{"os", "arch", "module-version"}},
 	{"Reachability", []string{"roots", "dlopen-policy", "dynamic-import-policy", "trust-import-absence"}},
 	{"Advisory sources", []string{"osv-url", "osv-dir", "osv-ecosystem", "prefer-vendor", "distro-feeds"}},
-	{"VEX", []string{"vexhub", "vex-out", "vex-author", "vex-format", "vex-publisher-namespace", "vex-publisher-category"}},
+	{"VEX", []string{"vexhub", "vex-out", "vex-author", "vex-format", "vex-merge-into",
+		"vex-publisher-namespace", "vex-publisher-category"}},
 	{"Triage", []string{"triage"}},
 	{"LLM exploitability", []string{"llm", "llm-endpoint", "llm-model", "llm-command", "mine-advisories", "rpm-deep"}},
 	{"Output", []string{"format", "details", "out", "color", "no-pager", "quiet", "gist", "gist-secret"}},
