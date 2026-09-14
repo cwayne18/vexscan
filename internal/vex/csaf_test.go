@@ -126,7 +126,7 @@ func TestCSAFResolvesRelationshipsIntoSubcomponents(t *testing.T) {
 
 	st, note := Match(doc, k8sProduct,
 		[]string{"GHSA-cgrx-mc8f-2prm"},
-		"pkg:golang/github.com/opencontainers/selinux@v1.11.1")
+		"pkg:golang/github.com%2Fopencontainers%2Fselinux@v1.11.0")
 	if st == nil {
 		t.Fatalf("no statement matched; document has %d", len(doc.Statements))
 	}
@@ -142,10 +142,12 @@ func TestCSAFResolvesRelationshipsIntoSubcomponents(t *testing.T) {
 	if st.Timestamp != "2026-06-19T00:00:00Z" {
 		t.Errorf("timestamp = %q, want the vulnerability's release date", st.Timestamp)
 	}
-	// The component matched across a version disagreement, which is the same
-	// tolerance the OpenVEX reader applies and must be recorded the same way.
+	// The component matched across an encoding disagreement -- the hub writes
+	// the module path decoded, the scanner percent-encodes it -- which is the
+	// tolerance the reader still applies once versions agree, and it must be
+	// recorded the same way.
 	if note == "" {
-		t.Error("a loose version match recorded no disagreement note")
+		t.Error("a loose spelling match recorded no disagreement note")
 	}
 }
 
