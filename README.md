@@ -261,6 +261,11 @@ The output shape is decided by the **flags**, not by how many lines the list
 happened to have — a `fleet.txt` that drops to one image still emits a batch
 document, so nothing parsing it changes underneath you.
 
+A batch `json` document is what
+[`contrib/vexscan-dashboard.py`](#an-html-dashboard-contribvexscan-dashboardpy)
+turns into a browsable index of the fleet, worst image first, with a page per
+target behind it.
+
 ### Exit status and `--vex-out`
 
 | Situation | Exit |
@@ -2151,7 +2156,7 @@ changes a finding's `severity` and `cvss`** where every other second opinion
   finding relates to several CVEs and the vendor scored more than one, the most
   severe of the vendor's own numbers is used.
 - **It can score what OSV left `UNKNOWN`.** SUSE's *OSV export* publishes no CVSS
-  at all — the [triage section](#prioritising-by-exploitation-triage) notes every
+  at all — the [triage section](#prioritising-by-exploitation-evidence---triage) notes every
   SUSE advisory renders `UNKNOWN` there — and govulncheck's OpenVEX carries none
   either, so Go findings in repo mode are `UNKNOWN` too. SUSE's *CSAF* does carry
   a score, so `--prefer-vendor suse` gives a real rating to findings that would
@@ -2451,6 +2456,67 @@ neutral fields so they cannot drift.
 `component_not_present` is expressed through `justification` rather than a sixth
 status, because VEX consumers already read that field.
 
+#### An HTML dashboard (`contrib/vexscan-dashboard.py`)
+
+The text report is written for the person who ran the scan. `contrib/vexscan-dashboard.py`
+is for the other audience — the one handed a link:
+
+```sh
+vexscan --image myorg/app:latest --all --triage --format json > scan.json
+contrib/vexscan-dashboard.py scan.json -o scan.html
+```
+
+That is one self-contained file. No CDN, no web font, no JavaScript from
+anywhere else, no network access when it is generated and none when it is read,
+so it opens the same from a `file://` URL, a CI artifact store or GitHub Pages.
+It is Python 3.8+ and the standard library; nothing to install.
+
+A [batch report](#scanning-a-fleet---images-from) renders as a directory
+instead — an index of the fleet, worst image first, and one page per target:
+
+```sh
+vexscan --images-from fleet.txt --all --triage --format json > fleet.json
+contrib/vexscan-dashboard.py fleet.json -o site/
+```
+
+The mode is read from the JSON, not from a flag.
+
+**It is a renderer, not a second opinion.** Every number on the page is read out
+of the report; nothing is re-derived. The four sections, their order, which
+columns each one shows and how the rows within it sort are all the same rules
+[the text report](#the-text-report) uses, because a dashboard that disagreed with
+the terminal about how many findings are AFFECTED would be worse than no
+dashboard at all. Concretely, on a `rancher/hardened-kubernetes` scan where
+[`--format summary`](#the-summary) counts 32 affected, 56 vexed and 26 ruled
+out, and reads `affected by severity: 10 high, 12 unknown, 10 medium`, the page
+says the same.
+
+That is also why the `EPSS` column shows the **percentile** — the same figure
+`--format text` puts under the same heading. The probability itself is on the
+badge's tooltip and in the expanded row, spelled `4.7% percentile (epss 0.00214)`
+exactly as `--details` spells it. Two columns named EPSS showing different
+numbers is the mistake this avoids.
+
+Each row expands to the `--details` view: the evidence, the matched VEX
+statement with its author, impact and action text, the purl, the binary, the
+other branches a fix landed in. A filter box narrows by CVE, package, binary or
+justification; sections open while filtering so a match inside a collapsed
+RULED OUT is not silently missed. There is a dark theme, following the system
+preference unless you override it, and printing the page expands every row.
+
+Below the findings is the coverage block, which reports the absences as loudly
+as the totals: an ecosystem that failed, paths that could not be read, what
+`--severity` hid, what `--triage`'s feeds could not score and how old they were,
+which hubs answered. An incomplete scan says so in a banner above its own counts
+— a clean total over a hole in the inventory is the one reading of the page that
+would be actively harmful.
+
+Being a contrib script and not a `--format html` is deliberate. The JSON is
+already the stable contract, so the renderer can change without touching the
+binary; and nine hundred lines of CSS and a theme toggle do not belong in a tool
+whose [standard library](#standard-library) discipline is the reason it has no
+third-party dependencies at all.
+
 ### SARIF
 
 `--format sarif` emits SARIF 2.1.0, the format GitHub code scanning and most CI
@@ -2658,6 +2724,9 @@ over the same read-only path `--vexhub` uses.
   a `--vex-out` directory into a pull request. `--vex-out` itself needs neither.
   Add [`git-lfs`](https://git-lfs.com) for `--merge-into` against a hub that
   stores its merged report in LFS, as rancher/vexhub does
+- Python 3.8+ — only for [`contrib/vexscan-dashboard.py`](#an-html-dashboard-contribvexscan-dashboardpy),
+  which turns a `--format json` report into an HTML page. Standard library only,
+  and it never touches the network
 - An LLM provider for `--llm` — an endpoint and key, a local model, or an
   installed CLI. See [Choosing a provider](#choosing-a-provider); there is no
   default and nothing is required unless you pass `--llm`.
