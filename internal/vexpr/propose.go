@@ -33,6 +33,12 @@ type Options struct {
 	Hub HubReader
 	// Format is the serialisation to write. The zero value is OpenVEX.
 	Format Format
+	// Aggregates are hub-relative paths to merged documents that receive every
+	// product's claims in addition to the per-product documents -- the "master"
+	// report some hubs publish for a CI run that scans a fleet. They are never
+	// added to the index; see aggregate.go for why they are named rather than
+	// discovered.
+	Aggregates []string
 	// Author is the author recorded on every statement written. It has no
 	// default: an author is a claim of responsibility for the assertion, and
 	// there is nobody but the caller who can make it.
@@ -61,9 +67,15 @@ type FileChange struct {
 // Computing and writing are separate so the caller can report what is about to
 // happen, and so the whole merge is testable without a filesystem.
 type Plan struct {
-	Changes    []FileChange
-	Products   []ProductChange
+	Changes  []FileChange
+	Products []ProductChange
+	// Statements counts the per-product documents only. An aggregate carries the
+	// same claims a second time, and adding those in would report every
+	// statement twice.
 	Statements int
+	// Aggregates is every merged document the plan adds to, reported separately
+	// for that reason.
+	Aggregates []AggregateChange
 	// Skipped is how many ruled-out findings could not be written as a
 	// matchable statement (no product, component or id).
 	Skipped int
@@ -95,13 +107,45 @@ type ProductChange struct {
 	Vulns   []string
 }
 
+// AggregateChange records one merged document the plan adds to, and what it
+// gained. Products is not always the same as the plan's own Products: an
+// aggregate can lag the per-product tree, in which case it gains claims the
+// product documents already carried.
+type AggregateChange struct {
+	Path       string
+	Products   []ProductChange
+	Statements int
+}
+
 // Empty reports whether the proposal would change nothing -- every ruled-out
 // finding was already covered, or there were none to begin with.
 func (p *Plan) Empty() bool { return len(p.Changes) == 0 }
 
+// writes reports whether the plan already writes a path.
+func (p *Plan) writes(path string) bool {
+	for _, ch := range p.Changes {
+		if ch.Path == path {
+			return true
+		}
+	}
+	return false
+}
+
 // Propose computes the documents that record this scan's ruled-out findings,
 // merged into whatever the hub already publishes. It writes nothing; Write does.
 func Propose(ctx context.Context, res *analyze.Result, opts Options) (*Plan, error) {
+	return ProposeAll(ctx, []*analyze.Result{res}, opts)
+}
+
+// ProposeAll is Propose over a fleet: every result contributes to one plan.
+//
+// A batch scan is one contribution to a hub, not one per image. Each image is
+// still its own product with its own document -- nothing is pooled that the hub
+// would keep apart -- but reading the hub, resolving the index and merging any
+// aggregate happen once for the run instead of once per target, which is the
+// difference between a fleet scan being practical against a hub with a
+// hundred-megabyte merged report and not.
+func ProposeAll(ctx context.Context, results []*analyze.Result, opts Options) (*Plan, error) {
 	logf := opts.Logf
 	if logf == nil {
 		logf = func(string, ...any) {}
@@ -110,6 +154,9 @@ func Propose(ctx context.Context, res *analyze.Result, opts Options) (*Plan, err
 	if err != nil {
 		return nil, err
 	}
+	// Resolved back onto the options so everything downstream sees the format
+	// that is actually being written rather than the zero value standing for it.
+	opts.Format = format
 	meta := Meta{
 		Author:             opts.Author,
 		Timestamp:          opts.Timestamp,
@@ -124,7 +171,7 @@ func Propose(ctx context.Context, res *analyze.Result, opts Options) (*Plan, err
 		return nil, err
 	}
 
-	proposals, skipped := selectProposals(res, opts.Timestamp)
+	proposals, skipped := selectProposals(results, opts.Timestamp)
 	if len(proposals) == 0 {
 		return &Plan{Skipped: skipped}, nil
 	}
@@ -140,12 +187,19 @@ func Propose(ctx context.Context, res *analyze.Result, opts Options) (*Plan, err
 
 	plan := &Plan{Skipped: skipped}
 	indexTouched := false
+	// eligible is the proposals an aggregate is built from: the ones whose
+	// product could be filed in the hub at all. A purl too malformed to yield a
+	// path is too malformed to write into a merged report either, so the two
+	// stay in step rather than the aggregate quietly accepting what the tree
+	// rejected.
+	var eligible []ProductProposal
 	for _, prop := range proposals {
 		loc, idxChanged, err := idx.ensure(prop.Product, enc.fileName())
 		if err != nil {
 			logf("  ! vex-out: %s skipped: %v", prop.Product, err)
 			continue
 		}
+		eligible = append(eligible, prop)
 
 		raw, err := hubRaw(ctx, opts.Hub, loc)
 		if err != nil {
@@ -187,6 +241,14 @@ func Propose(ctx context.Context, res *analyze.Result, opts Options) (*Plan, err
 		plan.Changes = append(plan.Changes, FileChange{Path: loc, Content: content})
 		plan.Statements += len(added)
 		plan.Products = append(plan.Products, ProductChange{Product: prop.Product, Vulns: added})
+	}
+
+	// After the per-product documents, so an aggregate naming a path this run
+	// already writes is caught rather than silently overwriting it -- and before
+	// the empty check, because an aggregate that lags the tree can have
+	// something to add when no product document does.
+	if err := planAggregates(ctx, plan, enc, eligible, opts, meta); err != nil {
+		return nil, err
 	}
 
 	if len(plan.Changes) == 0 {

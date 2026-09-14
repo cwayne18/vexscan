@@ -33,9 +33,9 @@ func TestMergeClaimsDedupesAgainstExistingDoc(t *testing.T) {
 		// New vuln -> added.
 		claim("CVE-2", "pkg:deb/debian/b@1"),
 	}}
-	added := mergeClaims(doc, prop, testMeta("2026-08-06T11:00:00Z"))
-	if len(added) != 1 || added[0] != "CVE-2" {
-		t.Fatalf("added = %v, want [CVE-2]", added)
+	changes := mergeClaims(doc, []ProductProposal{prop}, testMeta("2026-08-06T11:00:00Z"))
+	if len(changes) != 1 || len(changes[0].Vulns) != 1 || changes[0].Vulns[0] != "CVE-2" {
+		t.Fatalf("changes = %v, want one product with [CVE-2]", changes)
 	}
 	if len(doc.Statements) != 2 {
 		t.Fatalf("doc has %d statements, want 2", len(doc.Statements))
@@ -53,16 +53,16 @@ func TestMergeClaimsProductWideCovers(t *testing.T) {
 		Status:        StatusNotAffected,
 	}}
 	prop := ProductProposal{Product: testProduct, Claims: []Claim{claim("CVE-1", "pkg:deb/debian/a@1")}}
-	if added := mergeClaims(doc, prop, testMeta(testTime)); len(added) != 0 {
-		t.Fatalf("added = %v, want none (product-wide statement covers it)", added)
+	if changes := mergeClaims(doc, []ProductProposal{prop}, testMeta(testTime)); len(changes) != 0 {
+		t.Fatalf("changes = %v, want none (product-wide statement covers it)", changes)
 	}
 }
 
 func TestMergeClaimsNoChangeNoTimestampBump(t *testing.T) {
 	doc := NewDoc("Someone", testTime)
 	prop := ProductProposal{Product: testProduct} // no claims
-	if added := mergeClaims(doc, prop, testMeta("2026-09-09T09:09:09Z")); len(added) != 0 {
-		t.Fatalf("added = %v, want none", added)
+	if changes := mergeClaims(doc, []ProductProposal{prop}, testMeta("2026-09-09T09:09:09Z")); len(changes) != 0 {
+		t.Fatalf("changes = %v, want none", changes)
 	}
 	if doc.Timestamp != testTime {
 		t.Errorf("timestamp changed with no additions: %q", doc.Timestamp)

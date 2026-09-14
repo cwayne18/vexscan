@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/cwayne18/vexscan/internal/csaf"
@@ -50,15 +51,15 @@ func (e openvexEncoder) merge(raw []byte, prop ProductProposal, meta Meta) ([]by
 		doc = parsed
 	}
 
-	added := mergeClaims(doc, prop, meta)
-	if len(added) == 0 {
+	changes := mergeClaims(doc, []ProductProposal{prop}, meta)
+	if len(changes) == 0 {
 		return nil, nil, nil
 	}
 	content, err := doc.Marshal()
 	if err != nil {
 		return nil, nil, err
 	}
-	return content, added, nil
+	return content, changes[0].Vulns, nil
 }
 
 // Doc is an OpenVEX document as it is written to a hub.
@@ -219,19 +220,19 @@ func NewDoc(author, timestamp string) *Doc {
 // its raw bytes), so a later Marshal reproduces every field OpenVEX allows, not
 // just the ones this type models.
 func ParseDoc(b []byte) (*Doc, bool) {
-	b = bytes.TrimSpace(b)
-	if len(b) == 0 {
+	body := bytes.TrimSpace(b)
+	if len(body) == 0 {
 		return nil, false
 	}
 	var shape docShape
-	if err := json.Unmarshal(b, &shape); err != nil {
+	if err := json.Unmarshal(body, &shape); err != nil {
 		return nil, false
 	}
 	fields := map[string]json.RawMessage{}
-	if err := json.Unmarshal(b, &fields); err != nil {
+	if err := json.Unmarshal(body, &fields); err != nil {
 		return nil, false
 	}
-	order, err := objectKeyOrder(b)
+	order, err := objectKeyOrder(body)
 	if err != nil {
 		return nil, false
 	}
@@ -244,7 +245,13 @@ func ParseDoc(b []byte) (*Doc, bool) {
 		Statements: shape.Statements,
 		original:   fields,
 		order:      order,
-		layout:     detectLayout(b),
+		// Read off the untrimmed bytes, deliberately. The whitespace trimmed for
+		// the decode above is the whole of what a layout is, and detecting it on
+		// the trimmed form meant lastNL was never true -- so every merge into an
+		// existing hub document dropped that document's trailing newline and
+		// added a "\ No newline at end of file" to a diff nothing else in it
+		// justified.
+		layout: detectLayout(b),
 	}
 	if d.Statements == nil {
 		d.Statements = []Statement{}
@@ -316,8 +323,13 @@ func (d *Doc) Marshal() ([]byte, error) {
 	return out, nil
 }
 
-// mergeClaims adds a proposal's claims to a document, skipping any the document
-// already answers, and returns the vulnerabilities that were actually new.
+// mergeClaims adds the proposals' claims to a document, skipping any the
+// document already answers, and returns what each product actually gained.
+//
+// It takes a slice rather than one proposal because a document is not always
+// one product's. A per-product document gets a slice of one; an aggregate --
+// the merged report some hubs publish alongside the per-product tree -- gets
+// every product in the run, folded into one file in a single pass.
 //
 // A claim is considered already present when the document holds a statement for
 // the same vulnerability (by name or alias, case-insensitively) that covers the
@@ -328,22 +340,120 @@ func (d *Doc) Marshal() ([]byte, error) {
 //
 // The document's top-level timestamp is advanced only when something was added,
 // so a re-run that changes nothing produces no diff.
-func mergeClaims(doc *Doc, prop ProductProposal, meta Meta) []string {
-	var added []string
-	for _, c := range prop.Claims {
-		if documentCovers(doc, prop.Product, c) {
+func mergeClaims(doc *Doc, props []ProductProposal, meta Meta) []ProductChange {
+	idx := newCoverIndex(doc)
+	var changes []ProductChange
+	for _, prop := range props {
+		var added []string
+		for _, c := range prop.Claims {
+			if idx.covers(prop.Product, c) {
+				continue
+			}
+			doc.Statements = append(doc.Statements, claimStatement(c))
+			// Filed as it is appended, so two proposals that somehow carry the
+			// same claim cannot both write it.
+			idx.add(len(doc.Statements) - 1)
+			added = append(added, c.Vuln)
+		}
+		if len(added) == 0 {
 			continue
 		}
-		doc.Statements = append(doc.Statements, claimStatement(c))
-		added = append(added, c.Vuln)
+		sort.Strings(added)
+		changes = append(changes, ProductChange{Product: prop.Product, Vulns: added})
 	}
-	if len(added) > 0 {
+	if len(changes) > 0 {
 		doc.Timestamp = meta.Timestamp
 		if doc.Author == "" {
 			doc.Author = meta.Author
 		}
 	}
-	return added
+	return changes
+}
+
+// coverIndex answers "does this document already say this?" without walking
+// every statement for every claim.
+//
+// The linear scan this replaces was fine for a product document holding a few
+// dozen statements, and is not fine for an aggregate: rancher/vexhub's merged
+// report carries 316,236 of them, and the old check allocated a fresh slice of
+// ids per statement inspected. The index pays that cost once, filing each
+// statement under every id it can be found by, so a claim is only compared
+// against the handful of statements that share one of its ids.
+type coverIndex struct {
+	doc *Doc
+	// byVuln maps a lowercased vulnerability id to the statements filed under
+	// it, as indexes into doc.Statements rather than copies -- a Statement
+	// carries its original bytes, and 316,236 of those are not worth duplicating
+	// to save a subscript.
+	byVuln map[string][]int
+}
+
+func newCoverIndex(doc *Doc) *coverIndex {
+	ci := &coverIndex{doc: doc, byVuln: make(map[string][]int, len(doc.Statements))}
+	for i := range doc.Statements {
+		ci.add(i)
+	}
+	return ci
+}
+
+// add files a statement under every id it can be matched on.
+func (ci *coverIndex) add(i int) {
+	v := ci.doc.Statements[i].Vulnerability
+	ci.file(v.Name, i)
+	ci.file(v.ID, i)
+	for _, a := range v.Aliases {
+		ci.file(a, i)
+	}
+}
+
+// file records one id for one statement, skipping the repeat when a statement
+// names the same id twice -- as one does when its @id and its name agree.
+func (ci *coverIndex) file(id string, i int) {
+	if id == "" {
+		return
+	}
+	k := strings.ToLower(id)
+	if s := ci.byVuln[k]; len(s) > 0 && s[len(s)-1] == i {
+		return
+	}
+	ci.byVuln[k] = append(ci.byVuln[k], i)
+}
+
+// covers reports whether the document already has a statement that would make
+// the proposed claim redundant.
+func (ci *coverIndex) covers(product string, want Claim) bool {
+	wantProduct := decodeKey(product)
+	for _, id := range append([]string{want.Vuln}, want.Aliases...) {
+		if id == "" {
+			continue
+		}
+		for _, i := range ci.byVuln[strings.ToLower(id)] {
+			if statementCovers(ci.doc.Statements[i], wantProduct, want.Subcomponent) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// statementCovers reports whether a statement already answers a claim about
+// this product and subcomponent. Matching the vulnerability is the caller's
+// job; getting here means it already matched.
+func statementCovers(s Statement, wantProduct, wantSub string) bool {
+	for _, p := range s.Products {
+		if decodeKey(p.ID) != wantProduct {
+			continue
+		}
+		if len(p.Subcomponents) == 0 {
+			return true // product-wide statement covers any subcomponent
+		}
+		for _, sc := range p.Subcomponents {
+			if sc.ID == wantSub {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // claimStatement is the OpenVEX statement a claim becomes. The mapping is
@@ -364,44 +474,3 @@ func claimStatement(c Claim) Statement {
 	}
 }
 
-// documentCovers reports whether the document already has a statement that would
-// make the proposed claim redundant.
-func documentCovers(doc *Doc, product string, want Claim) bool {
-	wantIDs := append([]string{want.Vuln}, want.Aliases...)
-	for _, s := range doc.Statements {
-		if !sharesVuln(s.Vulnerability, wantIDs) {
-			continue
-		}
-		for _, p := range s.Products {
-			if decodeKey(p.ID) != decodeKey(product) {
-				continue
-			}
-			if len(p.Subcomponents) == 0 {
-				return true // product-wide statement covers any subcomponent
-			}
-			for _, sc := range p.Subcomponents {
-				if sc.ID == want.Subcomponent {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
-// sharesVuln reports whether an existing vulnerability names any of the wanted
-// ids, comparing case-insensitively across name, @id and aliases.
-func sharesVuln(v Vulnerability, wantIDs []string) bool {
-	have := append([]string{v.Name, v.ID}, v.Aliases...)
-	for _, w := range wantIDs {
-		if w == "" {
-			continue
-		}
-		for _, h := range have {
-			if h != "" && strings.EqualFold(h, w) {
-				return true
-			}
-		}
-	}
-	return false
-}

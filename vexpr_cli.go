@@ -19,20 +19,26 @@ type vexOutOptions struct {
 	format    string
 	pubNS     string
 	pubCat    string
+	mergeInto []string
 	hubs      []string
 	timestamp string
 	logf      func(string, ...any)
 }
 
-// runVexOut writes the VEX documents for this scan's ruled-out findings into a
+// runVexOut writes the VEX documents for these scans' ruled-out findings into a
 // directory, laid out as a VEX hub.
+//
+// It takes every result at once rather than one at a time. A fleet scan is one
+// contribution: each image is still its own product with its own document, but
+// the hub is read once and any merged "master" document is rewritten once,
+// instead of once per image.
 //
 // When a --vexhub is given the documents are merged into what that hub already
 // publishes -- read-only, over the same transport the scan used -- so the output
 // is the hub's own files with statements added, and copying it over a clone
 // produces a reviewable diff. With no --vexhub the output is a hub in its own
 // right, index and all.
-func runVexOut(ctx context.Context, res *analyze.Result, opts vexOutOptions) error {
+func runVexOut(ctx context.Context, results []*analyze.Result, opts vexOutOptions) error {
 	var hub vexpr.HubReader
 	if len(opts.hubs) > 0 {
 		h, err := vex.Open(ctx, opts.hubs[0])
@@ -43,9 +49,10 @@ func runVexOut(ctx context.Context, res *analyze.Result, opts vexOutOptions) err
 		hub = h
 	}
 
-	plan, err := vexpr.Propose(ctx, res, vexpr.Options{
+	plan, err := vexpr.ProposeAll(ctx, results, vexpr.Options{
 		Hub:                hub,
 		Format:             vexpr.Format(opts.format),
+		Aggregates:         opts.mergeInto,
 		Author:             opts.author,
 		Timestamp:          opts.timestamp,
 		PublisherCategory:  opts.pubCat,
@@ -84,6 +91,13 @@ func runVexOut(ctx context.Context, res *analyze.Result, opts vexOutOptions) err
 		for _, v := range pc.Vulns {
 			opts.logf("    + %s", v)
 		}
+	}
+	// Counted apart from the total above: an aggregate repeats the same claims
+	// in one merged file, so folding them into the headline would report every
+	// statement twice.
+	for _, ag := range plan.Aggregates {
+		opts.logf("  %s: +%d statement(s) across %d product(s), merged",
+			ag.Path, ag.Statements, len(ag.Products))
 	}
 	for _, ch := range plan.Changes {
 		opts.logf("  %s", ch.Path)
@@ -130,8 +144,9 @@ func reportSkippedDocuments(plan *vexpr.Plan, logf func(string, ...any)) int {
 // reporting a vulnerability. "vexscan" is not an answer to who said so.
 // --vex-publisher-namespace is the same question in CSAF's terms, which is why
 // it has no default either.
-func checkVexOut(dir, author, format, pubNS, pubCat string) error {
-	f, err := vexpr.ParseFormat(format)
+func checkVexOut(o vexOutOptions) error {
+	dir, author, pubNS, pubCat := o.dir, o.author, o.pubNS, o.pubCat
+	f, err := vexpr.ParseFormat(o.format)
 	if err != nil {
 		return fmt.Errorf("--vex-format: %w", err)
 	}
@@ -140,7 +155,11 @@ func checkVexOut(dir, author, format, pubNS, pubCat string) error {
 		{"--vex-publisher-category", pubCat},
 	}
 	if dir == "" {
-		for _, fl := range append([]struct{ name, val string }{{"--vex-author", author}}, publisher...) {
+		flags := append([]struct{ name, val string }{{"--vex-author", author}}, publisher...)
+		if len(o.mergeInto) > 0 {
+			flags = append(flags, struct{ name, val string }{"--vex-merge-into", o.mergeInto[0]})
+		}
+		for _, fl := range flags {
 			if fl.val != "" {
 				return fmt.Errorf("%s has no effect without --vex-out", fl.name)
 			}
@@ -150,6 +169,12 @@ func checkVexOut(dir, author, format, pubNS, pubCat string) error {
 	if author == "" {
 		return fmt.Errorf("--vex-out needs --vex-author to record on the statements, " +
 			`e.g. --vex-author "Acme Security"`)
+	}
+	// Rejected here rather than after the scan: an aggregate is a merged OpenVEX
+	// report, and CSAF has no shape for one.
+	if len(o.mergeInto) > 0 && f == vexpr.FormatCSAF {
+		return fmt.Errorf("--vex-merge-into cannot be written as CSAF; " +
+			"a merged report is OpenVEX, so drop --vex-format csaf or drop --vex-merge-into")
 	}
 	if f != vexpr.FormatCSAF {
 		for _, fl := range publisher {

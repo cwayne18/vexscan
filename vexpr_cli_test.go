@@ -18,6 +18,7 @@ func TestCheckVexOut(t *testing.T) {
 	cases := []struct {
 		name                         string
 		dir, author, format, ns, cat string
+		mergeInto                    []string
 		wantErr                      bool
 	}{
 		{name: "neither"},
@@ -54,13 +55,39 @@ func TestCheckVexOut(t *testing.T) {
 			name: "publisher identity without a directory",
 			ns:   "https://acme.example", wantErr: true,
 		},
+
+		// An aggregate is a merged OpenVEX report. CSAF identifies an advisory by
+		// document.tracking.id and revises it as a unit, so there is no such
+		// thing as a CSAF document holding every product at once -- caught here
+		// rather than after the scan.
+		{
+			name: "merge-into on an openvex run",
+			dir:  "./out", author: "Acme Security",
+			mergeInto: []string{"reports/rancher.openvex.json"},
+		},
+		{
+			name: "merge-into with an explicit openvex format",
+			dir:  "./out", author: "Acme Security", format: "openvex",
+			mergeInto: []string{"reports/rancher.openvex.json"},
+		},
+		{
+			name: "merge-into on a csaf run",
+			dir:  "./out", author: "Acme Security", format: "csaf", ns: "https://acme.example",
+			mergeInto: []string{"reports/rancher.openvex.json"}, wantErr: true,
+		},
+		{
+			name:      "merge-into without a directory",
+			mergeInto: []string{"reports/rancher.openvex.json"}, wantErr: true,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := checkVexOut(tc.dir, tc.author, tc.format, tc.ns, tc.cat)
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("checkVexOut(%q, %q, %q, %q, %q) = %v, wantErr %v",
-					tc.dir, tc.author, tc.format, tc.ns, tc.cat, err, tc.wantErr)
+			opts := vexOutOptions{
+				dir: tc.dir, author: tc.author, format: tc.format,
+				pubNS: tc.ns, pubCat: tc.cat, mergeInto: tc.mergeInto,
+			}
+			if err := checkVexOut(opts); (err != nil) != tc.wantErr {
+				t.Fatalf("checkVexOut(%+v) = %v, wantErr %v", opts, err, tc.wantErr)
 			}
 		})
 	}

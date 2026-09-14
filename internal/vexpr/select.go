@@ -45,8 +45,14 @@ type ProductProposal struct {
 	Claims []Claim
 }
 
-// selectProposals turns the ruled-out findings in a result into per-product
-// proposals.
+// selectProposals turns the ruled-out findings in one or more results into
+// per-product proposals.
+//
+// It takes a slice because a fleet scan is one contribution, not forty. Each
+// image is its own product and gets its own document, so grouping by product
+// separates them again -- but doing the selection once means the hub is read
+// once and any aggregate is merged once, rather than a hundred-megabyte merged
+// report being parsed and re-rendered for every image in the list.
 //
 // A finding qualifies when the scan ruled it out -- not_present or
 // not_in_execute_path, the two RULED OUT statuses the report groups -- and the
@@ -58,30 +64,36 @@ type ProductProposal struct {
 // written as a matchable statement, so it is dropped rather than emitted as one
 // that would never be found again. The dropped count is returned so the caller
 // can say so instead of silently proposing fewer than the report ruled out.
-func selectProposals(res *analyze.Result, timestamp string) (proposals []ProductProposal, skipped int) {
+func selectProposals(results []*analyze.Result, timestamp string) (proposals []ProductProposal, skipped int) {
 	byProduct := map[string][]Claim{}
 	seen := map[string]bool{}
-	for _, f := range res.Findings {
-		if !ruledOut(f) {
+	for _, res := range results {
+		if res == nil {
 			continue
 		}
-		if f.VEX != nil {
-			// The hub has already spoken to this finding; --vexhub matched it.
-			continue
+		for _, f := range res.Findings {
+			if !ruledOut(f) {
+				continue
+			}
+			if f.VEX != nil {
+				// The hub has already spoken to this finding; --vexhub matched it.
+				continue
+			}
+			c, ok := claimFor(f, timestamp)
+			if !ok {
+				skipped++
+				continue
+			}
+			// Dedupe within a single run: two binaries can rule out the same CVE
+			// in the same product, and so can two scans of the same image. The
+			// document should carry it once.
+			dk := dedupeKey(c.Product, c.Vuln, c.Subcomponent)
+			if seen[dk] {
+				continue
+			}
+			seen[dk] = true
+			byProduct[f.Product] = append(byProduct[f.Product], c)
 		}
-		c, ok := claimFor(f, timestamp)
-		if !ok {
-			skipped++
-			continue
-		}
-		// Dedupe within a single scan: two binaries can rule out the same CVE in
-		// the same product, and the document should carry it once.
-		dk := dedupeKey(c.Product, c.Vuln, c.Subcomponent)
-		if seen[dk] {
-			continue
-		}
-		seen[dk] = true
-		byProduct[f.Product] = append(byProduct[f.Product], c)
 	}
 
 	for product, claims := range byProduct {

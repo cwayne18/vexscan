@@ -21,7 +21,7 @@ func TestSelectProposalsPicksRuledOutOnly(t *testing.T) {
 		// Undetermined -- must not be proposed.
 		{ID: "CVE-4", CVE: "CVE-4", Product: testProduct, PURL: "pkg:deb/debian/d@1", Status: analyze.StatusUndetermined},
 	}}
-	props, skipped := selectProposals(res, testTime)
+	props, skipped := selectProposals([]*analyze.Result{res}, testTime)
 	if skipped != 0 {
 		t.Fatalf("skipped = %d, want 0", skipped)
 	}
@@ -48,7 +48,7 @@ func TestSelectProposalsSkipsHubCoveredAndUnmatchable(t *testing.T) {
 		// No component purl -- likewise.
 		{ID: "CVE-3", CVE: "CVE-3", Product: testProduct, Status: analyze.StatusNotPresent},
 	}}
-	props, skipped := selectProposals(res, testTime)
+	props, skipped := selectProposals([]*analyze.Result{res}, testTime)
 	if len(props) != 0 {
 		t.Fatalf("got %d proposals, want 0", len(props))
 	}
@@ -62,7 +62,7 @@ func TestSelectProposalsDedupesWithinScan(t *testing.T) {
 		{ID: "CVE-1", CVE: "CVE-1", Product: testProduct, PURL: "pkg:deb/debian/a@1", Status: analyze.StatusNotPresent},
 		{ID: "CVE-1", CVE: "CVE-1", Product: testProduct, PURL: "pkg:deb/debian/a@1", Status: analyze.StatusNotPresent},
 	}}
-	props, _ := selectProposals(res, testTime)
+	props, _ := selectProposals([]*analyze.Result{res}, testTime)
 	if len(props) != 1 || len(props[0].Claims) != 1 {
 		t.Fatalf("expected one deduped claim, got %+v", props)
 	}
