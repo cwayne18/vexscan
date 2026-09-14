@@ -277,7 +277,7 @@ func TestVexOverlayMatchesThroughAnAlias(t *testing.T) {
 		return Finding{
 			Ecosystem: "golang", ID: "GO-2025-3547", CVE: "GO-2025-3547", GoID: "GO-2025-3547",
 			// The percent-encoded form the Go plugin actually emits.
-			PURL:    "pkg:golang/k8s.io%2Fapiserver@v0.31.2",
+			PURL:    "pkg:golang/k8s.io%2Fapiserver@v0.29.0",
 			Product: "pkg:golang/k8s.io/kubernetes",
 			Status:  StatusLinked,
 		}

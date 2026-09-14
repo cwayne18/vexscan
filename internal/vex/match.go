@@ -57,7 +57,23 @@ func covers(p Product, subPURL string) (scoped bool, note string, ok bool) {
 	}
 	for _, sc := range p.Subcomponents {
 		want, wantOK := parseKey(sc)
-		if !wantOK || want != have {
+		if !wantOK || want.typ != have.typ || want.name != have.name {
+			continue
+		}
+		// Version-sensitive when the statement pins a version, for every
+		// ecosystem but the OS ones. A statement about
+		// golang.org/x/crypto@v0.53.0 does not speak to a finding about
+		// @v0.55.0: the ruled-out verdict was reached against the code in one
+		// version, and a dependency bump can reintroduce the vulnerable path a
+		// rebuild would then wrongly report as answered.
+		//
+		// OS packages stay version-agnostic. A hub writes them without a version
+		// at all -- pkg:rpm/suse/libgcrypt20, no @ -- so there is nothing to
+		// compare, and where it does carry one the release and epoch are spelled
+		// differently enough from what the scanner writes that comparing them
+		// would only ever mean "no match". A statement that omits the version
+		// still covers any version found, in either ecosystem.
+		if !osPURLTypes[want.typ] && want.ver != "" && want.ver != have.ver {
 			continue
 		}
 		return true, disagreement(sc, subPURL), true
@@ -81,13 +97,16 @@ func better(scoped bool, s *Statement, bestScoped bool, best *Statement) bool {
 
 // key is a purl reduced to what two spellings of the same package must agree
 // on.
-type key struct{ typ, name string }
+type key struct{ typ, name, ver string }
 
-// parseKey reduces a purl to its type and name, dropping the version and
+// parseKey reduces a purl to its type, name and version, dropping the
 // qualifiers, and dropping the namespace only where the namespace is a
 // distribution.
 //
-// The loose comparison is not a shortcut, it is the only rule that fires
+// The version is kept so a versioned ecosystem's statement can be pinned to the
+// version it was written against; covers ignores it for the OS types, where a
+// hub writes no version and the spellings would never line up. The loose
+// comparison of type and name is not a shortcut, it is the only rule that fires
 // against real data. A hub writes pkg:rpm/suse/libgcrypt20 -- no version, and
 // namespaced by vendor. vexscan writes pkg:rpm/sles/libgcrypt20@1.9.4?arch=x86_64
 // for the same package, because the namespace comes from the image's os-release
@@ -111,7 +130,9 @@ func parseKey(purl string) (key, bool) {
 		return key{}, false
 	}
 	typ = strings.ToLower(typ)
+	var ver string
 	if at := strings.LastIndex(rest, "@"); at >= 0 {
+		ver = rest[at+1:]
 		rest = rest[:at]
 	}
 	if osPURLTypes[typ] {
@@ -126,7 +147,7 @@ func parseKey(purl string) (key, bool) {
 	if rest == "" {
 		return key{}, false
 	}
-	return key{typ: typ, name: rest}, true
+	return key{typ: typ, name: rest, ver: ver}, true
 }
 
 // osPURLTypes are the purl types whose namespace is a distribution rather than

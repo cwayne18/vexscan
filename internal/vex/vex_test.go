@@ -168,23 +168,27 @@ func TestAnAliasIsEnoughToMatch(t *testing.T) {
 	}
 }
 
-// The Go subcomponent version moves with every dependency bump; matching on it
-// would make every statement go stale the moment the image is rebuilt.
-func TestGoSubcomponentMatchesRegardlessOfVersion(t *testing.T) {
+// A Go subcomponent statement is pinned to the version it was written against:
+// the ruled-out verdict was reached against one version's code, and a
+// dependency bump can reintroduce the vulnerable path. A statement about
+// x/net@v0.44.0 therefore does not answer a finding about @v0.46.0.
+func TestGoSubcomponentIsVersionSensitive(t *testing.T) {
 	h := openTestHub(t)
 	product := GoProduct(clickhouseModule)
 	doc := lookup(t, h, product)
 
-	st, note := Match(doc, product, []string{"CVE-2025-47911"}, "pkg:golang/golang.org/x/net@v0.46.0")
-	if st == nil {
-		t.Fatal("no match")
+	// A later version than the statement names -- the verdict was not reached
+	// against this code, so it is not covered.
+	if st, _ := Match(doc, product, []string{"CVE-2025-47911"}, "pkg:golang/golang.org/x/net@v0.46.0"); st != nil {
+		t.Error("a statement about v0.44.0 answered a finding about v0.46.0")
 	}
-	if !strings.Contains(note, "v0.44.0") {
-		t.Errorf("note should record the version the statement was written against: %q", note)
+	// The exact version the statement names -- covered.
+	if st, _ := Match(doc, product, []string{"CVE-2025-47911"}, "pkg:golang/golang.org/x/net@v0.44.0"); st == nil {
+		t.Error("the statement did not answer a finding at its own version")
 	}
 	// The full module path is the name for golang -- dropping the leading
 	// segment the way an OS namespace is dropped would match anything.
-	if st, _ := Match(doc, product, []string{"CVE-2025-47911"}, "pkg:golang/example.com/x/net@v0.46.0"); st != nil {
+	if st, _ := Match(doc, product, []string{"CVE-2025-47911"}, "pkg:golang/example.com/x/net@v0.44.0"); st != nil {
 		t.Error("a different module with the same trailing path matched")
 	}
 }
@@ -262,7 +266,7 @@ func TestTypeIsPartOfTheSubcomponentIdentity(t *testing.T) {
 	if st, _ := Match(doc, syntheticProduct, []string{"CVE-2020-0004"}, "pkg:golang/lodash@1.0.0"); st != nil {
 		t.Error("a golang purl matched a statement written about an npm package")
 	}
-	if st, _ := Match(doc, syntheticProduct, []string{"CVE-2020-0004"}, "pkg:npm/lodash@4.17.21"); st == nil {
+	if st, _ := Match(doc, syntheticProduct, []string{"CVE-2020-0004"}, "pkg:npm/lodash@1.0.0"); st == nil {
 		t.Error("the npm package did not match its own statement")
 	}
 }
