@@ -78,7 +78,7 @@ func TestModuleVersionFromImageTag(t *testing.T) {
 		{"github.com/some/tool", "python:3.12.1", "", false},
 	}
 	for _, tt := range tests {
-		gotVer, _, why := moduleVersionFromImageTag(tt.mod, tt.ref)
+		gotVer, _, why := moduleVersionFromImageTag(tt.mod, tt.ref, false)
 		if gotVer != tt.wantVer || (why != "") != tt.wantOK {
 			t.Errorf("moduleVersionFromImageTag(%q, %q) = (%q, %q), want (%q, ok=%v)",
 				tt.mod, tt.ref, gotVer, why, tt.wantVer, tt.wantOK)
@@ -109,7 +109,7 @@ func TestK3sAndRKE2AreAlwaysResolved(t *testing.T) {
 		{"k8s.io/kubernetes", "rancher/hardened-kubernetes:v1.34.10-rke2r1-build20260724", "v1.34.10-rke2r1-build20260724"},
 	}
 	for _, tt := range tests {
-		got, _, why := moduleVersionFromImageTag(tt.mod, tt.ref)
+		got, _, why := moduleVersionFromImageTag(tt.mod, tt.ref, false)
 		if got != tt.want {
 			t.Errorf("moduleVersionFromImageTag(%q, %q) = %q, want %q", tt.mod, tt.ref, got, tt.want)
 		}
@@ -133,7 +133,7 @@ func TestTagAuthority(t *testing.T) {
 		{"github.com/goharbor/harbor/v2", "goharbor/harbor:v2.11.0", "v2.11.0"},
 	}
 	for _, tt := range allowed {
-		if why := tagAuthority(tt.mod, tt.ref, tt.version); why == "" {
+		if why := tagAuthority(tt.mod, tt.ref, tt.version, false); why == "" {
 			t.Errorf("tagAuthority(%q, %q, %q) = \"\", want an authority", tt.mod, tt.ref, tt.version)
 		}
 	}
@@ -151,7 +151,7 @@ func TestTagAuthority(t *testing.T) {
 		{"github.com/some/tool", "", "v1.2.3"},
 	}
 	for _, tt := range refused {
-		if why := tagAuthority(tt.mod, tt.ref, tt.version); why != "" {
+		if why := tagAuthority(tt.mod, tt.ref, tt.version, false); why != "" {
 			t.Errorf("tagAuthority(%q, %q, %q) = %q, want refusal", tt.mod, tt.ref, tt.version, why)
 		}
 	}

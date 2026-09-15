@@ -156,9 +156,16 @@ func splitXKey(key string) (pkgPath, name string, ok bool) {
 // stamps "goVersion" or "buildVersion" is saying something else, and a wrong
 // version here reads too high and hides a real finding, so a name that is not
 // unmistakably the version is left to the fallbacks.
+//
+// "release" earns its place on the same test: it is what a project calls the
+// variable when it thinks in releases rather than versions, and it is how
+// k8s.io/ingress-nginx spells its own -- `version.RELEASE`. What keeps it from
+// meaning something else is not the name but ownedBy, which has already
+// established the variable lives in the main module's own tree; a distro
+// release or a channel name stamped there would fail normalizeSemver anyway.
 func isVersionVar(name string) bool {
 	switch strings.ToLower(name) {
-	case "version", "ver":
+	case "version", "ver", "release":
 		return true
 	}
 	return false

@@ -108,9 +108,12 @@ var projectBuildSuffix = regexp.MustCompile(`\+(k3s\d+|rke2r?\d+)$`)
 // that happens to be inside it. Inferring one anyway can read *too high*, which
 // marks a genuinely vulnerable finding as fixed -- the one direction this tool
 // must never take. So a plausible semver tag is necessary and not sufficient,
-// and one of two things has to establish that the tag is talking about the
+// and one of three things has to establish that the tag is talking about the
 // module in hand:
 //
+//   - The image runs this module's binary. runsModule is what the image's own OCI
+//     config says it exists to do, so it settles by evidence what the two tests
+//     below reach for by inference. See entrypointversion.go.
 //   - The tag carries a k3s/rke2 build suffix. "+k3s1" and "+rke2r1" are not
 //     general semver decoration; they are those projects' own release marker,
 //     and a tag carrying one is that project's version whatever the image is
@@ -120,12 +123,15 @@ var projectBuildSuffix = regexp.MustCompile(`\+(k3s\d+|rke2r?\d+)$`)
 //     prometheus. A dash-separated token counts, so rancher's
 //     "hardened-kubernetes" still names k8s.io/kubernetes.
 //
-// Neither is proof, and the second is the weaker: an image can be named after
-// the project and still be tagged with something other than the binary's
-// version. That residual risk is what the provenance note on every inferred
-// finding is for. What this rules out is the case where there was never any
-// reason to connect the two at all.
-func tagAuthority(modulePath, ref, version string) string {
+// None is proof, and the last is the weakest: an image can be named after the
+// project and still be tagged with something other than the binary's version.
+// That residual risk is what the provenance note on every inferred finding is
+// for. What this rules out is the case where there was never any reason to
+// connect the two at all.
+func tagAuthority(modulePath, ref, version string, runsModule bool) string {
+	if runsModule {
+		return "the image's own command runs this module's binary"
+	}
 	if projectBuildSuffix.MatchString(version) {
 		return "the tag carries that project's own build suffix"
 	}
@@ -192,7 +198,8 @@ func normalizeTagVersion(tag string) (string, bool) {
 // moduleVersionFromImageTag derives a comparable Go module version for
 // modulePath from an image reference's tag, returning the version, the raw tag
 // it came from, and why the tag was trusted ("" when it was not, and so no
-// version could be derived).
+// version could be derived). runsModule reports whether the image's default
+// command runs a binary whose main module this is.
 //
 // Two independent conditions have to hold, and both exist for the same reason:
 // a wrong-but-higher version would mark a genuinely vulnerable finding as
@@ -201,13 +208,13 @@ func normalizeTagVersion(tag string) (string, bool) {
 // *this module* (tagAuthority). A clean semver tag on an image that has nothing
 // to do with the module -- a Go binary sitting inside python:3.12.1 -- passes
 // the first and fails the second.
-func moduleVersionFromImageTag(modulePath, ref string) (version, tag, why string) {
+func moduleVersionFromImageTag(modulePath, ref string, runsModule bool) (version, tag, why string) {
 	tag = imageTag(ref)
 	v, ok := normalizeTagVersion(tag)
 	if !ok {
 		return "", tag, ""
 	}
-	why = tagAuthority(modulePath, ref, v)
+	why = tagAuthority(modulePath, ref, v, runsModule)
 	if why == "" {
 		return "", tag, ""
 	}

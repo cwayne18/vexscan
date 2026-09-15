@@ -1146,8 +1146,8 @@ module, including the ones fixed long before the build. This is by far the
 largest source of Go false positives, because it lands on the one module whose
 code is unquestionably present.
 
-vexscan tries two recoveries for the main module, strongest first, and a third
-for the one shape of *dependency* that has the same defect.
+vexscan tries three recoveries for the main module, strongest first, and a
+fourth for the one shape of *dependency* that has the same defect.
 
 **1. The binary's own linker flags.** A project that versions itself with
 `-ldflags "-X .../version.Version=v1.36.2+k3s1"` never gets that into
@@ -1172,16 +1172,78 @@ stamps end in `/version.Version`, so that rule finds five candidates, cannot
 choose between them, and gives up: trivy reports the k3s main module with no
 version at all, and therefore no findings against it — true or false.
 
-**2. The image tag,** which is a guess about the artifact rather than a fact
-from it, and so is fenced much harder. The tag must normalize to full
-`MAJOR.MINOR.PATCH` semver, *and* something must connect it to this module:
-either it carries a k3s/rke2 build suffix (`+k3s1`, `+rke2r1` — those projects'
-own release markers, valid whatever the image is called), or the image is named
-after the module (`prom/prometheus`, `rancher/hardened-kubernetes`). Nothing
-connects `python:3.12.1` to a Go binary that happens to live inside it, so no
-version is inferred there.
+**2. The binary's own symbol table,** for the builds where recovery 1 has
+nothing to read because Go threw the flags away.
 
-**3. The main module's own release, for a vendored staging module.** A monorepo
+`-trimpath` makes the toolchain record no `-ldflags` setting at all — that is
+[go#63432](https://go.dev/issue/63432) — and a reproducible distro rebuild sets
+both:
+
+```
+go build           -ldflags "-X main.version=v9.9.9"
+  → build -ldflags="-X main.version=v9.9.9"
+go build -trimpath -ldflags "-X main.version=v9.9.9"
+  → build -trimpath=true
+```
+
+The stamp itself survives. The linker materializes the string an `-X`
+assignment writes as a symbol named for the variable with `.str` appended, so
+`main.version` is still in the artifact as `main.version.str`. Reading it back
+is the same fact from a different place — not an inference — which is why it
+outranks the tag. The authority test is the identical one: the owning package
+must be the main module's own tree or package `main`, and two surviving stamps
+that disagree are both discarded.
+
+This needs an unstripped binary. `-ldflags "-s -w"` removes `.symtab` and with
+it the evidence, and then there is nothing here to read either — which is the
+case on `rancher/nginx-ingress-controller`, where the binary is stripped and
+recovery 3 is what answers instead. The technique is borrowed from trivy, which
+added it for the same `-trimpath` reason; the selection rule around it is
+vexscan's stricter one.
+
+**3. The image tag,** which is a guess about the artifact rather than a fact
+from it, and so is fenced much harder. The tag must normalize to full
+`MAJOR.MINOR.PATCH` semver, *and* one of three things must connect it to this
+module:
+
+- **The image runs this module's binary.** The OCI config's `Entrypoint` and
+  `Cmd` say what the image exists to do, so an image whose command is
+  `/nginx-ingress-controller` is that module's image whatever it has been
+  named. This is evidence where the two tests below are inference, so it is
+  tried first.
+- **The tag carries a k3s/rke2 build suffix** (`+k3s1`, `+rke2r1`) — those
+  projects' own release markers, valid whatever the image is called, including
+  a private mirror or a retag.
+- **The image is named after the module** (`prom/prometheus`,
+  `rancher/hardened-kubernetes`), the weakest of the three.
+
+Nothing connects `python:3.12.1` to a Go binary that happens to live inside it,
+so no version is inferred there.
+
+The entrypoint test is what `registry.rancher.com/rancher/nginx-ingress-controller`
+needs. Its binary is stripped and built with `-trimpath`, so recoveries 1 and 2
+both come up empty, and the name test cannot help either: the module is
+`k8s.io/ingress-nginx` and no dash-separated token of `nginx-ingress-controller`
+equals `ingress-nginx`. The image's `Cmd` names the binary outright, and
+`--all` on `v1.15.1-prime11` goes from 61 findings to 10 — including
+CVE-2025-1974, CVE-2025-1098, CVE-2025-1097 and CVE-2023-5044, all fixed long
+before 1.15.1.
+
+Authority is decided per *module*, not per file, which is the same shape the
+name tests have. That image ships three binaries built from `k8s.io/ingress-nginx`
+— the controller, `/dbg` and `/wait-shutdown` — and runs one; the tag states
+that project's version in all three, since they are one build of one checkout.
+
+Reading the command stops at the first option, because everything after one is
+that program's arguments rather than another thing the image runs: `/coredns
+-conf /etc/coredns/Corefile` runs `coredns` and reads a file. A bare `--` is
+stepped over instead, since it is how the init shims that so often occupy
+`argv[0]` hand off — the ingress-nginx image runs `catatonit -- /nginx-ingress-controller`,
+and the binary that matters is on the far side of it. A shell entrypoint names
+only the shell and so grants nothing: `rancher/klipper-helm` runs a script
+called `entry`, and the Go binaries beside it get no authority from it.
+
+**4. The main module's own release, for a vendored staging module.** A monorepo
 that publishes some of its own subdirectories as separate modules wires them up
 with a directory replace — `replace k8s.io/apimachinery =>
 ./staging/src/k8s.io/apimachinery` — and there is no tag on a directory, so the
@@ -1226,10 +1288,11 @@ at every version, so an uncomparable version takes nothing away from it.
 
 **Every recovered version is on the finding.** Findings decided against one
 carry an evidence entry naming both the version and where it came from —
-`ldflags-version` with the exact `-X` key, `image-tag-version` with the tag and
-why the tag was believed, or `staging-module-version` with the main-module
-release it was derived from — so no reader has to take a version build info
-never stated on trust.
+`ldflags-version` with the exact `-X` key, `elf-symbol-version` with the `.str`
+symbol it was read from, `image-tag-version` with the tag and why the tag was
+believed, or `staging-module-version` with the main-module release it was
+derived from — so no reader has to take a version build info never stated on
+trust.
 
 On the k3s binary above, the two mechanisms compose: the ldflags stamp turns
 `(devel)` into `v1.36.2+k3s1`, which is a version the correction below can then

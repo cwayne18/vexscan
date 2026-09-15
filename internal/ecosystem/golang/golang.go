@@ -18,6 +18,7 @@ import (
 	"runtime/debug"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/cwayne18/vexscan/internal/binscan"
 	"github.com/cwayne18/vexscan/internal/ecosystem"
@@ -58,6 +59,48 @@ type Plugin struct {
 
 	// Logf receives progress messages. Never nil after New.
 	Logf func(format string, args ...any)
+
+	// runsModule holds the main module of every binary the image's own default
+	// command runs, derived from the OCI config by InventoryImage -- the one
+	// place an image's configuration is in hand, since the plugin is built
+	// before the image it will be pointed at is pulled. Nil in every other
+	// mode, and nil is simply an image that claims to run nothing: a module is
+	// looked up in it, never enumerated from it.
+	//
+	// An image that runs a module's binary is that module's image, which is the
+	// strongest reason there is to read the image's tag as that module's
+	// version. It is keyed by module and not by binary for the same reason the
+	// name tests in tagAuthority are: the question is whose version the tag
+	// states, and an image built from one checkout of one project ships one
+	// version of it. ingress-nginx puts three binaries from its own tree in its
+	// image and runs one; the tag is no less that module's version in the other
+	// two. See entrypointversion.go.
+	runsModule map[string]bool
+
+	// elfStamps memoizes the symbol-table read, which is the one recovery that
+	// costs real work: it parses a whole .symtab, and group asks a binary for
+	// its main module's version once per module it was told to look for. The
+	// key is module and path together because the authority test is relative to
+	// the module, and a rootfs can hold two binaries with different main
+	// modules.
+	elfStamps   map[string]versionStamp
+	elfStampsMu sync.Mutex
+}
+
+// elfStamp is moduleVersionFromELFSymbols, answered once per binary.
+func (p *Plugin) elfStamp(modulePath, path string) (version, key string) {
+	p.elfStampsMu.Lock()
+	defer p.elfStampsMu.Unlock()
+	if p.elfStamps == nil {
+		p.elfStamps = map[string]versionStamp{}
+	}
+	k := modulePath + "\x00" + path
+	s, ok := p.elfStamps[k]
+	if !ok {
+		s.version, s.key = moduleVersionFromELFSymbols(modulePath, path)
+		p.elfStamps[k] = s
+	}
+	return s.version, s.key
 }
 
 // Module is one Go module an outside inventory named.
@@ -207,18 +250,26 @@ type inference struct {
 //     inference at all -- it is the number the build used, read back out of the
 //     artifact. See moduleVersionFromLDFlags for the test that keeps a stamp
 //     naming some *dependency's* version from being read as this module's.
-//  2. The image tag, which is a guess about the artifact rather than a fact
+//  2. The binary's own symbol table, which holds the same stamp under a
+//     ".str" symbol. This exists because `-trimpath` makes Go record no
+//     -ldflags at all (go.dev/issue/63432), so a binary that *was* stamped
+//     reaches recovery 1 with nothing to read. It is a fact from the artifact
+//     exactly as the flags are, and ranks above the tag for that reason; it
+//     needs an unstripped binary. See elfversion.go.
+//  3. The image tag, which is a guess about the artifact rather than a fact
 //     from it, and so is fenced by tagAuthority -- the thing that stops a Go
 //     binary inside python:3.12.1 being reported as version 3.12.1 of itself.
+//     runsBinary says the image's own config names this binary as what it
+//     runs, which is the strongest of the reasons that gate accepts.
 //
-// Both are governed by the single rule this tool never bends: it must not
+// All are governed by the single rule this tool never bends: it must not
 // silently under-report. A version that reads too high ranges past a real
 // advisory and marks a vulnerable binary clean, so every gate below fails
 // closed. When neither recovery is allowed, the original version is returned
 // unchanged and the scan goes on querying OSV with "(devel)" and over-reporting
 // -- the safe direction, rather than guessing a version that could hide a real
 // vulnerability.
-func (p *Plugin) mainModuleVersion(modulePath, rawVersion string, settings []debug.BuildSetting) (version string, from inference) {
+func (p *Plugin) mainModuleVersion(modulePath, rawVersion string, bin binscan.Binary, runsBinary bool) (version string, from inference) {
 	if !isDevelVersion(rawVersion) {
 		return rawVersion, inference{}
 	}
@@ -227,7 +278,7 @@ func (p *Plugin) mainModuleVersion(modulePath, rawVersion string, settings []deb
 		reported = "(empty)"
 	}
 
-	if stamped, key := moduleVersionFromLDFlags(modulePath, settings); stamped != "" {
+	if stamped, key := moduleVersionFromLDFlags(modulePath, buildSettings(bin)); stamped != "" {
 		// Naming the key, not just the version, is what makes this auditable:
 		// it shows the reader whose version variable was read, which is the
 		// entire question moduleVersionFromLDFlags had to answer.
@@ -238,10 +289,21 @@ func (p *Plugin) mainModuleVersion(modulePath, rawVersion string, settings []deb
 		}
 	}
 
+	// The flags are absent on every `-trimpath` build, stamped or not, so a
+	// binary can arrive here carrying its version and no record of the flag
+	// that set it. The symbol the linker wrote for that stamp is still there.
+	if stamped, key := p.elfStamp(modulePath, bin.Path); stamped != "" {
+		return stamped, inference{
+			origin: "elf-symbol-version",
+			detail: fmt.Sprintf("version not in build info (reported %s) and no -ldflags recorded; read from the binary's own symbol table, %s.str=%s",
+				reported, key, stamped),
+		}
+	}
+
 	if p.Image == "" {
 		return rawVersion, inference{}
 	}
-	inferred, tag, why := moduleVersionFromImageTag(modulePath, p.Image)
+	inferred, tag, why := moduleVersionFromImageTag(modulePath, p.Image, runsBinary)
 	if why == "" {
 		return rawVersion, inference{}
 	}
@@ -310,6 +372,7 @@ func (p *Plugin) InventoryImage(ctx context.Context, img *target.Image, subjects
 	p.Logf("Scanning for Go binaries...")
 	bins := binscan.FindGoBinaries(img.FS)
 	p.Logf("Found %d Go binaries.", len(bins))
+	p.runsModule = runModules(root, img.Config, bins)
 
 	if all {
 		// Every module every binary links, read straight out of build info.
@@ -397,7 +460,7 @@ func (p *Plugin) groupAll(root string, bins []binscan.Binary) []ecosystem.Compon
 			// comparable version from the binary's linker flags or the image
 			// tag when it is safe to, and keep the provenance so the recovery
 			// is visible.
-			ver, from := p.mainModuleVersion(m.Path, m.Version, bin.Info.Settings)
+			ver, from := p.mainModuleVersion(m.Path, m.Version, bin, p.runsModule[m.Path])
 			if ver != "" {
 				g.add(m.Path, ver, rel, bin.Path, main)
 				g.markInferred(m.Path, ver, from)
@@ -443,9 +506,9 @@ func (p *Plugin) group(root string, bins []binscan.Binary, modules []string) []e
 				// version OSV cannot match.
 				switch {
 				case main == module:
-					version, from = p.mainModuleVersion(module, version, buildSettings(bin))
+					version, from = p.mainModuleVersion(module, version, bin, p.runsModule[module])
 				case version != "":
-					mainVer, _ := p.mainModuleVersion(main, mainModuleRawVersion(bin), buildSettings(bin))
+					mainVer, _ := p.mainModuleVersion(main, mainModuleRawVersion(bin), bin, p.runsModule[main])
 					version, from, why = p.depVersion(main, mainVer, module, version)
 				}
 			}
