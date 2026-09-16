@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/cwayne18/vexscan/internal/analyze"
+	"github.com/cwayne18/vexscan/internal/ecosystem"
 )
 
 // fakeHub is a hub held in memory: an index and whatever documents it points at.
@@ -376,6 +377,101 @@ func TestMarshalDefaultsToTwoSpacesAndANewline(t *testing.T) {
 		if !strings.Contains(got, "\n  \"") {
 			t.Errorf("%s is not indented with two spaces:\n%s", ch.Path, got)
 		}
+	}
+}
+
+// TestProposeBackfillsAggregateForHubCoveredFinding reproduces the vexhub-pr
+// "no changes" bug: a finding a per-product document already answers (so the
+// scan set Finding.VEX) must still be folded into an aggregate that lags the
+// per-product tree. Selecting it away entirely -- which is what dropping every
+// VEX-covered finding did -- left --vex-merge-into unable to ever catch a
+// merged report up, and when every ruled-out finding was covered the run
+// returned before the aggregate was even considered.
+func TestProposeBackfillsAggregateForHubCoveredFinding(t *testing.T) {
+	const aggPath = "reports/agg.openvex.json"
+	hub := &fakeHub{
+		index: syntheticIndex(),
+		files: map[string]string{
+			// The per-product document already answers CVE-1 -- which is why the
+			// finding below carries VEX -- but the aggregate does not.
+			syntheticLoc: `{"@context":"https://openvex.dev/ns/v0.2.0","author":"Prev","version":1,
+				"timestamp":"2026-01-01T00:00:00Z","statements":[
+				  {"vulnerability":{"name":"CVE-1"},
+				   "products":[{"@id":"` + testProduct + `","subcomponents":[{"@id":"pkg:deb/debian/a@1"}]}],
+				   "status":"not_affected"}]}`,
+			aggPath: `{"@context":"https://openvex.dev/ns/v0.2.0","author":"Hub","version":1,
+				"timestamp":"2026-01-01T00:00:00Z","statements":[]}`,
+		},
+	}
+	res := ruledOutResult("CVE-1")
+	res.Findings[0].PURL = "pkg:deb/debian/a@1"
+	res.Findings[0].VEX = &ecosystem.VEXStatement{Status: "not_affected"}
+
+	plan, err := ProposeAll(context.Background(), []*analyze.Result{res}, Options{
+		Hub: hub, Aggregates: []string{aggPath}, Author: "Acme Security", Timestamp: testTime,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Empty() {
+		t.Fatal("plan is empty; the aggregate that lags the per-product tree was never backfilled")
+	}
+	// Only the aggregate changes: the per-product document already answers it,
+	// so it is left alone and no vendor is overruled.
+	if got := pathsOf(plan); !equalStrings(got, []string{aggPath}) {
+		t.Fatalf("changes = %v, want only the aggregate %s", got, aggPath)
+	}
+	if len(plan.Aggregates) != 1 || plan.Aggregates[0].Statements != 1 {
+		t.Fatalf("aggregate change = %+v, want CVE-1 added once", plan.Aggregates)
+	}
+	if !strings.Contains(string(plan.Changes[0].Content), "CVE-1") {
+		t.Errorf("aggregate does not carry CVE-1:\n%s", plan.Changes[0].Content)
+	}
+}
+
+// TestProposeMixedCoverageSplitsProductAndAggregate pins the split: within one
+// product, a claim the per-product document already answers goes only into the
+// aggregate, while a genuinely new one goes into both.
+func TestProposeMixedCoverageSplitsProductAndAggregate(t *testing.T) {
+	const aggPath = "reports/agg.openvex.json"
+	hub := &fakeHub{
+		index: syntheticIndex(),
+		files: map[string]string{
+			// The per-product document answers CVE-1 (hence VEX below) but not
+			// CVE-2; the aggregate carries neither.
+			syntheticLoc: `{"@context":"https://openvex.dev/ns/v0.2.0","author":"Prev","version":1,
+				"timestamp":"2026-01-01T00:00:00Z","statements":[
+				  {"vulnerability":{"name":"CVE-1"},
+				   "products":[{"@id":"` + testProduct + `","subcomponents":[{"@id":"pkg:deb/debian/a@1"}]}],
+				   "status":"not_affected"}]}`,
+			aggPath: `{"@context":"https://openvex.dev/ns/v0.2.0","author":"Hub","version":1,
+				"timestamp":"2026-01-01T00:00:00Z","statements":[]}`,
+		},
+	}
+	res := ruledOutResult("CVE-1", "CVE-2")
+	res.Findings[0].PURL = "pkg:deb/debian/a@1"
+	res.Findings[0].VEX = &ecosystem.VEXStatement{Status: "not_affected"}
+	res.Findings[1].PURL = "pkg:deb/debian/b@1"
+
+	plan, err := ProposeAll(context.Background(), []*analyze.Result{res}, Options{
+		Hub: hub, Aggregates: []string{aggPath}, Author: "Acme Security", Timestamp: testTime,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The product document gains only CVE-2; the aggregate gains both.
+	if got := pathsOf(plan); !equalStrings(got, []string{syntheticLoc, aggPath}) {
+		t.Fatalf("changes = %v, want the product document then the aggregate", got)
+	}
+	if plan.Statements != 1 || len(plan.Products) != 1 || len(plan.Products[0].Vulns) != 1 || plan.Products[0].Vulns[0] != "CVE-2" {
+		t.Fatalf("per-product change = %+v, want only CVE-2", plan.Products)
+	}
+	product := string(plan.Changes[0].Content)
+	if strings.Count(product, "CVE-1") != 1 { // the pre-existing statement, not re-added
+		t.Errorf("product document should keep CVE-1 once, not overrule it:\n%s", product)
+	}
+	if plan.Aggregates[0].Statements != 2 {
+		t.Fatalf("aggregate gained %d, want both CVE-1 and CVE-2", plan.Aggregates[0].Statements)
 	}
 }
 

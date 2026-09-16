@@ -194,6 +194,22 @@ func ProposeAll(ctx context.Context, results []*analyze.Result, opts Options) (*
 	// rejected.
 	var eligible []ProductProposal
 	for _, prop := range proposals {
+		// The product's own document gets only the claims no published statement
+		// already answers; an aggregate gets them all.
+		fresh := prop.unanswered()
+		if len(fresh.Claims) == 0 {
+			// Nothing for this product's own document. It still belongs to any
+			// aggregate, but only if it could be filed in the hub at all --
+			// checked without adding it to the index, which no document written
+			// here would back.
+			if err := idx.filable(prop.Product, enc.fileName()); err != nil {
+				logf("  ! vex-out: %s skipped: %v", prop.Product, err)
+				continue
+			}
+			eligible = append(eligible, prop)
+			continue
+		}
+
 		loc, idxChanged, err := idx.ensure(prop.Product, enc.fileName())
 		if err != nil {
 			logf("  ! vex-out: %s skipped: %v", prop.Product, err)
@@ -206,7 +222,7 @@ func ProposeAll(ctx context.Context, results []*analyze.Result, opts Options) (*
 			return nil, err
 		}
 
-		content, added, err := enc.merge(raw, prop, meta)
+		content, added, err := enc.merge(raw, fresh, meta)
 		switch {
 		case errors.Is(err, errUnreadable):
 			// The file is there and this cannot read it, which is not the same

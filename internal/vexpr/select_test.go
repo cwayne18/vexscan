@@ -39,9 +39,10 @@ func TestSelectProposalsPicksRuledOutOnly(t *testing.T) {
 	}
 }
 
-func TestSelectProposalsSkipsHubCoveredAndUnmatchable(t *testing.T) {
+func TestSelectProposalsMarksHubCoveredAndSkipsUnmatchable(t *testing.T) {
 	res := &analyze.Result{Findings: []analyze.Finding{
-		// Already answered by the hub -- leave it alone.
+		// Already answered by the hub -- kept, but marked so it is folded only
+		// into an aggregate and not written over the vendor's own document.
 		{ID: "CVE-1", CVE: "CVE-1", Product: testProduct, PURL: "pkg:deb/debian/a@1", Status: analyze.StatusNotPresent, VEX: &ecosystem.VEXStatement{Status: "not_affected"}},
 		// No id -- cannot be written as a matchable statement.
 		{Product: testProduct, PURL: "pkg:deb/debian/b@1", Status: analyze.StatusNotPresent},
@@ -49,11 +50,18 @@ func TestSelectProposalsSkipsHubCoveredAndUnmatchable(t *testing.T) {
 		{ID: "CVE-3", CVE: "CVE-3", Product: testProduct, Status: analyze.StatusNotPresent},
 	}}
 	props, skipped := selectProposals([]*analyze.Result{res}, testTime)
-	if len(props) != 0 {
-		t.Fatalf("got %d proposals, want 0", len(props))
-	}
 	if skipped != 2 {
 		t.Fatalf("skipped = %d, want 2", skipped)
+	}
+	if len(props) != 1 || len(props[0].Claims) != 1 {
+		t.Fatalf("got %+v, want the one covered claim kept", props)
+	}
+	if !props[0].Claims[0].covered {
+		t.Error("hub-covered claim was not marked covered")
+	}
+	// It is kept out of the product's own document...
+	if u := props[0].unanswered(); len(u.Claims) != 0 {
+		t.Errorf("covered claim leaked into the product document: %+v", u.Claims)
 	}
 }
 

@@ -2373,7 +2373,10 @@ with the statements appended and `timestamp` moved. The hub's own `@id`,
 `author` and `version` are left alone — you are adding to their document, not
 reissuing it — and dedupe runs against everything already in it, so a claim the
 merged report already carries is not written a second time even when the
-per-product document is missing it.
+per-product document is missing it. The reverse holds too: a finding a
+per-product document (or a vendor's own statement) already answers is still
+folded into a merged report that lacks it, so the aggregate a CI run reads is
+brought up to date rather than left permanently behind the tree.
 
 - **Aggregates are named, never discovered.** Nothing in the VEX Repository
   spec describes them; `index.json` maps a product to one document, and none of

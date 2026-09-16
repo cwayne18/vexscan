@@ -34,6 +34,13 @@ type Claim struct {
 	// how vexscan reached the verdict.
 	Impact    string
 	Timestamp string
+	// covered is set when a published statement already answers this finding
+	// (the scan matched it against a --vexhub, so Finding.VEX is not nil). Such
+	// a claim is kept rather than dropped: it is not written into the product's
+	// own document -- adding what a hub is missing does not overrule a vendor
+	// who has already spoken -- but it is still folded into any aggregate that
+	// lags the per-product tree, which is the merged report a CI run reads.
+	covered bool
 }
 
 // ProductProposal is every claim proposed for one product's document.
@@ -43,6 +50,19 @@ type ProductProposal struct {
 	// Claims are the not_affected claims, one per ruled-out finding, sorted so
 	// a repeated run produces a byte-identical document.
 	Claims []Claim
+}
+
+// unanswered is the proposal restricted to the claims no published statement
+// already answers -- what belongs in the product's own document. An aggregate
+// takes the whole proposal instead, and dedupes against its own contents.
+func (p ProductProposal) unanswered() ProductProposal {
+	out := ProductProposal{Product: p.Product}
+	for _, c := range p.Claims {
+		if !c.covered {
+			out.Claims = append(out.Claims, c)
+		}
+	}
+	return out
 }
 
 // selectProposals turns the ruled-out findings in one or more results into
@@ -55,10 +75,13 @@ type ProductProposal struct {
 // report being parsed and re-rendered for every image in the list.
 //
 // A finding qualifies when the scan ruled it out -- not_present or
-// not_in_execute_path, the two RULED OUT statuses the report groups -- and the
-// hub does not already answer it. A finding the hub already carries a statement
-// for (f.VEX != nil) is left alone whatever that statement says: this flow adds
-// what a hub is missing, it does not overrule a vendor who has already spoken.
+// not_in_execute_path, the two RULED OUT statuses the report groups. A finding
+// the hub already answers (f.VEX != nil) is kept but marked covered: it is not
+// written into the product's own document -- this flow adds what a hub is
+// missing, it does not overrule a vendor who has already spoken -- but it is
+// still offered to any aggregate that lags the per-product tree, so a merged
+// report can be brought up to date. Dropping it here instead is what left
+// --vex-merge-into reporting "no changes" while the aggregate stayed behind.
 //
 // A finding with no product, no component purl, or no vulnerability id cannot be
 // written as a matchable statement, so it is dropped rather than emitted as one
@@ -75,15 +98,14 @@ func selectProposals(results []*analyze.Result, timestamp string) (proposals []P
 			if !ruledOut(f) {
 				continue
 			}
-			if f.VEX != nil {
-				// The hub has already spoken to this finding; --vexhub matched it.
-				continue
-			}
 			c, ok := claimFor(f, timestamp)
 			if !ok {
 				skipped++
 				continue
 			}
+			// The hub has already spoken to this finding when --vexhub matched
+			// it. Kept, not dropped, so an aggregate can still be caught up.
+			c.covered = f.VEX != nil
 			// Dedupe within a single run: two binaries can rule out the same CVE
 			// in the same product, and so can two scans of the same image. The
 			// document should carry it once.

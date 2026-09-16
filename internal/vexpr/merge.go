@@ -121,6 +121,24 @@ func (idx *indexFile) ensure(product, fileName string) (location string, changed
 	return loc, true, nil
 }
 
+// filable reports whether a product could be written into the hub at all,
+// without adding it to the index. It is the eligibility an aggregate needs for
+// a product whose own document this run does not write -- one every claim of
+// which a published statement already answers -- where calling ensure would
+// leave the index pointing at a document that is never created.
+func (idx *indexFile) filable(product, fileName string) error {
+	if _, ok := idx.location(product); ok {
+		return nil
+	}
+	if _, err := productLocation(product, fileName); err != nil {
+		return err
+	}
+	if _, err := indexKey(product); err != nil {
+		return err
+	}
+	return nil
+}
+
 // marshal renders index.json: every original member in its original place, with
 // packages replaced by the same array plus whatever was appended.
 func (idx *indexFile) marshal() ([]byte, error) {
