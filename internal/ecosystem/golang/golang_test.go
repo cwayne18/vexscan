@@ -31,9 +31,9 @@ func TestPurlRoundTrip(t *testing.T) {
 	tests := []struct {
 		module, version, want string
 	}{
-		{"golang.org/x/net", "v0.17.0", "pkg:golang/golang.org%2Fx%2Fnet@v0.17.0"},
+		{"golang.org/x/net", "v0.17.0", "pkg:golang/golang.org/x/net@v0.17.0"},
 		{"stdlib", "1.24.0", "pkg:golang/stdlib@1.24.0"},
-		{"golang.org/x/net", "", "pkg:golang/golang.org%2Fx%2Fnet"},
+		{"golang.org/x/net", "", "pkg:golang/golang.org/x/net"},
 	}
 	for _, tt := range tests {
 		got := purl(tt.module, tt.version)
@@ -298,7 +298,7 @@ func TestGroupComponents(t *testing.T) {
 	if got[0].Ecosystem != "Go" {
 		t.Errorf("ecosystem = %q, want Go", got[0].Ecosystem)
 	}
-	if got[0].PURL != "pkg:golang/golang.org%2Fx%2Fnet@v0.17.0" {
+	if got[0].PURL != "pkg:golang/golang.org/x/net@v0.17.0" {
 		t.Errorf("purl = %q", got[0].PURL)
 	}
 	if got[0].Key() == got[1].Key() {

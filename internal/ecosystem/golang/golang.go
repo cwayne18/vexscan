@@ -921,15 +921,39 @@ func primaryID(st source.Statement) string {
 }
 
 // purl renders a Go module version as a package URL.
+//
+// The module path goes in literally, slashes and all. In
+// pkg:golang/<namespace>/<name>@<version> those slashes are the structural
+// separators between the namespace segments and the name, so percent-encoding
+// them does not escape a reserved character -- it changes what the purl says.
+// "pkg:golang/golang.org%2Fx%2Fcrypto@v0.55.0" parses as a namespace-less
+// package whose name happens to contain slashes, which is a different package
+// from golang.org/x/crypto, and every consumer that compares purls says so:
+// Trivy emits the literal form, never matches the encoded one, and silently
+// leaves the CVE unsuppressed. That is this tool publishing a statement nobody
+// can act on, which is the same failure as not publishing it.
+//
+// This is what vex.GoProduct already does for the main module, for the reason
+// written there: a hub's golang keys are the plain module path, which is also
+// exactly what build info reports. Products were always spelled that way and
+// subcomponents were not, so a document could disagree with itself.
+//
+// Nothing needs escaping. A Go module path is ASCII letters, digits and
+// "-._~/+", none of which is reserved in a purl path component. Note in
+// particular the "+" of a "+incompatible" version, which must stay literal:
+// packageurl-go's ToString writes it as %2B, and that spelling matches nothing
+// either.
 func purl(module, version string) string {
-	p := "pkg:golang/" + strings.ReplaceAll(module, "/", "%2F")
+	p := "pkg:golang/" + module
 	if version != "" {
 		p += "@" + version
 	}
 	return p
 }
 
-// parsePURL is the inverse of purl, tolerant of an unescaped module path.
+// parsePURL is the inverse of purl. It stays tolerant of the percent-encoded
+// module path this package used to emit, because a hub is full of documents
+// written by the version that did.
 func parsePURL(s string) (module, version string) {
 	const prefix = "pkg:golang/"
 	if !strings.HasPrefix(s, prefix) {

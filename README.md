@@ -120,7 +120,7 @@ resolved against whatever inventory contains it:
 golang:golang.org/x/net    deb:openssl    apk:musl    rpm:glibc    openssl
 pypi:PyYAML    npm:@babel/core    maven:org.apache.logging.log4j:log4j-core
 org.apache.logging.log4j:log4j-core    log4j-core
-pkg:golang/golang.org%2Fx%2Fnet@v0.17.0    pkg:pypi/pyyaml@6.0.3    pkg:npm/%40babel/core@7.24.0
+pkg:golang/golang.org/x/net@v0.17.0    pkg:pypi/pyyaml@6.0.3    pkg:npm/%40babel/core@7.24.0
 pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1
 ```
 
@@ -2049,7 +2049,7 @@ usually the most useful thing in the document:
   vendor:   Rancher Security team says not_affected (vulnerable_code_not_in_execute_path)
             Manually confirmed, only exploitable when running runc directly.
             product pkg:golang/k8s.io/kubernetes, published 2026-06-19T00:00:00Z
-            matched loosely: statement names pkg:golang/github.com/opencontainers/selinux@v1.11.0; component is pkg:golang/github.com%2Fopencontainers%2Fselinux@v1.11.1
+            matched loosely: statement names pkg:golang/github.com/opencontainers/selinux@v1.11.0; component is pkg:golang/github.com/opencontainers/selinux@v1.11.1
 ```
 
 Only `not_affected` and `fixed` move a row. A vendor `affected` or

@@ -843,7 +843,7 @@ runs a per-ecosystem presence test and reports what it could not rule out.
 	os.Stderr.WriteString(`
 A --package SPEC is a purl, an "ecosystem:name" shorthand, or a bare name:
   golang:golang.org/x/net   deb:openssl   pypi:PyYAML   npm:@babel/traverse
-  pkg:golang/golang.org%2Fx%2Fnet@v0.17.0
+  pkg:golang/golang.org/x/net@v0.17.0
 
 Examples:
   # Where does this CVE land, anywhere in the image? (searches every ecosystem)
