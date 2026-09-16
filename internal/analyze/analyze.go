@@ -147,6 +147,13 @@ type Options struct {
 	// hand. What it does buy is that the LLM overlay is never asked about a row
 	// nobody is going to read.
 	Severities []string
+	// FixedOnly drops findings no fix has been published for (--fixed-only),
+	// leaving the ones something can actually be done about.
+	//
+	// Applied late, after the fixed versions are resolved, and never silently:
+	// see fixedOnlyFilter and WithheldUnfixed. What it hides includes findings
+	// that are affecting the target right now, so the report says how many.
+	FixedOnly bool
 
 	CVEs    []string // optional filter; empty means "every advisory that applies"
 	Version string   // optional override of the detected module version (image mode)
@@ -311,6 +318,12 @@ type Result struct {
 	// flag was not used or hid nothing. See severityFilter: a filtered result
 	// and a clean one are indistinguishable without it.
 	Withheld *Withheld `json:"withheld,omitempty"`
+
+	// WithheldUnfixed is what --fixed-only removed from Findings, and is nil
+	// when the flag was not used or hid nothing. Separate from Withheld
+	// because a run using both flags hid two different populations for two
+	// different reasons: see fixedOnlyFilter.
+	WithheldUnfixed *WithheldUnfixed `json:"withheld_unfixed,omitempty"`
 
 	// Triage records what --triage contributed, and is nil when the flag was
 	// not used. Like VEXHubs it is not part of Failed(): see triageOverlay.
@@ -846,6 +859,9 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	productOverlay(result.Findings, opts.Image)
 	upstreamOverlay(result.Findings, sets.Upstream)
 	fixedOverlay(result.Findings, run.resolver.fixedVersions())
+	// Directly after the overlay that decides what "fixed" means, and before
+	// the ones that cost money or count rows. See fixedOnlyFilter.
+	result.Findings, result.WithheldUnfixed = fixedOnlyFilter(result.Findings, opts.FixedOnly)
 	result.VEXHubs = vexOverlay(ctx, opts.VEXHubs, result.Findings, run.resolver.aliases(), logf)
 	if len(opts.DistroFeeds) > 0 {
 		// After vexOverlay so a user's --vexhub outranks an automatic feed, and
@@ -1183,6 +1199,9 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 	// checkout is is its own module, which the Go plugin already recorded.
 	upstreamOverlay(result.Findings, sets.Upstream)
 	fixedOverlay(result.Findings, run.resolver.fixedVersions())
+	// See runTree: after the overlay that decides what "fixed" means, before
+	// the ones that cost money or count rows.
+	result.Findings, result.WithheldUnfixed = fixedOnlyFilter(result.Findings, opts.FixedOnly)
 	result.VEXHubs = vexOverlay(ctx, opts.VEXHubs, result.Findings, run.resolver.aliases(), logf)
 	result.Triage = triageOverlay(ctx, opts.Triage, result.Findings, sets.All, logf)
 	llmOverlay(ctx, llmClient, result.Findings, "source tree", logf)

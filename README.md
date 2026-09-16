@@ -1829,6 +1829,48 @@ Exit codes are unchanged: `0` the scan completed, `1` it could not read
 something, `2` the command line was wrong. Findings existing — at any severity —
 is not a failure, which is what keeps exit `1` worth acting on.
 
+### Filtering to what you can fix (`--fixed-only`)
+
+`--fixed-only` keeps the findings some published version closes, and drops the
+ones nothing can be done about yet. It is the answer to "just show me the work",
+and it is Trivy's `--ignore-unfixed` under a name that says what survives rather
+than what disappears.
+
+```console
+$ vexscan --image registry.rancher.com/rancher/nginx-ingress-controller:v1.15.1-prime11 --all --fixed-only
+NOTE: --fixed-only withheld 2 of 10 findings no fix has been published for:
+      2 unknown (no rating was published)
+      2 of those are AFFECTED: vulnerable, with no fix to upgrade to.
+
+  affected by severity: 7 unknown
+  7 affected: 7 fixable, 0 with no fix yet
+```
+
+The third line of that banner is the point. The first two read like a filter
+tidying up, and the rows behind them are not untidy: they are open, they apply
+to this image, and the only reason they are gone is that nobody has shipped a
+version to move to. Hiding them is a reasonable thing to want from a sprint
+board and a dangerous thing to do to a security report, so the count comes with
+every run and `--format json` gains a `withheld_unfixed` block carrying the same
+three numbers.
+
+- **It asks about the fix, not about you.** A `RULED OUT` finding with a fix
+  stays; an `AFFECTED` finding without one goes. Those are separate axes, and
+  collapsing them would make the flag mean something no reader of
+  `--ignore-unfixed` expects.
+- **It composes with `--severity`, and each says what it hid.** `--severity`
+  runs first over everything, `--fixed-only` over what survived, so the two
+  banners are two stages rather than two views of one number. If between them
+  they empty the report, both lines still print, because a reader dropping one
+  of the two flags needs to know which one was hiding what.
+- **A `--cves` id that matched nothing is never filtered**, for the same reason
+  `--severity` never filters it: those rows exist so an id you named by hand
+  cannot vanish, and they have no fix to publish.
+
+It runs after the fix versions are resolved — it has to, since that is what
+decides which rows have one — but before the VEX, distro-feed, triage and LLM
+overlays, so `--fixed-only --llm` only pays for the rows you will read.
+
 ### Prioritising by exploitation evidence (`--triage`)
 
 Severity says how bad a vulnerability would be if exploited. It says nothing
@@ -2712,6 +2754,7 @@ Three properties are deliberate:
 | `--vex-publisher-namespace` | | With `--vex-format csaf`, the URI identifying the publisher, e.g. `https://acme.example` — **required** for CSAF, and an error without it |
 | `--vex-publisher-category` | `other` | With `--vex-format csaf`, the CSAF publisher category: `coordinator`, `discoverer`, `other`, `translator`, `user`, `vendor` |
 | `--severity` | *(all)* | Only report findings at these severities: `CRITICAL`, `HIGH`, `UNKNOWN`, `MEDIUM`, `LOW`, `NONE`; comma-separated or repeatable. `UNKNOWN` must be named to be shown — see [Filtering by severity](#filtering-by-severity---severity) |
+| `--fixed-only` | `false` | Only report findings a fix has been published for. Prints how many it hid and how many of those are AFFECTED — see [Filtering to what you can fix](#filtering-to-what-you-can-fix---fixed-only) |
 | `--triage` | `false` | Order findings by exploitation evidence — EPSS scores and CISA's known-exploited catalog. Adds two columns and re-sorts; hides nothing and changes no severity — see [Prioritising by exploitation evidence](#prioritising-by-exploitation-evidence---triage) |
 | `--dlopen-policy` | `taint` | `taint` (block conclusions) or `assume-none` |
 | `--dynamic-import-policy` | `taint` | The same knob for a language import graph's computed imports. These are far more common than `dlopen`, so `assume-none` discards much more |

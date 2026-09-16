@@ -78,15 +78,36 @@ func writeNoFindings(b *strings.Builder, res *analyze.Result) {
 	case res.Failed():
 		b.WriteString("No findings, but the scan was incomplete: see above.\n")
 		b.WriteString("This is not a clean result.\n")
-	case res.Withheld != nil:
+	case res.Withheld != nil || res.WithheldUnfixed != nil:
 		// The --repo case: govulncheck publishes no severity, so every Go
 		// finding is UNKNOWN and a --severity that does not name UNKNOWN
 		// empties the report. Printing the bare "no findings" line there
-		// would be this tool telling its worst available lie.
-		b.WriteString("No findings at these severities.\n")
-		fmt.Fprintf(b, "--severity %s withheld all %d finding(s): %s.\n",
-			strings.Join(res.Withheld.Severities, ","), res.Withheld.Count,
-			withheldSpread(res.Withheld))
+		// would be this tool telling its worst available lie. --fixed-only
+		// empties a report the same way and just as quietly, on any target
+		// whose advisories are all still open.
+		//
+		// "all" is dropped when both flags ran, because then neither of them
+		// emptied the report by itself and saying so of each would be two
+		// statements that cannot both be true.
+		all := "all "
+		switch {
+		case res.Withheld != nil && res.WithheldUnfixed != nil:
+			all = ""
+			b.WriteString("No findings survived these filters.\n")
+		case res.Withheld != nil:
+			b.WriteString("No findings at these severities.\n")
+		default:
+			b.WriteString("No findings have a published fix.\n")
+		}
+		if w := res.Withheld; w != nil {
+			fmt.Fprintf(b, "--severity %s withheld %s%d finding(s): %s.\n",
+				strings.Join(w.Severities, ","), all, w.Count, withheldSpread(w))
+		}
+		if w := res.WithheldUnfixed; w != nil {
+			fmt.Fprintf(b, "--fixed-only withheld %s%d finding(s) no fix has been published for: %s.\n",
+				all, w.Count, unfixedSpread(w))
+			writeUnfixedAffected(b, w, "")
+		}
 		b.WriteString("This is a filtered view, not a clean result.\n")
 	default:
 		b.WriteString("No findings: nothing selected was found in this target,\n")
@@ -189,6 +210,15 @@ func writeCaveats(dst *strings.Builder, res *analyze.Result, pal palette) {
 		fmt.Fprintf(b, "NOTE: --severity %s withheld %d of %d findings:\n",
 			strings.Join(w.Severities, ","), w.Count, w.Count+len(res.Findings))
 		fmt.Fprintf(b, "      %s\n", withheldSpread(w))
+	}
+	if w := res.WithheldUnfixed; w != nil && len(res.Findings) > 0 {
+		// Below the severity banner, in the order the two filters ran, so the
+		// counts read as the two stages they are: --fixed-only's denominator is
+		// what was left after --severity, not the original total.
+		fmt.Fprintf(b, "NOTE: --fixed-only withheld %d of %d findings no fix has been published for:\n",
+			w.Count, w.Count+len(res.Findings))
+		fmt.Fprintf(b, "      %s\n", unfixedSpread(w))
+		writeUnfixedAffected(b, w, "      ")
 	}
 	writeCorrectionsCaveat(b, res)
 	for _, h := range res.VEXHubs {
@@ -752,6 +782,27 @@ func stale(b bool) string {
 // withheldSpread is what --severity hid, by severity.
 func withheldSpread(w *analyze.Withheld) string {
 	return severitySpread(w.BySeverity, true)
+}
+
+// unfixedSpread is what --fixed-only hid, by severity.
+func unfixedSpread(w *analyze.WithheldUnfixed) string {
+	return severitySpread(w.BySeverity, true)
+}
+
+// writeUnfixedAffected names the rows --fixed-only hid that were affecting the
+// target, and prints nothing when there were none.
+//
+// This is the line the flag is dangerous without. The severity spread above it
+// reads like a list of things that did not clear a bar, and every one of these
+// did: they are open, they apply, and the only reason they are gone is that
+// nobody has published a version to move to. A reader who hides 40 findings
+// because they cannot act on them should still be told that 12 of them are
+// acting on the target.
+func writeUnfixedAffected(b *strings.Builder, w *analyze.WithheldUnfixed, indent string) {
+	if w.Affected == 0 {
+		return
+	}
+	fmt.Fprintf(b, "%s%d of those are AFFECTED: vulnerable, with no fix to upgrade to.\n", indent, w.Affected)
 }
 
 // severitySpread renders a count-per-label as "10 critical, 26 high", in the

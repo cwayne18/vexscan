@@ -57,6 +57,7 @@ func main() {
 		all        = flag.Bool("all", false, "check everything each ecosystem can inventory (the default in --image mode with no --package/--cves)")
 		cvesFlag   = flag.String("cves", "", "comma-separated CVE/GHSA/GO ids to check; alone, resolved against the whole target")
 		cvesFile   = flag.String("cves-file", "", "file with one CVE/GHSA/GO id per line (merged with --cves)")
+		fixedOnly  = flag.Bool("fixed-only", false, "only report findings a fix has been published for; says how many it hid, including how many of those are affecting you")
 		modVersion = flag.String("module-version", "", "override the module version (image mode; default: read from each binary's build info)")
 		showVer    = flag.Bool("V", false, "print version and exit")
 		goVersion  = flag.String("go-version", "", "pin the Go toolchain for --repo, e.g. 1.24.0 (useful with --package golang:stdlib)")
@@ -323,6 +324,7 @@ func main() {
 		All:                *all,
 		Ecosystems:         ecosystems,
 		Severities:         keep,
+		FixedOnly:          *fixedOnly,
 		CVEs:               cves,
 		Version:            *modVersion,
 		OS:                 *goos,
@@ -815,7 +817,7 @@ var flagGroups = []struct {
 	names []string
 }{
 	{"Targets (choose exactly one)", []string{"image", "images-from", "rootfs", "repo", "rpm", "sbom"}},
-	{"What to check", []string{"package", "cves", "cves-file", "all", "ecosystem", "severity", "module"}},
+	{"What to check", []string{"package", "cves", "cves-file", "all", "ecosystem", "severity", "fixed-only", "module"}},
 	{"Source repo (--repo)", []string{"ref", "repo-path", "go-version"}},
 	{"Container image", []string{"os", "arch", "module-version"}},
 	{"Reachability", []string{"roots", "dlopen-policy", "dynamic-import-policy", "trust-import-absence"}},

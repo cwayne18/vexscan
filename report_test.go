@@ -880,6 +880,105 @@ func TestTheUnratedGlossOnlyAppearsWhenUnratedRowsWereHidden(t *testing.T) {
 	}
 }
 
+func unfixedReport(t *testing.T, w *analyze.WithheldUnfixed, findings ...analyze.Finding) string {
+	t.Helper()
+	return renderText(&analyze.Result{
+		SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
+		Findings: findings, WithheldUnfixed: w,
+	}, renderOpts{})
+}
+
+func TestTheFixedOnlyBannerSaysWhatItHid(t *testing.T) {
+	out := unfixedReport(t, &analyze.WithheldUnfixed{
+		Count:      40,
+		BySeverity: map[string]int{"HIGH": 4, "MEDIUM": 30, "UNKNOWN": 6},
+		Affected:   12,
+	}, gccTrio[1])
+
+	note := lineWith(t, out, "withheld")
+	for _, want := range []string{"NOTE:", "--fixed-only", "40 of 41", "no fix has been published for"} {
+		if !strings.Contains(note, want) {
+			t.Errorf("banner %q is missing %q", note, want)
+		}
+	}
+	if !strings.Contains(out, "4 high, 6 unknown (no rating was published), 30 medium") {
+		t.Errorf("want the ranked spread, got:\n%s", out)
+	}
+	// The line the flag is dangerous without.
+	if !strings.Contains(out, "12 of those are AFFECTED") {
+		t.Errorf("the banner hid 12 affected findings without saying so:\n%s", out)
+	}
+}
+
+// Every row it hid was already ruled out, so there is no second sentence to
+// write. The AFFECTED line has to mean something when it appears.
+func TestTheFixedOnlyBannerOmitsTheAffectedLineWhenItHidNone(t *testing.T) {
+	out := unfixedReport(t, &analyze.WithheldUnfixed{
+		Count: 9, BySeverity: map[string]int{"LOW": 9},
+	}, gccTrio[1])
+	if strings.Contains(out, "AFFECTED:") {
+		t.Errorf("claimed affected rows were hidden when none were:\n%s", out)
+	}
+}
+
+// The --fixed-only twin of TestFilteringEverythingIsNotACleanResult, and the
+// likelier case of the two: a target whose advisories are all still open
+// empties this report completely.
+func TestFilteringOutEveryUnfixedFindingIsNotACleanResult(t *testing.T) {
+	out := renderText(&analyze.Result{
+		SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
+		WithheldUnfixed: &analyze.WithheldUnfixed{
+			Count: 12, BySeverity: map[string]int{"HIGH": 12}, Affected: 3,
+		},
+	}, renderOpts{})
+
+	for _, want := range []string{
+		"No findings have a published fix.",
+		"--fixed-only withheld all 12 finding(s)",
+		"12 high",
+		"3 of those are AFFECTED",
+		"This is a filtered view, not a clean result.",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "the scan was incomplete") {
+		t.Errorf("a filtered report claims the scan was incomplete:\n%s", out)
+	}
+}
+
+// Both flags, and between them nothing left. Neither one emptied the report by
+// itself, so neither may say it withheld "all" of anything -- but both have to
+// appear, because a reader who drops one of the two flags needs to know which
+// one was hiding what.
+func TestTwoFiltersEmptyingTheReportBothSaySo(t *testing.T) {
+	out := renderText(&analyze.Result{
+		SchemaVersion: analyze.SchemaVersion, Target: "debian:12", Mode: "image",
+		Withheld: &analyze.Withheld{
+			Severities: []string{"CRITICAL"}, Count: 8,
+			BySeverity: map[string]int{"LOW": 8},
+		},
+		WithheldUnfixed: &analyze.WithheldUnfixed{
+			Count: 4, BySeverity: map[string]int{"CRITICAL": 4}, Affected: 4,
+		},
+	}, renderOpts{})
+
+	for _, want := range []string{
+		"No findings survived these filters.",
+		"--severity CRITICAL withheld 8 finding(s)",
+		"--fixed-only withheld 4 finding(s)",
+		"4 of those are AFFECTED",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "withheld all") {
+		t.Errorf("a filter claims it emptied the report alone when the other hid rows too:\n%s", out)
+	}
+}
+
 func TestNoBannerWithoutTheFlag(t *testing.T) {
 	out := report(t, false, gccTrio...)
 	for _, unwanted := range []string{"--severity", "withheld"} {
