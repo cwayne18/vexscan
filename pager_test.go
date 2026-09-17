@@ -121,6 +121,23 @@ func TestPageReportsFailureForAPagerThatIsNotThere(t *testing.T) {
 	}
 }
 
+// TestPageReportsFailureWhenTheWriteCannotLand is the same failure with the
+// timing taken out of it.
+//
+// The test above races: a pager that is not there fails the write only when sh
+// exits before page() writes, which it does on a loaded machine and does not on
+// an idle one. That is how the bug reached main green and then failed CI on the
+// merge commit. Here the report is larger than a pipe buffer and the pager
+// exits at once, so the write cannot possibly complete -- the losing ordering
+// every time, on any machine.
+func TestPageReportsFailureWhenTheWriteCannotLand(t *testing.T) {
+	clearPagerEnv(t)
+	t.Setenv("VEXSCAN_PAGER", "exit 3")
+	if page(strings.Repeat("a report\n", 1<<17)) {
+		t.Error("page() claimed success for a pager that read nothing and exited 3; the report would be lost")
+	}
+}
+
 func TestPageDeclinesWhenPagingIsOff(t *testing.T) {
 	clearPagerEnv(t)
 	t.Setenv("VEXSCAN_PAGER", "")
