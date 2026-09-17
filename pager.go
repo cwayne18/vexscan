@@ -94,13 +94,20 @@ func page(s string) bool {
 		return false
 	}
 
-	// A write error here is almost always the reader quitting early, which is
-	// not a failure -- the reader saw what they wanted and pressed q. The
-	// report has already been partly written to the terminal either way, so
-	// reprinting it would be worse than saying nothing.
-	_, writeErr := io.WriteString(stdin, s)
+	// The write error is deliberately discarded, and the exit status alone
+	// decides. A failed write is almost always the reader quitting early --
+	// they saw what they wanted and pressed q -- and every common pager exits 0
+	// when that happens, so Wait already reports it as the success it is.
+	//
+	// It must not be consulted on top of that, because the other way to fail a
+	// write is a pager that was never there: sh exits 127 before anything reads
+	// the pipe, the write gets EPIPE, and treating that as an early quit loses
+	// the report entirely. Which of the two orderings happens is a race against
+	// process startup -- it wins on an idle laptop and loses on a loaded CI
+	// runner -- and a report must not depend on that.
+	_, _ = io.WriteString(stdin, s)
 	stdin.Close()
-	if err := cmd.Wait(); err != nil && writeErr == nil {
+	if err := cmd.Wait(); err != nil {
 		// The pager took the text and still failed, or -- far more likely --
 		// never existed: sh exits 127 for a command it cannot find, and the
 		// text vanishes into a pipe nobody read. Falling back can in principle
