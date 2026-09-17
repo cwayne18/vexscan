@@ -4,6 +4,7 @@ import (
 	"context"
 	"debug/elf"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -460,6 +461,102 @@ func TestFamiliesAreSelectable(t *testing.T) {
 	}
 	if ecosystem.MatchEcosystem(p, "golang") {
 		t.Error("--ecosystem golang selects the OS plugin")
+	}
+}
+
+// TestAPureGoEntrypointDischargesTheStaticTaint is the end-to-end of the
+// discharge: a real CGO_ENABLED=0 binary as the entrypoint, through the plugin
+// as a caller drives it, with no prober injected by the test.
+//
+// It is here and not in elfgraph because the two halves are wired together
+// here, and a test that injects its own prober cannot tell whether the plugin
+// installs one. Deleting StaticProber from the graph options passes every
+// test in elfgraph and binscan; it fails this one.
+//
+// The evidence assertion is the other half. A clean verdict that a prober
+// unlocked and a clean verdict nothing ever threatened are different claims,
+// and the discharged taint is what distinguishes them in the output.
+func TestAPureGoEntrypointDischargesTheStaticTaint(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		cgo      string
+		want     ecosystem.Status
+		blocking bool
+	}{
+		// Pure Go: links no C library, so it cannot be hiding a copy of
+		// libunused inside itself and the untouched .so on disk is the answer.
+		{"pure Go", "CGO_ENABLED=0", ecosystem.StatusNotInPath, false},
+		// cgo: it may well have linked the C library in, and nothing here can
+		// see whether it did.
+		{"cgo", "CGO_ENABLED=1", ecosystem.StatusLinked, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bin := filepath.Join(t.TempDir(), "app")
+			buildGoBinary(t, bin, tc.cgo)
+			code, err := os.ReadFile(bin)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			img := debianImage(t,
+				target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}},
+				[]debPkg{{name: "libunused1", version: "1.0-1", files: []string{"/usr/lib/libunused.so.1"}}},
+				map[string]string{"/usr/bin/app": string(code)})
+
+			// Statically linked as far as the closure is concerned: no
+			// PT_INTERP, so DT_NEEDED sees nothing. Whether that is a Go binary
+			// is the prober's question, and it reads the file itself.
+			p := New(Options{ReadELF: fakeELF{
+				"/usr/bin/app":            {Class: elf.ELFCLASS64, Machine: elf.EM_X86_64, Type: elf.ET_EXEC},
+				"/usr/lib/libunused.so.1": lib("libunused.so.1"),
+			}.read})
+
+			f := statuses(t, p, img, []ecosystem.Subject{{Raw: ""}})["libunused1"]
+			if f.Status != tc.want {
+				t.Errorf("status = %s, want %s", f.Status, tc.want)
+			}
+
+			var static *ecosystem.Evidence
+			for i, e := range f.Evidence {
+				if strings.Contains(e.Detail, "statically linked") {
+					static = &f.Evidence[i]
+				}
+			}
+			if static == nil {
+				t.Fatalf("the static entrypoint left no trace in the evidence: %+v", f.Evidence)
+			}
+			if static.Blocking != tc.blocking {
+				t.Errorf("static evidence blocking = %v, want %v: %q", static.Blocking, tc.blocking, static.Detail)
+			}
+			if got := strings.Contains(static.Detail, "CGO_ENABLED=0"); got != !tc.blocking {
+				t.Errorf("evidence does not say what happened to the taint: %q", static.Detail)
+			}
+		})
+	}
+}
+
+// buildGoBinary compiles a trivial program to dst with env applied to the
+// toolchain. A handwritten fixture will not do: the CGO_ENABLED setting the
+// prober reads is stamped by the build, so only a real binary carries one.
+func buildGoBinary(t *testing.T, dst string, env ...string) {
+	t.Helper()
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("no go toolchain on PATH")
+	}
+	src := t.TempDir()
+	write := func(name, content string) {
+		if err := os.WriteFile(filepath.Join(src, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("go.mod", "module probe\n\ngo 1.21\n")
+	write("main.go", "package main\n\nfunc main() {}\n")
+
+	cmd := exec.Command("go", "build", "-o", dst, ".")
+	cmd.Dir = src
+	cmd.Env = append(os.Environ(), env...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("go build unavailable in this environment: %v: %s", err, out)
 	}
 }
 

@@ -76,8 +76,14 @@ type StaticProbe struct {
 	// raise is recorded rather than allowed to block.
 	Closed bool
 
-	// Why explains the conclusion in the taint's evidence line. Set whenever
-	// Closed is true, so the discharge is auditable next to what it discharged.
+	// Why explains the conclusion in the taint's evidence line, so the
+	// discharge is auditable next to what it discharged.
+	//
+	// Required when Closed is true, and enforced rather than documented: a
+	// probe that clears a binary without saying why produces a taint whose
+	// detail reads exactly like the blocking one, and a result that was
+	// filtered has to be distinguishable from a result that was not. A Closed
+	// probe with no Why is therefore treated as having established nothing.
 	Why string
 }
 
@@ -625,12 +631,18 @@ func (g *Graph) collectTaints(opts Options) {
 			})
 		}
 		if n.Info.Dlopen {
+			assumed := opts.DlopenPolicy == DlopenAssumeNone
+			detail := fmt.Sprintf("%s calls dlopen, so what it loads is decided at runtime", p)
+			if assumed {
+				detail += ", and --dlopen-policy=assume-none says to take that as loading nothing that matters here"
+			}
 			g.taints = append(g.taints, Taint{
-				Kind:     TaintDlopen,
-				Detail:   fmt.Sprintf("%s calls dlopen, so what it loads is decided at runtime", p),
-				Path:     p,
-				Blocking: opts.DlopenPolicy != DlopenAssumeNone,
-				Global:   opts.DlopenPolicy != DlopenAssumeNone,
+				Kind:       TaintDlopen,
+				Detail:     detail,
+				Path:       p,
+				Blocking:   !assumed,
+				Global:     !assumed,
+				Discharged: assumed,
 			})
 		}
 		if n.Kind >= RootEscalated && n.Info.Static() {
@@ -656,7 +668,10 @@ func (g *Graph) collectTaints(opts Options) {
 			// the taint is recorded rather than allowed to block.
 			var probed string
 			if blocking && opts.StaticProber != nil {
-				if pr, ok := opts.StaticProber(g.fsys, p); ok && pr.Closed {
+				// pr.Why is part of the condition, not just the message: an
+				// unexplained discharge would be indistinguishable in the
+				// output from no discharge at all.
+				if pr, ok := opts.StaticProber(g.fsys, p); ok && pr.Closed && pr.Why != "" {
 					blocking = false
 					probed = pr.Why
 				}
@@ -675,6 +690,10 @@ func (g *Graph) collectTaints(opts Options) {
 				Path:     p,
 				Blocking: blocking,
 				Global:   blocking,
+				// Only the entrypoint case is a discharge. A static utility
+				// that is not a root never blocked, so recording it as
+				// "answered" would claim a test that never ran.
+				Discharged: explicit && !blocking,
 			})
 		}
 	}

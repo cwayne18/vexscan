@@ -61,6 +61,18 @@ type Taint struct {
 	// asserted the risk away, and the record should still show it was there.
 	Blocking bool `json:"blocking"`
 
+	// Discharged says this taint would have blocked and something answered it:
+	// --dlopen-policy=assume-none, or a StaticProber that could account for a
+	// static entrypoint's contents.
+	//
+	// It is separate from !Blocking because the two say different things. A
+	// static utility that is not the entrypoint never blocked in the first
+	// place -- every glibc distribution ships a static ldconfig -- and it is
+	// recorded for completeness. A discharged taint is load-bearing: it is the
+	// reason a conclusion was available at all, so a report that omits it lets
+	// a cleared verdict read as one nothing ever threatened.
+	Discharged bool `json:"discharged,omitempty"`
+
 	// Global says the taint applies to every package rather than to the
 	// scope named by Path or Soname.
 	Global bool `json:"global,omitempty"`

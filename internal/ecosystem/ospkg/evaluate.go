@@ -121,6 +121,11 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 
 	blockers := e.blockers(files.ELF)
 
+	// Recorded first, before anything the closure goes on to conclude, because
+	// a discharged taint is the ground the conclusion stands on rather than a
+	// footnote to it.
+	f.Evidence = append(f.Evidence, e.discharged()...)
+
 	// The mined-symbol layer runs before the closure is consulted, because it
 	// answers a stronger question: whether the vulnerable function is in this
 	// build at all. It is gated on there being no blocking taint for the same
@@ -290,6 +295,37 @@ func metadataDetail(pkg pkgdb.Package, meta pkgdb.Meta) string {
 // blockers are the taints that stop this package's objects being declared
 // unreachable: every global one, plus any scoped to a library it installs.
 func (e evaluator) blockers(elfFiles []string) []ecosystem.Evidence {
+	return e.taints(elfFiles, true)
+}
+
+// discharged are the taints that would have blocked this package's conclusion
+// and were answered: a static entrypoint a prober could account for, a dlopen
+// call the user waved off with --dlopen-policy=assume-none.
+//
+// They are reported because they are the reason a conclusion was available. A
+// clean nothing ever threatened and a clean resting on a prober having looked
+// inside a static binary are different claims, and a reader weighing the row
+// cannot tell them apart if the second leaves no trace.
+//
+// Every discharged taint is in scope for every package, because the taints
+// that can be discharged are the ones that blocked globally before they were.
+// They carry Blocking false, so they are evidence and not a gate, and they are
+// deliberately not part of blockers() -- callers count that slice to decide
+// whether a conclusion is available at all, and an answered taint must not
+// resurrect itself as a blocker by being counted there.
+func (e evaluator) discharged() []ecosystem.Evidence {
+	var out []ecosystem.Evidence
+	for _, t := range e.g.Taints() {
+		if !t.Discharged {
+			continue
+		}
+		out = append(out, ecosystem.Evidence{Origin: MethodClosure, Detail: t.Detail})
+	}
+	return out
+}
+
+// taints maps the recorded taints in scope for this package to evidence.
+func (e evaluator) taints(elfFiles []string, blocking bool) []ecosystem.Evidence {
 	sonames := map[string]bool{}
 	for _, f := range elfFiles {
 		sonames[path.Base(f)] = true
@@ -300,7 +336,7 @@ func (e evaluator) blockers(elfFiles []string) []ecosystem.Evidence {
 
 	var out []ecosystem.Evidence
 	for _, t := range e.g.Taints() {
-		if !t.Blocking {
+		if t.Blocking != blocking {
 			continue
 		}
 		// A scoped taint is a claim about one soname. It belongs to this
@@ -313,7 +349,7 @@ func (e evaluator) blockers(elfFiles []string) []ecosystem.Evidence {
 		out = append(out, ecosystem.Evidence{
 			Origin:   MethodClosure,
 			Detail:   t.Detail,
-			Blocking: true,
+			Blocking: t.Blocking,
 		})
 	}
 	return out

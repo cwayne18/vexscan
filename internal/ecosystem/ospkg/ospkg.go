@@ -433,6 +433,15 @@ func (p *Plugin) graph(pr *prepared) (*elfgraph.Graph, error) {
 // stops being a reason to block: the .so on disk being unreferenced is the real
 // answer. Anything else -- a cgo build, a non-Go binary, a build info with no
 // CGO_ENABLED setting -- returns false and leaves the taint blocking.
+//
+// What it discharges is linked-in C code, and only that. A pure-Go binary can
+// still exec something else in the image, or write out an embedded helper and
+// exec that, and either would load a library the closure called unreferenced.
+// That gap is not specific to static binaries -- a dynamically linked
+// entrypoint can do exactly the same and has never blocked for it -- so this
+// brings static entrypoints to the same footing rather than below it. The
+// residual is real and belongs in the known limits, not in a taint that stops
+// every conclusion an image can produce.
 func cgoStaticProbe(fsys target.RootFS, treePath string) (elfgraph.StaticProbe, bool) {
 	host, err := fsys.HostPath(treePath)
 	if err != nil {
