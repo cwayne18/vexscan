@@ -199,6 +199,33 @@ func IsStripped(path string) bool {
 	return len(syms) == 0
 }
 
+// CGODisabled reports whether the Go binary at hostPath was built with
+// CGO_ENABLED=0.
+//
+// A CGO_ENABLED=0 build links no C library, so however statically linked it is,
+// it cannot carry a hidden copy of libcrypto or any other C shared object. That
+// is the one thing that discharges the static-entrypoint taint: the closure's
+// inability to see inside the binary stops mattering once the binary is known
+// to hold nothing.
+//
+// The second result is false when the file is not a Go binary or records no
+// CGO_ENABLED setting -- an older toolchain, a stripped build info -- in which
+// case nothing is known and the caller must stay conservative. It survives
+// -ldflags=-s -w, because the build settings live in the same notes section
+// buildinfo already reads for module versions, not in the symbol table.
+func CGODisabled(hostPath string) (disabled, ok bool) {
+	info, err := buildinfo.ReadFile(hostPath)
+	if err != nil || info == nil {
+		return false, false
+	}
+	for _, s := range info.Settings {
+		if s.Key == "CGO_ENABLED" {
+			return s.Value == "0", true
+		}
+	}
+	return false, false
+}
+
 // openVEXDoc is the subset of the OpenVEX schema govulncheck emits.
 type openVEXDoc struct {
 	Statements []struct {

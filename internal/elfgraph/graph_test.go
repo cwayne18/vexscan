@@ -676,6 +676,59 @@ func TestStaticUtilityIsRecordedButDoesNotBlock(t *testing.T) {
 	}
 }
 
+// TestStaticRootDischargedByProbe: a static entrypoint a prober can account for
+// -- a pure-Go CGO_ENABLED=0 build links no C library -- carries nothing
+// hidden, so the taint is recorded rather than left to block. The prober is
+// injected the same way ReadELF is, so no real Go binary is needed to exercise
+// the discharge.
+func TestStaticRootDischargedByProbe(t *testing.T) {
+	static := &Info{Class: elf.ELFCLASS64, Machine: elf.EM_X86_64, Type: elf.ET_EXEC}
+	opts := Options{
+		Config: target.ImageConfig{Entrypoint: []string{"/app/server"}},
+		StaticProber: func(_ target.RootFS, p string) (StaticProbe, bool) {
+			if p != "/app/server" {
+				return StaticProbe{}, false
+			}
+			return StaticProbe{Closed: true, Why: "it is a pure-Go binary built with CGO_ENABLED=0"}, true
+		},
+	}
+	g := build(t, tree(t, map[string]string{"/app/server": "", "/usr/lib/libssl.so.3": ""}),
+		fakeELF{"/app/server": static, "/usr/lib/libssl.so.3": lib()}, opts)
+
+	tt := hasTaint(g, TaintStaticELF)
+	if tt == nil {
+		t.Fatal("a discharged static entrypoint must still be recorded")
+	}
+	if tt.Blocking || tt.Global {
+		t.Errorf("prober said the binary is closed, but the taint still blocks: %+v", *tt)
+	}
+	if len(g.BlockingTaints()) != 0 {
+		t.Errorf("BlockingTaints() = %v, want none once the entrypoint is discharged", g.BlockingTaints())
+	}
+	if !strings.Contains(tt.Detail, "CGO_ENABLED=0") {
+		t.Errorf("detail does not record why the taint was discharged: %q", tt.Detail)
+	}
+}
+
+// TestStaticRootProbeInconclusiveStillBlocks: a prober that cannot account for
+// the binary -- a cgo build, an unrecognised file -- leaves the entrypoint
+// blocking exactly as it would with no prober at all. The discharge is a
+// narrowing of the conservative default, never a loosening of it.
+func TestStaticRootProbeInconclusiveStillBlocks(t *testing.T) {
+	static := &Info{Class: elf.ELFCLASS64, Machine: elf.EM_X86_64, Type: elf.ET_EXEC}
+	opts := Options{
+		Config:       target.ImageConfig{Entrypoint: []string{"/app/server"}},
+		StaticProber: func(target.RootFS, string) (StaticProbe, bool) { return StaticProbe{}, false },
+	}
+	g := build(t, tree(t, map[string]string{"/app/server": "", "/usr/lib/libssl.so.3": ""}),
+		fakeELF{"/app/server": static, "/usr/lib/libssl.so.3": lib()}, opts)
+
+	tt := hasTaint(g, TaintStaticELF)
+	if tt == nil || !tt.Blocking || !tt.Global {
+		t.Fatalf("an unaccounted static entrypoint must stay a global blocker: %+v", tt)
+	}
+}
+
 // TestTheInterpreterIsReachable: ld.so is loaded by the kernel, not through
 // DT_NEEDED, so nothing in the graph points at it. It belongs to glibc or musl
 // -- the two packages most often asked about -- and reporting it unreachable in

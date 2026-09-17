@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/cwayne18/vexscan/internal/binscan"
 	"github.com/cwayne18/vexscan/internal/ecosystem"
 	"github.com/cwayne18/vexscan/internal/elfgraph"
 	"github.com/cwayne18/vexscan/internal/osv"
@@ -418,10 +419,33 @@ func (p *Plugin) graph(pr *prepared) (*elfgraph.Graph, error) {
 			Roots:        p.Roots,
 			DlopenPolicy: p.DlopenPolicy,
 			ReadELF:      p.ReadELF,
+			StaticProber: cgoStaticProbe,
 			Logf:         p.Logf,
 		})
 	})
 	return pr.graph, pr.graphErr
+}
+
+// cgoStaticProbe discharges the static-entrypoint taint for a pure-Go binary.
+//
+// A CGO_ENABLED=0 build links no C library, so it cannot carry a hidden copy of
+// a vulnerable shared object. The closure not being able to see inside it then
+// stops being a reason to block: the .so on disk being unreferenced is the real
+// answer. Anything else -- a cgo build, a non-Go binary, a build info with no
+// CGO_ENABLED setting -- returns false and leaves the taint blocking.
+func cgoStaticProbe(fsys target.RootFS, treePath string) (elfgraph.StaticProbe, bool) {
+	host, err := fsys.HostPath(treePath)
+	if err != nil {
+		return elfgraph.StaticProbe{}, false
+	}
+	disabled, ok := binscan.CGODisabled(host)
+	if !ok || !disabled {
+		return elfgraph.StaticProbe{}, false
+	}
+	return elfgraph.StaticProbe{
+		Closed: true,
+		Why:    "it is a pure-Go binary built with CGO_ENABLED=0, so it links no C library and cannot carry a hidden copy of one",
+	}, true
 }
 
 // AnalyzeImage implements ecosystem.ImageAnalyzer.
