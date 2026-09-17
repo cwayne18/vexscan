@@ -83,28 +83,67 @@ func (br *batchReport) failed() bool {
 	return false
 }
 
+// scanTarget is one image in a batch: what it is called, and -- when it is not
+// coming from a registry -- what the local OCI layout calls it.
+//
+// The two are one string for --image and --images-from, and two for --haul,
+// because hauler files a store entry under a name with the registry stripped
+// off. ref is the one that reaches the report and the purls; storeRef only
+// ever addresses bytes. See image.Source.
+type scanTarget struct {
+	ref      string
+	storeRef string
+}
+
+// imageTargets is the plain case: a list of references, each its own address.
+func imageTargets(refs []string) []scanTarget {
+	out := make([]scanTarget, 0, len(refs))
+	for _, r := range refs {
+		out = append(out, scanTarget{ref: r})
+	}
+	return out
+}
+
+// targetRefs is the inverse, for the places that only want the names.
+func targetRefs(targets []scanTarget) []string {
+	out := make([]string, 0, len(targets))
+	for _, t := range targets {
+		out = append(out, t.ref)
+	}
+	return out
+}
+
 // batchRun is everything runBatch needs from the command line. A struct rather
 // than fifteen parameters, and only because the flag block it comes from is
 // already fifteen lines long.
 type batchRun struct {
-	opts      analyze.Options // the shared scan settings; Image is set per image
-	images    []string
-	format    string
-	render    renderOpts
-	out       string
-	noPager   bool
-	gist      bool
-	gistPub   bool
-	vexOpts   vexOutOptions // timestamp and logf are filled in per run below
-	gate      failOn
-	started   time.Time
-	logf      func(string, ...any)
+	opts    analyze.Options // the shared scan settings; the target is set per image
+	targets []scanTarget
+	format  string
+	render  renderOpts
+	out     string
+	noPager bool
+	gist    bool
+	gistPub bool
+	vexOpts vexOutOptions // timestamp and logf are filled in per run below
+	gate    failOn
+	started time.Time
+	logf    func(string, ...any)
+
+	// afterScan releases whatever the targets were read out of, once the last
+	// one has been. For --haul that is an unpacked copy of the bundle, which
+	// can be tens of gigabytes and is of no use to the rendering that follows.
+	// A defer would not do: every path out of here is an os.Exit.
+	afterScan func()
 }
 
 // runBatch scans a fleet and exits. It never returns: like the single-image
 // path it owns the process's exit status, and for the same reasons.
 func runBatch(ctx context.Context, r batchRun) {
-	br := scanBatch(ctx, r.opts, r.images, r.logf)
+	br := scanBatch(ctx, r.opts, r.targets, r.logf)
+	if r.afterScan != nil {
+		r.afterScan()
+	}
 
 	rendered, err := renderBatch(br, r.format, r.render)
 	if err != nil {
@@ -205,16 +244,18 @@ func runBatch(ctx context.Context, r batchRun) {
 //
 // An image that fails is recorded and the scan moves on. Aborting on image 7 of
 // 40 would make this worse than the shell loop it replaces.
-func scanBatch(ctx context.Context, opts analyze.Options, images []string, logf func(string, ...any)) *batchReport {
+func scanBatch(ctx context.Context, opts analyze.Options, targets []scanTarget, logf func(string, ...any)) *batchReport {
 	br := &batchReport{
 		SchemaVersion: batchSchemaVersion,
 		Mode:          "batch",
-		Targets:       len(images),
-		order:         images,
+		Targets:       len(targets),
+		order:         targetRefs(targets),
 	}
-	for i, ref := range images {
-		logf("[%d/%d] %s", i+1, len(images), ref)
+	for i, t := range targets {
+		ref := t.ref
+		logf("[%d/%d] %s", i+1, len(targets), ref)
 		opts.Image = ref
+		opts.ImageLayoutRef = t.storeRef
 
 		// Per-image, because the descriptor records what this scan of this
 		// image cost, and a fleet's total tells a reader nothing about the one
@@ -287,15 +328,17 @@ func reportBatchFailures(br *batchReport) {
 // runInventoryBatch is --format inventory over a fleet: one listing per image,
 // in list order, and an image that could not be read is a labelled section
 // rather than a gap.
-func runInventoryBatch(ctx context.Context, opts analyze.Options, images []string, out string, noPager bool, logf func(string, ...any)) {
+func runInventoryBatch(ctx context.Context, opts analyze.Options, targets []scanTarget, out string, noPager bool, afterScan func(), logf func(string, ...any)) {
 	var b strings.Builder
 	bad := 0
-	for i, ref := range images {
+	for i, t := range targets {
 		if i > 0 {
 			writeBatchRule(&b)
 		}
-		logf("[%d/%d] %s", i+1, len(images), ref)
+		ref := t.ref
+		logf("[%d/%d] %s", i+1, len(targets), ref)
 		opts.Image = ref
+		opts.ImageLayoutRef = t.storeRef
 		inv, err := analyze.Inventory(ctx, opts)
 		if err != nil {
 			bad++
@@ -312,11 +355,15 @@ func runInventoryBatch(ctx context.Context, opts analyze.Options, images []strin
 		b.WriteString(renderInventory(inv))
 	}
 
+	if afterScan != nil {
+		afterScan()
+	}
+
 	// Written first, then failed: a fleet inventory with holes in it is still
 	// worth reading, and still not something a CI job should treat as the list.
 	emit(b.String(), out, noPager, logf)
 	if bad > 0 {
-		fmt.Fprintf(os.Stderr, "error: %d of %d image(s) could not be fully inventoried\n", bad, len(images))
+		fmt.Fprintf(os.Stderr, "error: %d of %d image(s) could not be fully inventoried\n", bad, len(targets))
 		os.Exit(1)
 	}
 }

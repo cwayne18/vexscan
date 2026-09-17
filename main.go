@@ -47,7 +47,8 @@ func main() {
 	flag.Var(&severities, "severity", "only report these severities: "+
 		strings.Join(cvss.Labels, ", ")+"; comma-separated or repeatable (UNKNOWN must be named to be shown)")
 	var (
-		imagesFrom = flag.String("images-from", "", "scan every image named in this list: a file with one reference per line, a URL, or '-' for stdin")
+		imagesFrom = flag.String("images-from", "", "scan every image named in this list: a file with one reference per line, a hauler manifest, a URL, or '-' for stdin")
+		haulPath   = flag.String("haul", "", "scan every image inside a hauler haul, without a registry: a .tar.zst, a tar, or an unpacked store directory")
 		rootfs     = flag.String("rootfs", "", "filesystem tree on disk to inspect: an unpacked image, a mounted volume, a machine's own /")
 		repo       = flag.String("repo", "", "git source repo to analyze via govulncheck source mode, e.g. github.com/rancher/rancher")
 		sbom       = flag.String("sbom", "", "CycloneDX JSON bill of materials to scan: a path, or '-' for stdin (every finding is undetermined)")
@@ -134,8 +135,16 @@ func main() {
 	if len(rpms) > 0 {
 		named++
 	}
+	// --haul names images like the other two, but it also says where to read
+	// them from, and that part does not combine: an image from a registry and
+	// an image from this haul would be extracted by different routes under one
+	// --image list, and a reference present in both would be ambiguous about
+	// which copy the report is describing.
+	if *haulPath != "" {
+		named++
+	}
 	if named != 1 {
-		fail("set exactly one of --image, --images-from, --rootfs, --repo, --rpm or --sbom")
+		fail("set exactly one of --image, --images-from, --haul, --rootfs, --repo, --rpm or --sbom")
 	}
 	if *rpmDeep {
 		if len(rpms) == 0 {
@@ -280,19 +289,41 @@ func main() {
 	// is minutes nobody asked for.
 	images = dedupe(images)
 
+	// The haul is opened here for the same reason: a haul that is not one, or
+	// one with nothing scannable in it, is an error reported before any work
+	// rather than after a multi-gigabyte unpack.
+	var (
+		targets   []scanTarget
+		haulDir   string
+		afterScan = func() {}
+	)
+	if *haulPath != "" {
+		h, t := openHaul(ctx, *haulPath, logf)
+		// Released as soon as the last image has been extracted rather than at
+		// the end of the run, because an unpacked haul is a second copy of a
+		// bundle that can be tens of gigabytes and the report does not need it.
+		// It cannot be deferred: the batch paths own the exit status and leave
+		// through os.Exit, which runs no defers.
+		haulDir, targets, afterScan = h.Dir, t, func() { h.Close() }
+	} else {
+		targets = imageTargets(images)
+	}
+
 	// Whether the report is a batch is decided by the flags, not by how many
 	// lines the list happened to have. A pipeline whose fleet.txt drops to one
 	// image should not silently change output shape underneath the thing that
-	// parses it.
-	batchMode := *imagesFrom != "" || len(images) > 1
+	// parses it. A haul is always a batch on the same grounds -- what is in it
+	// is a property of the bundle, not of the command.
+	batchMode := *imagesFrom != "" || *haulPath != "" || len(targets) > 1
 	var firstImage string
-	if len(images) > 0 {
-		firstImage = images[0]
+	if len(targets) > 0 {
+		firstImage = targets[0].ref
 	}
 
 	if inventoryMode {
 		invOpts := analyze.Options{
 			Image:        firstImage,
+			ImageLayout:  haulDir,
 			RootFS:       *rootfs,
 			Repo:         *repo,
 			RPM:          rpms,
@@ -303,7 +334,7 @@ func main() {
 			Logf:         logf,
 		}
 		if batchMode {
-			runInventoryBatch(ctx, invOpts, images, *out, *noPager, logf)
+			runInventoryBatch(ctx, invOpts, targets, *out, *noPager, afterScan, logf)
 			return
 		}
 		runInventory(ctx, invOpts, *out, *noPager, logf)
@@ -312,6 +343,7 @@ func main() {
 
 	opts := analyze.Options{
 		Image:              firstImage,
+		ImageLayout:        haulDir,
 		RootFS:             *rootfs,
 		Repo:               *repo,
 		RPM:                rpms,
@@ -367,7 +399,8 @@ func main() {
 	if batchMode {
 		runBatch(ctx, batchRun{
 			opts:      opts,
-			images:    images,
+			targets:   targets,
+			afterScan: afterScan,
 			format:    *format,
 			render:    ropts,
 			out:       *out,
@@ -798,8 +831,8 @@ const synopsis = `Usage:
   vexscan <target> <selection> [flags]
   vexscan --version
 
-Target (choose one):   --image REF... | --images-from LIST | --rootfs DIR |
-                       --repo REPO | --rpm FILE | --sbom FILE
+Target (choose one):   --image REF... | --images-from LIST | --haul FILE |
+                       --rootfs DIR | --repo REPO | --rpm FILE | --sbom FILE
 Selection:             --package SPEC... | --cves LIST | --all
 `
 
@@ -816,7 +849,7 @@ var flagGroups = []struct {
 	title string
 	names []string
 }{
-	{"Targets (choose exactly one)", []string{"image", "images-from", "rootfs", "repo", "rpm", "sbom"}},
+	{"Targets (choose exactly one)", []string{"image", "images-from", "haul", "rootfs", "repo", "rpm", "sbom"}},
 	{"What to check", []string{"package", "cves", "cves-file", "all", "ecosystem", "severity", "fixed-only", "module"}},
 	{"Source repo (--repo)", []string{"ref", "repo-path", "go-version"}},
 	{"Container image", []string{"os", "arch", "module-version"}},
@@ -864,6 +897,9 @@ Examples:
   vexscan --images-from fleet.txt --format summary
   kubectl get pods -A -o jsonpath='{..image}' | tr ' ' '\n' | \
     vexscan --images-from - --format summary
+
+  # A hauler haul, scanned in the airgap it was carried into -- no registry
+  vexscan --haul rke2-airgap.tar.zst --all --format summary
 
   # A source repo, or an SBOM when there is no image to hand
   vexscan --repo github.com/rancher/rancher --package golang:golang.org/x/net

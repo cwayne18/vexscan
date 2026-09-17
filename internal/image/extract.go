@@ -65,6 +65,53 @@ func NewExtractor() *Extractor {
 	return &Extractor{OS: "linux", Arch: "amd64", SkopeoPath: "skopeo"}
 }
 
+// Source names an image to extract and says where to read it from.
+//
+// Ref is what the image is called. It becomes target.Image.Ref and from there
+// the target in the report, the product purl in any VEX document written from
+// the scan, and the key a hub index files it under.
+//
+// Layout is where the bytes come from when they are not coming from a
+// registry: a local OCI image layout, which is what a haul is once it is
+// unpacked. LayoutRef is the name that layout files the image under.
+//
+// The addressing name is a separate field from the reported one because in a
+// haul they genuinely differ -- hauler strips the registry from the store's
+// own ref names -- and collapsing them would make a haul scan file its
+// findings under a product no registry scan of the same image would produce.
+type Source struct {
+	Ref       string
+	Layout    string
+	LayoutRef string
+}
+
+// skopeoSource renders s as a skopeo source URI.
+//
+// The oci: transport parses "oci:<path>:<reference>" by cutting at the first
+// colon after the scheme, which is why a layout path containing one cannot be
+// expressed and is rejected by validate rather than silently mis-split into a
+// path and a reference that do not exist.
+func (s Source) skopeoSource() string {
+	if s.Layout == "" {
+		return "docker://" + s.Ref
+	}
+	ref := s.LayoutRef
+	if ref == "" {
+		ref = s.Ref
+	}
+	return "oci:" + s.Layout + ":" + ref
+}
+
+func (s Source) validate() error {
+	if s.Ref == "" {
+		return errors.New("no image reference")
+	}
+	if strings.Contains(s.Layout, ":") {
+		return fmt.Errorf("OCI layout path %q contains a colon, which the oci: transport cannot address", s.Layout)
+	}
+	return nil
+}
+
 type ociManifest struct {
 	Config struct {
 		Digest string `json:"digest"`
@@ -85,12 +132,28 @@ type configFile struct {
 	} `json:"config"`
 }
 
-// Extract copies ref into a temporary OCI dir with skopeo and untars every
-// layer, in order, into dest. Later layers overwrite earlier ones and their
-// whiteouts delete from earlier ones, yielding the final image filesystem
-// state. The returned Image owns no resources: dest stays the caller's to
-// clean up.
+// Extract pulls ref from a registry. It is ExtractSource for the ordinary
+// case, where the name of the image and the place it comes from are the same
+// string.
 func (e *Extractor) Extract(ctx context.Context, ref, dest string) (*target.Image, error) {
+	return e.ExtractSource(ctx, Source{Ref: ref}, dest)
+}
+
+// ExtractSource copies src into a temporary OCI dir with skopeo and untars
+// every layer, in order, into dest. Later layers overwrite earlier ones and
+// their whiteouts delete from earlier ones, yielding the final image
+// filesystem state. The returned Image owns no resources: dest stays the
+// caller's to clean up.
+//
+// Reading out of a local layout rather than a registry changes the source URI
+// and nothing else. The platform overrides still apply -- a layout entry can
+// be a manifest list, and a haul built without a --platform holds exactly
+// those -- so a multi-arch haul scanned on one architecture selects the same
+// variant a registry pull would.
+func (e *Extractor) ExtractSource(ctx context.Context, src Source, dest string) (*target.Image, error) {
+	if err := src.validate(); err != nil {
+		return nil, err
+	}
 	if _, err := exec.LookPath(e.SkopeoPath); err != nil {
 		return nil, fmt.Errorf("skopeo not found on PATH: %w", err)
 	}
@@ -103,10 +166,11 @@ func (e *Extractor) Extract(ctx context.Context, ref, dest string) (*target.Imag
 
 	cmd := exec.CommandContext(ctx, e.SkopeoPath, "copy", "-q",
 		"--override-os", e.OS, "--override-arch", e.Arch,
-		"docker://"+ref, "dir:"+raw)
+		src.skopeoSource(), "dir:"+raw)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("skopeo copy failed: %w: %s", err, strings.TrimSpace(string(out)))
 	}
+	ref := src.Ref
 
 	manifestBytes, err := os.ReadFile(filepath.Join(raw, "manifest.json"))
 	if err != nil {

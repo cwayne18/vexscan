@@ -63,6 +63,13 @@ func readImageList(ctx context.Context, spec string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A hauler manifest is a list of images too, just declared rather than
+	// written out, and it is the file a team that builds hauls already keeps
+	// beside the pipeline. Recognised by its API group so that nothing else
+	// changes shape underneath an existing list; see haulmanifest.go.
+	if s := string(data); looksLikeHaulerManifest(s) {
+		return parseHaulerManifest(s)
+	}
 	return parseImageList(string(data)), nil
 }
 

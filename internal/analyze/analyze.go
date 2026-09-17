@@ -60,6 +60,17 @@ const (
 // Options configure a run. Set exactly one of Image, RootFS or Repo.
 type Options struct {
 	Image string
+
+	// ImageLayout is a local OCI image layout to read Image out of instead of
+	// a registry, and ImageLayoutRef the name that layout files it under
+	// (defaulting to Image when empty). Together they are how --haul scans a
+	// hauler haul without a network: a haul is an OCI layout, so the only
+	// thing that changes is where skopeo is pointed.
+	//
+	// Image stays the reference the scan is reported under either way. See
+	// image.Source for why the two names cannot be collapsed into one.
+	ImageLayout    string
+	ImageLayoutRef string
 	// RootFS is a filesystem tree already on disk -- an unpacked image, a
 	// mounted volume, a machine's own /. It runs the image analyzers against a
 	// tree nobody extracted, so it skips the pull but also arrives without an
@@ -620,10 +631,21 @@ func openTree(ctx context.Context, opts *Options) (*target.Image, func(), error)
 	}
 	cleanup := func() { os.RemoveAll(dest) }
 
-	opts.Logf("Extracting %s (%s/%s)...", opts.Image, opts.OS, opts.Arch)
+	// The layout is named in the log line when there is one, because
+	// "Extracting docker.io/rancher/x" with no network in sight is otherwise
+	// a confusing thing to watch a scan print in an airgap.
+	if opts.ImageLayout != "" {
+		opts.Logf("Extracting %s from the haul (%s/%s)...", opts.Image, opts.OS, opts.Arch)
+	} else {
+		opts.Logf("Extracting %s (%s/%s)...", opts.Image, opts.OS, opts.Arch)
+	}
 	ex := image.NewExtractor()
 	ex.OS, ex.Arch = opts.OS, opts.Arch
-	img, err := ex.Extract(ctx, opts.Image, dest)
+	img, err := ex.ExtractSource(ctx, image.Source{
+		Ref:       opts.Image,
+		Layout:    opts.ImageLayout,
+		LayoutRef: opts.ImageLayoutRef,
+	}, dest)
 	if err != nil {
 		cleanup()
 		return nil, nil, fmt.Errorf("extract image: %w", err)
