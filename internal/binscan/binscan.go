@@ -17,10 +17,13 @@ import (
 	"debug/buildinfo"
 	"debug/elf"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -197,6 +200,65 @@ func IsStripped(path string) bool {
 		return true
 	}
 	return len(syms) == 0
+}
+
+// StaticSymbols reads the static symbol table (.symtab) of the ELF binary at
+// hostPath and reports the symbols it *defines*, plus whether the binary is
+// stripped -- carries no static symbol table at all.
+//
+// This is the reader the cgo static-entrypoint discharge is built on. PR #24
+// discharged the static-elf taint only for a CGO_ENABLED=0 build, which links
+// no C library and so cannot be hiding a copy of one. A cgo build might have
+// linked the C library in, and the only way to prove a *specific* vulnerable
+// function is not baked into it is to read the table the linker left behind and
+// find the function absent while its namespace is present.
+//
+// That proof exists only when the table does. A stripped binary reports
+// stripped, and the caller must keep it blocking: absence from a symbol table
+// that was thrown away is not absence from the binary. Non-ELF and unreadable
+// files report stripped for the same reason -- nothing can be proven absent
+// from them -- which mirrors IsStripped rather than surfacing an error the
+// caller would have to translate back into "stay conservative".
+//
+// All bindings are returned -- global, weak, and local -- unlike Symbols, which
+// keeps only the exported ones. Symbols answers "could another object call
+// this", where a local symbol is irrelevant. This answers "is this code in the
+// binary at all", where a statically linked function the linker localised still
+// counts, and counting it is the safe direction: a symbol that is present keeps
+// the taint blocking and never clears it, so erring toward inclusion can only
+// ever refuse a discharge, never grant a false one.
+func StaticSymbols(hostPath string) (defined []string, stripped bool, err error) {
+	f, err := elf.Open(hostPath)
+	if err != nil {
+		return nil, true, nil
+	}
+	defer f.Close()
+
+	syms, err := f.Symbols()
+	if err != nil {
+		if errors.Is(err, elf.ErrNoSymbols) {
+			return nil, true, nil
+		}
+		return nil, false, fmt.Errorf("symtab %s: %w", hostPath, err)
+	}
+
+	seen := map[string]bool{}
+	for _, s := range syms {
+		// SHN_UNDEF is a symbol the binary references but does not define; a
+		// defined-symbol question must not count it, or a binary that merely
+		// mentions the vulnerable function would read as containing it.
+		if s.Name == "" || s.Section == elf.SHN_UNDEF {
+			continue
+		}
+		seen[s.Name] = true
+	}
+
+	out := make([]string, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out, false, nil
 }
 
 // CGODisabled reports whether the Go binary at hostPath was built with

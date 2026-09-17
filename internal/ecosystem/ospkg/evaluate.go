@@ -121,10 +121,33 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 
 	blockers := e.blockers(files.ELF)
 
+	// The mined-symbol check runs first because two later steps depend on it: it
+	// answers whether the vulnerable function is in this build at all, and it is
+	// what supplies the validated symbol the cgo static discharge needs.
+	sym := e.checkSymbols(req.Advisory, req.Hints, files.ELF)
+
+	// The cgo static-symbol discharge continues #24. That PR cleared the
+	// static-elf taint for a CGO_ENABLED=0 entrypoint, which links no C library
+	// and so cannot hide a copy of one. A cgo entrypoint might have linked it
+	// in, so it stayed blocking -- but if it is unstripped, its own symbol table
+	// can prove this specific advisory's function was not linked into it. That
+	// proof is CVE-specific, because which namespace to look for comes from the
+	// advisory, so it lives here per finding rather than at graph-build time
+	// with the structural discharge. A cleared taint is dropped from this
+	// finding's blockers, so the discharge unlocks a conclusion rather than
+	// merely annotating a blocked one.
+	cleared := e.staticSymbolDischarges(sym)
+	if len(cleared) > 0 {
+		blockers = e.blockersExcept(files.ELF, cleared)
+	}
+
 	// Recorded first, before anything the closure goes on to conclude, because
 	// a discharged taint is the ground the conclusion stands on rather than a
 	// footnote to it.
 	f.Evidence = append(f.Evidence, e.discharged()...)
+	for _, p := range sortedUnique(mapKeys(cleared)) {
+		f.Evidence = append(f.Evidence, ecosystem.Evidence{Origin: MethodStaticSymbolAbsent, Detail: cleared[p]})
+	}
 
 	// The mined-symbol layer runs before the closure is consulted, because it
 	// answers a stronger question: whether the vulnerable function is in this
@@ -132,7 +155,7 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 	// reason the closure is -- a statically linked entrypoint may hold a copy
 	// of the vulnerable code, and the package's own export tables say nothing
 	// about what is inside it.
-	if sym := e.checkSymbols(req.Advisory, req.Hints, files.ELF); sym.Usable {
+	if sym.Usable {
 		f.Evidence = append(f.Evidence, ecosystem.Evidence{Origin: MethodMined, Detail: sym.Why})
 		switch {
 		case len(sym.Defined) == 0 && len(blockers) == 0:
@@ -295,7 +318,16 @@ func metadataDetail(pkg pkgdb.Package, meta pkgdb.Meta) string {
 // blockers are the taints that stop this package's objects being declared
 // unreachable: every global one, plus any scoped to a library it installs.
 func (e evaluator) blockers(elfFiles []string) []ecosystem.Evidence {
-	return e.taints(elfFiles, true)
+	return e.taints(elfFiles, true, nil)
+}
+
+// blockersExcept is blockers with the static-elf taints in cleared removed,
+// because the cgo static-symbol discharge accounted for their contents for this
+// finding. Only static-elf taints are dropped, and only the ones whose
+// entrypoint path is in cleared: a discharge is a claim about one binary and
+// one advisory, so it must not silence an unrelated blocker.
+func (e evaluator) blockersExcept(elfFiles []string, cleared map[string]string) []ecosystem.Evidence {
+	return e.taints(elfFiles, true, cleared)
 }
 
 // discharged are the taints that would have blocked this package's conclusion
@@ -324,8 +356,10 @@ func (e evaluator) discharged() []ecosystem.Evidence {
 	return out
 }
 
-// taints maps the recorded taints in scope for this package to evidence.
-func (e evaluator) taints(elfFiles []string, blocking bool) []ecosystem.Evidence {
+// taints maps the recorded taints in scope for this package to evidence. When
+// cleared is non-nil, a blocking static-elf taint whose entrypoint path it names
+// is skipped: the cgo static-symbol discharge answered it for this finding.
+func (e evaluator) taints(elfFiles []string, blocking bool, cleared map[string]string) []ecosystem.Evidence {
 	sonames := map[string]bool{}
 	for _, f := range elfFiles {
 		sonames[path.Base(f)] = true
@@ -337,6 +371,9 @@ func (e evaluator) taints(elfFiles []string, blocking bool) []ecosystem.Evidence
 	var out []ecosystem.Evidence
 	for _, t := range e.g.Taints() {
 		if t.Blocking != blocking {
+			continue
+		}
+		if t.Kind == elfgraph.TaintStaticELF && cleared[t.Path] != "" {
 			continue
 		}
 		// A scoped taint is a claim about one soname. It belongs to this
@@ -351,6 +388,132 @@ func (e evaluator) taints(elfFiles []string, blocking bool) []ecosystem.Evidence
 			Detail:   t.Detail,
 			Blocking: t.Blocking,
 		})
+	}
+	return out
+}
+
+// staticSymbolDischarges is the cgo analogue of #24's structural discharge,
+// resolved per finding. For the validated symbols this advisory yielded, it asks
+// of every blocking static-elf entrypoint whether its own symbol table proves
+// the vulnerable code was not linked in, and returns the ones it can clear:
+// keyed by entrypoint path, valued by the evidence detail that says why.
+//
+// It fires only with a validated symbol in hand, which means only under
+// --mine-advisories. Without one there is no CVE-specific question to ask of the
+// binary, and a blanket "this cgo binary looks clean" is exactly the false
+// removal the whole package exists to refuse. A nil return leaves every blocker
+// standing, so the conservative default is what an absent discharge falls back
+// to.
+func (e evaluator) staticSymbolDischarges(sym symbolCheck) map[string]string {
+	if !sym.Usable || len(sym.Validated) == 0 {
+		return nil
+	}
+	var out map[string]string
+	for _, t := range e.g.Taints() {
+		if t.Kind != elfgraph.TaintStaticELF || !t.Blocking || t.Path == "" {
+			continue
+		}
+		if detail, ok := e.proveStaticAbsent(t.Path, sym.Validated); ok {
+			if out == nil {
+				out = map[string]string{}
+			}
+			out[t.Path] = detail
+		}
+	}
+	return out
+}
+
+// proveStaticAbsent decides whether the static entrypoint at path provably does
+// not carry the vulnerable code named by validated, reusing mine.go's namespace
+// discipline so the two symbol tests stay consistent.
+//
+// Every branch that cannot prove absence returns false and leaves the taint
+// blocking, because the promise is one-directional: a check may narrow the
+// conservative default, never loosen it.
+//
+//   - cgo off/unknown, stripped, or unreadable: nothing to reason over. (An
+//     off build was already discharged structurally at graph time and is no
+//     longer a blocking taint, so it does not reach here in practice; declining
+//     it costs nothing and states the intent.)
+//   - a validated symbol present in the table: that is the vulnerable code
+//     linked in. Stays blocking.
+//   - a validated symbol absent while its namespace is also absent: the binary
+//     does not visibly use the library family at all, so its absence is not
+//     evidence -- the family may be there under localised or stripped names.
+//     Stays blocking. This is the open-world rule from checkSymbols, applied to
+//     the entrypoint's own table.
+//   - every validated symbol absent, every namespace present: the family is
+//     linked and the vulnerable function is not, so it was not compiled into
+//     this build. Discharged.
+func (e evaluator) proveStaticAbsent(path string, validated []string) (string, bool) {
+	defined, stripped, cgo, err := e.readStatic(path)
+	if err != nil || !cgo || stripped {
+		return "", false
+	}
+
+	bin := make(map[string]bool, len(defined))
+	for _, s := range defined {
+		bin[s] = true
+	}
+
+	for _, v := range validated {
+		if bin[v] {
+			return "", false
+		}
+	}
+	for _, v := range validated {
+		if !hasNamespace(bin, v) {
+			return "", false
+		}
+	}
+
+	return fmt.Sprintf("%s is a cgo binary, but its static symbol table carries the %s namespace and not %s, "+
+		"so the vulnerable code is not statically linked into it",
+		path, strings.Join(namespacesOf(validated), ", "), strings.Join(validated, ", ")), true
+}
+
+// readStatic reads one static entrypoint's symbol table, once per image. The
+// same binary is asked about for every finding whose blocker it is, so without
+// the cache its table -- and the buildinfo read behind the cgo test -- would be
+// parsed once per advisory.
+func (e evaluator) readStatic(path string) (defined []string, stripped, cgo bool, err error) {
+	e.sym.mu.Lock()
+	if c, ok := e.sym.static[path]; ok {
+		e.sym.mu.Unlock()
+		return c.defined, c.stripped, c.cgo, c.err
+	}
+	e.sym.mu.Unlock()
+
+	read := e.sym.readStatic
+	if read == nil {
+		read = readStaticEntrypoint
+	}
+	defined, stripped, cgo, err = read(e.sym.fsys, path)
+
+	e.sym.mu.Lock()
+	e.sym.static[path] = staticEntry{defined: defined, stripped: stripped, cgo: cgo, err: err}
+	e.sym.mu.Unlock()
+	return defined, stripped, cgo, err
+}
+
+// namespacesOf is the deduplicated set of library namespaces the symbols carry,
+// for the evidence line -- SSL_free_buffers and SSL_read collapse to SSL_.
+func namespacesOf(syms []string) []string {
+	var out []string
+	for _, s := range syms {
+		if ns := namespace(s); ns != "" {
+			out = append(out, ns)
+		}
+	}
+	return sortedUnique(out)
+}
+
+// mapKeys returns a map's keys, for a deterministic ordering pass through
+// sortedUnique.
+func mapKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
 	}
 	return out
 }

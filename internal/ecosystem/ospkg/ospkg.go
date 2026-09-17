@@ -73,6 +73,13 @@ type Plugin struct {
 	// ReadSymbols loads dynamic symbol tables; nil means elfgraph.Symbols.
 	ReadSymbols elfgraph.SymbolReader
 
+	// readStatic loads a static entrypoint's symbol table for the cgo
+	// static-symbol discharge; nil means the real binscan-backed reader. It is
+	// unexported because it is a test seam, not a public knob: a real scan
+	// always reads the binary itself, and only a test needs to stand in a
+	// symbol table without compiling one.
+	readStatic staticReader
+
 	// Logf receives progress messages. Never nil after New.
 	Logf func(format string, args ...any)
 
@@ -90,6 +97,7 @@ type Options struct {
 	TrustImportAbsence bool
 	ReadELF            elfgraph.Reader
 	ReadSymbols        elfgraph.SymbolReader
+	readStatic         staticReader
 	Logf               func(format string, args ...any)
 }
 
@@ -108,6 +116,7 @@ func New(opts Options) *Plugin {
 		TrustImportAbsence: opts.TrustImportAbsence,
 		ReadELF:            opts.ReadELF,
 		ReadSymbols:        opts.ReadSymbols,
+		readStatic:         opts.readStatic,
 		Logf:               logf,
 	}
 }
@@ -186,16 +195,55 @@ type prepared struct {
 // walks every reachable object once per package being checked, so without this
 // the same tables would be parsed over and over inside a single run.
 type symbolCache struct {
-	fsys target.RootFS
-	read elfgraph.SymbolReader
+	fsys       target.RootFS
+	read       elfgraph.SymbolReader
+	readStatic staticReader
 
-	mu    sync.Mutex
-	cache map[string]symbolEntry
+	mu     sync.Mutex
+	cache  map[string]symbolEntry
+	static map[string]staticEntry
 }
 
 type symbolEntry struct {
 	defined, undefined []string
 	err                error
+}
+
+// staticEntry caches one static entrypoint's symbol table and the two facts
+// the discharge needs about it: whether it is a cgo build and whether it is
+// stripped. All three come from reading the same binary, so they are read and
+// cached together, once per image.
+type staticEntry struct {
+	defined  []string
+	stripped bool
+	cgo      bool
+	err      error
+}
+
+// staticReader loads what the cgo static-symbol discharge needs about one static
+// entrypoint, addressed by its tree-absolute path: the symbols it defines,
+// whether it is stripped, and whether it is a cgo build. It is a function type
+// for the same reason SymbolReader is -- so the discharge logic can be exercised
+// against a chosen symbol table without compiling a binary that carries one.
+type staticReader func(fsys target.RootFS, path string) (defined []string, stripped, cgo bool, err error)
+
+// readStaticEntrypoint is the real staticReader. It reads the binary once for
+// all three facts: CGODisabled tells it whether cgo is on (and whether that is
+// even known), and StaticSymbols reads the table and reports stripping.
+//
+// cgo is reported true only when the build info records CGO_ENABLED and records
+// it as on. A non-Go binary, or one whose build info cannot be read, leaves cgo
+// false with nothing proven -- the discharge then declines, exactly as the
+// conservative default requires.
+func readStaticEntrypoint(fsys target.RootFS, path string) (defined []string, stripped, cgo bool, err error) {
+	host, err := fsys.HostPath(path)
+	if err != nil {
+		return nil, true, false, err
+	}
+	disabled, ok := binscan.CGODisabled(host)
+	cgo = ok && !disabled
+	defined, stripped, err = binscan.StaticSymbols(host)
+	return defined, stripped, cgo, err
 }
 
 // prepare reads the package databases and the distribution identity, once per
@@ -214,9 +262,11 @@ func (p *Plugin) prepare(img *target.Image) (*prepared, error) {
 	}
 
 	pr := &prepared{img: img, syms: &symbolCache{
-		fsys:  img.FS,
-		read:  p.ReadSymbols,
-		cache: map[string]symbolEntry{},
+		fsys:       img.FS,
+		read:       p.ReadSymbols,
+		readStatic: p.readStatic,
+		cache:      map[string]symbolEntry{},
+		static:     map[string]staticEntry{},
 	}}
 	// A handed-in inventory replaces the tree entirely: nothing below this
 	// reads a database, an os-release, or a file, because with --rpm there is
