@@ -76,10 +76,45 @@ func TestModuleVersionStdlib(t *testing.T) {
 	}
 }
 
+// TestCGODisabled compiles the two builds that matter to the static-entrypoint
+// discharge: a pure-Go one that carries no C library, and a cgo one that might.
+// A handwritten fixture will not do -- buildinfo reads settings the toolchain
+// stamps, so only a real binary carries a CGO_ENABLED record at all.
+func TestCGODisabled(t *testing.T) {
+	off := filepath.Join(t.TempDir(), "off")
+	buildGoBinaryEnv(t, off, "CGO_ENABLED=0")
+	if disabled, ok := CGODisabled(off); !ok || !disabled {
+		t.Errorf("CGO_ENABLED=0 build: got (disabled=%v, ok=%v), want (true, true)", disabled, ok)
+	}
+
+	on := filepath.Join(t.TempDir(), "on")
+	buildGoBinaryEnv(t, on, "CGO_ENABLED=1")
+	if disabled, ok := CGODisabled(on); !ok || disabled {
+		t.Errorf("CGO_ENABLED=1 build: got (disabled=%v, ok=%v), want (false, true)", disabled, ok)
+	}
+
+	// A file that is not a Go binary tells the prober nothing, so it must stay
+	// conservative rather than read absence of a setting as CGO being off.
+	notGo := filepath.Join(t.TempDir(), "passwd")
+	if err := os.WriteFile(notGo, []byte("root:x:0:0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if disabled, ok := CGODisabled(notGo); ok || disabled {
+		t.Errorf("non-Go file: got (disabled=%v, ok=%v), want (false, false)", disabled, ok)
+	}
+}
+
 // buildGoBinary compiles a trivial program to dst. Discovery cannot be tested
 // with a handwritten fixture: buildinfo rejects anything the toolchain did not
 // produce, so a real binary is the only thing FindGoBinaries will report.
 func buildGoBinary(t *testing.T, dst string) {
+	t.Helper()
+	buildGoBinaryEnv(t, dst)
+}
+
+// buildGoBinaryEnv is buildGoBinary with extra environment for the toolchain,
+// so a test can pin CGO_ENABLED and read back what the build recorded.
+func buildGoBinaryEnv(t *testing.T, dst string, env ...string) {
 	t.Helper()
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("no go toolchain on PATH")
@@ -95,6 +130,7 @@ func buildGoBinary(t *testing.T, dst string) {
 
 	cmd := exec.Command("go", "build", "-o", dst, ".")
 	cmd.Dir = src
+	cmd.Env = append(os.Environ(), env...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Skipf("go build unavailable in this environment: %v: %s", err, out)
 	}

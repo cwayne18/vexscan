@@ -620,6 +620,17 @@ func TestDlopenTaint(t *testing.T) {
 	if len(g2.BlockingTaints()) != 0 {
 		t.Errorf("BlockingTaints = %v under assume-none", g2.BlockingTaints())
 	}
+	// Discharged, not merely non-blocking: this one would have blocked, and a
+	// reader has to be able to see that the clean rests on the assertion.
+	if !tt2.Discharged {
+		t.Errorf("assume-none demoted the taint without marking it discharged: %+v", *tt2)
+	}
+	if !strings.Contains(tt2.Detail, "assume-none") {
+		t.Errorf("detail does not say the policy is what demoted it: %q", tt2.Detail)
+	}
+	if tt.Discharged {
+		t.Errorf("the default-policy taint is marked discharged: %+v", *tt)
+	}
 }
 
 // TestUnreachableDlopenDoesNotTaint: a plugin loader sitting unused on disk
@@ -673,6 +684,103 @@ func TestStaticUtilityIsRecordedButDoesNotBlock(t *testing.T) {
 	}
 	if len(g.BlockingTaints()) != 0 {
 		t.Errorf("BlockingTaints() = %v, want none", g.BlockingTaints())
+	}
+	// Not discharged: it never blocked, so nothing answered it. Marking it so
+	// would put a static ldconfig in the evidence of every finding in every
+	// glibc image, claiming a test that never ran.
+	if tt.Discharged {
+		t.Errorf("a taint that never blocked is marked discharged: %+v", *tt)
+	}
+}
+
+// TestStaticRootDischargedByProbe: a static entrypoint a prober can account for
+// -- a pure-Go CGO_ENABLED=0 build links no C library -- carries nothing
+// hidden, so the taint is recorded rather than left to block. The prober is
+// injected the same way ReadELF is, so no real Go binary is needed to exercise
+// the discharge.
+func TestStaticRootDischargedByProbe(t *testing.T) {
+	static := &Info{Class: elf.ELFCLASS64, Machine: elf.EM_X86_64, Type: elf.ET_EXEC}
+	opts := Options{
+		Config: target.ImageConfig{Entrypoint: []string{"/app/server"}},
+		StaticProber: func(_ target.RootFS, p string) (StaticProbe, bool) {
+			if p != "/app/server" {
+				return StaticProbe{}, false
+			}
+			return StaticProbe{Closed: true, Why: "it is a pure-Go binary built with CGO_ENABLED=0"}, true
+		},
+	}
+	g := build(t, tree(t, map[string]string{"/app/server": "", "/usr/lib/libssl.so.3": ""}),
+		fakeELF{"/app/server": static, "/usr/lib/libssl.so.3": lib()}, opts)
+
+	tt := hasTaint(g, TaintStaticELF)
+	if tt == nil {
+		t.Fatal("a discharged static entrypoint must still be recorded")
+	}
+	if tt.Blocking || tt.Global {
+		t.Errorf("prober said the binary is closed, but the taint still blocks: %+v", *tt)
+	}
+	if len(g.BlockingTaints()) != 0 {
+		t.Errorf("BlockingTaints() = %v, want none once the entrypoint is discharged", g.BlockingTaints())
+	}
+	if !tt.Discharged {
+		t.Errorf("a taint that would have blocked but for the probe is not marked discharged: %+v", *tt)
+	}
+	if !strings.Contains(tt.Detail, "CGO_ENABLED=0") {
+		t.Errorf("detail does not record why the taint was discharged: %q", tt.Detail)
+	}
+}
+
+// TestStaticRootProbeInconclusiveStillBlocks: a prober that cannot account for
+// the binary -- a cgo build, an unrecognised file -- leaves the entrypoint
+// blocking exactly as it would with no prober at all. The discharge is a
+// narrowing of the conservative default, never a loosening of it.
+func TestStaticRootProbeInconclusiveStillBlocks(t *testing.T) {
+	static := &Info{Class: elf.ELFCLASS64, Machine: elf.EM_X86_64, Type: elf.ET_EXEC}
+	opts := Options{
+		Config:       target.ImageConfig{Entrypoint: []string{"/app/server"}},
+		StaticProber: func(target.RootFS, string) (StaticProbe, bool) { return StaticProbe{}, false },
+	}
+	g := build(t, tree(t, map[string]string{"/app/server": "", "/usr/lib/libssl.so.3": ""}),
+		fakeELF{"/app/server": static, "/usr/lib/libssl.so.3": lib()}, opts)
+
+	tt := hasTaint(g, TaintStaticELF)
+	if tt == nil || !tt.Blocking || !tt.Global {
+		t.Fatalf("an unaccounted static entrypoint must stay a global blocker: %+v", tt)
+	}
+}
+
+// TestStaticRootProbeWithNoReasonDoesNotDischarge: a probe that reports Closed
+// without saying why is not a discharge. Honouring one would emit a
+// non-blocking taint whose detail is byte-for-byte the blocking one's, leaving
+// a filtered result indistinguishable from an unfiltered one -- the single
+// failure mode the taint machinery exists to prevent.
+func TestStaticRootProbeWithNoReasonDoesNotDischarge(t *testing.T) {
+	static := &Info{Class: elf.ELFCLASS64, Machine: elf.EM_X86_64, Type: elf.ET_EXEC}
+	files := map[string]string{"/app/server": "", "/usr/lib/libssl.so.3": ""}
+	elves := func() fakeELF {
+		return fakeELF{"/app/server": static, "/usr/lib/libssl.so.3": lib()}
+	}
+	cfg := target.ImageConfig{Entrypoint: []string{"/app/server"}}
+
+	g := build(t, tree(t, files), elves(), Options{
+		Config: cfg,
+		StaticProber: func(target.RootFS, string) (StaticProbe, bool) {
+			return StaticProbe{Closed: true}, true
+		},
+	})
+
+	tt := hasTaint(g, TaintStaticELF)
+	if tt == nil || !tt.Blocking || !tt.Global {
+		t.Fatalf("a probe with no reason must leave the entrypoint blocking: %+v", tt)
+	}
+
+	// And it must read as an ordinary block, because that is what it is.
+	plain := hasTaint(build(t, tree(t, files), elves(), Options{Config: cfg}), TaintStaticELF)
+	if plain == nil {
+		t.Fatal("unprobed run recorded no static-elf taint")
+	}
+	if tt.Detail != plain.Detail {
+		t.Errorf("detail = %q, want the unprobed detail %q", tt.Detail, plain.Detail)
 	}
 }
 

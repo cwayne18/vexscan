@@ -898,13 +898,42 @@ A taint never sets a status. It *blocks* the closure from concluding
 `not_affected`, and is always emitted as evidence, so the report says why it
 could not answer rather than answering wrongly.
 
+A taint that stops blocking is still emitted. `--dlopen-policy=assume-none` and
+the pure-Go discharge below both turn a blocker into a note, and the note is
+the point: a clean verdict that something was cleared to reach is a different
+claim from a clean verdict nothing ever threatened, and the evidence has to let
+you tell them apart.
+
 | Taint | Trigger | Effect |
 |---|---|---|
 | `unresolved-needed` | a `DT_NEEDED` that resolved to nothing | scoped to that soname |
 | `dlopen` | a reachable ELF references `dlopen`/`dlmopen` | global, unless `--dlopen-policy=assume-none` |
-| `static-elf` | a reachable ELF has no `PT_INTERP`/`.dynamic` | blocks all C-library conclusions |
+| `static-elf` | a reachable ELF has no `PT_INTERP`/`.dynamic` | blocks all C-library conclusions, unless the entrypoint is a pure-Go build |
 | `shell-entrypoint` | argv[0] is a shell or init shim (`sh`, `busybox`, `s6-*`), or a transparent wrapper (`tini`, `gosu`, `env`) used in a form its parser cannot read | every ELF in the standard bin dirs becomes a root |
 | `no-entrypoint` | the image config has neither Entrypoint nor Cmd — or there is no config at all, as in `--rootfs` mode | same escalation |
+
+**The pure-Go discharge.** `static-elf` blocks because a statically linked
+entrypoint may hold a copy of the vulnerable library inside it, where
+`DT_NEEDED` cannot see it — so an unreferenced `.so` on disk proves nothing. A
+binary built with `CGO_ENABLED=0` links no C library at all, which answers
+exactly that question: there is no hidden copy to worry about, and the
+unreferenced `.so` really is the answer. vexscan reads the setting out of the
+Go build info, so it survives `-ldflags=-s -w`, and the taint is recorded as a
+non-blocking note rather than dropped:
+
+```
+evidence: /app/server is statically linked, so the libraries it uses are inside it
+          and not on disk, but it is a pure-Go binary built with CGO_ENABLED=0, so
+          it links no C library and cannot carry a hidden copy of one
+```
+
+Only the entrypoint is probed, and only a Go binary whose build info records
+`CGO_ENABLED=0`. A cgo build, a non-Go static binary, or a build info that
+cannot be read leaves the taint blocking. What this discharges is *linked-in* C
+code: a pure-Go binary can still `exec` another binary in the image, and that
+one may load anything. So can a dynamically linked entrypoint, which has never
+blocked for it — the discharge puts static Go entrypoints on the same footing,
+not below it.
 
 `--roots /path/to/bin` adds entrypoints for an image whose real command comes
 from outside its own config — a Kubernetes `command:`, a sidecar, an operator —
@@ -1098,10 +1127,12 @@ The closure proves nothing about the file's contents. It is ground truth only
 for an image that is fully dynamically linked, does not call `dlopen`, and has a
 known entrypoint. Concretely:
 
-- **Alpine and distroless images are the worst case.** Static binaries embed
+- **Alpine and static musl builds are the worst case.** A static binary embeds
   musl, OpenSSL and zlib while the corresponding `.so` sits unreferenced on
   disk. The `static-elf` taint catches this and the result is `linked` — correct
-  but useless — on exactly the images people most want a clean answer for.
+  but useless — on exactly the images people most want a clean answer for. The
+  [pure-Go discharge](#taints) lifts it for a `CGO_ENABLED=0` entrypoint, which
+  covers the common distroless Go image but nothing built with cgo.
 - **Distro base images are nearly as bad.** `debian:12` and `ubi9` ship with
   `bash` as Cmd, which triggers `shell-entrypoint`: every binary in `/usr/bin`
   becomes a root, and almost everything is reachable. On `ubi9:latest --all`,

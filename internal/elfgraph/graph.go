@@ -53,8 +53,45 @@ type Options struct {
 	// ReadELF loads ELF metadata. Defaults to the debug/elf-backed reader.
 	ReadELF Reader
 
+	// StaticProber optionally inspects a statically linked entrypoint to decide
+	// whether its contents can be accounted for from outside it. Nil is the
+	// conservative default: with no prober, every static entrypoint blocks,
+	// because the closure cannot see the libraries it carries inside itself.
+	//
+	// A prober is what lets that judgement be sharpened rather than always
+	// assumed. The motivating case is a pure-Go binary built with
+	// CGO_ENABLED=0: it is statically linked, so DT_NEEDED sees nothing, but it
+	// links no C library at all -- so unlike a static musl+openssl binary it
+	// cannot hold a hidden copy of the vulnerable code, and the unreferenced
+	// .so on disk really is the answer.
+	StaticProber StaticProber
+
 	Logf func(string, ...any)
 }
+
+// StaticProbe is what a StaticProber concluded about one static entrypoint.
+type StaticProbe struct {
+	// Closed reports that the binary links no library that could hide a copy of
+	// a vulnerable shared object, so the static-elf taint it would otherwise
+	// raise is recorded rather than allowed to block.
+	Closed bool
+
+	// Why explains the conclusion in the taint's evidence line, so the
+	// discharge is auditable next to what it discharged.
+	//
+	// Required when Closed is true, and enforced rather than documented: a
+	// probe that clears a binary without saying why produces a taint whose
+	// detail reads exactly like the blocking one, and a result that was
+	// filtered has to be distinguishable from a result that was not. A Closed
+	// probe with no Why is therefore treated as having established nothing.
+	Why string
+}
+
+// StaticProber inspects the static entrypoint at a tree-absolute path and
+// reports what could be established about it. The second result is false when
+// nothing could be -- an unreadable file, or one the prober does not recognise
+// -- in which case the taint blocks as it would with no prober at all.
+type StaticProber func(fsys target.RootFS, path string) (StaticProbe, bool)
 
 // Node is one ELF object in the image.
 type Node struct {
@@ -594,12 +631,18 @@ func (g *Graph) collectTaints(opts Options) {
 			})
 		}
 		if n.Info.Dlopen {
+			assumed := opts.DlopenPolicy == DlopenAssumeNone
+			detail := fmt.Sprintf("%s calls dlopen, so what it loads is decided at runtime", p)
+			if assumed {
+				detail += ", and --dlopen-policy=assume-none says to take that as loading nothing that matters here"
+			}
 			g.taints = append(g.taints, Taint{
-				Kind:     TaintDlopen,
-				Detail:   fmt.Sprintf("%s calls dlopen, so what it loads is decided at runtime", p),
-				Path:     p,
-				Blocking: opts.DlopenPolicy != DlopenAssumeNone,
-				Global:   opts.DlopenPolicy != DlopenAssumeNone,
+				Kind:       TaintDlopen,
+				Detail:     detail,
+				Path:       p,
+				Blocking:   !assumed,
+				Global:     !assumed,
+				Discharged: assumed,
 			})
 		}
 		if n.Kind >= RootEscalated && n.Info.Static() {
@@ -615,16 +658,42 @@ func (g *Graph) collectTaints(opts Options) {
 			// exchange for no safety -- ldconfig contains glibc, and glibc is
 			// reachable in those images anyway. It is still recorded.
 			explicit := n.Kind == RootExplicit
+			blocking := explicit
+
+			// A static entrypoint blocks because it may carry a copy of the
+			// vulnerable code inside it, where DT_NEEDED cannot see it. A
+			// prober can discharge exactly that: a binary it can account for --
+			// a pure-Go CGO_ENABLED=0 build links no C library -- has nothing
+			// hidden, so the unreferenced .so on disk is the real answer and
+			// the taint is recorded rather than allowed to block.
+			var probed string
+			if blocking && opts.StaticProber != nil {
+				// pr.Why is part of the condition, not just the message: an
+				// unexplained discharge would be indistinguishable in the
+				// output from no discharge at all.
+				if pr, ok := opts.StaticProber(g.fsys, p); ok && pr.Closed && pr.Why != "" {
+					blocking = false
+					probed = pr.Why
+				}
+			}
+
 			detail := fmt.Sprintf("%s is statically linked, so the libraries it uses are inside it and not on disk", p)
-			if !explicit {
+			switch {
+			case probed != "":
+				detail += ", but " + probed
+			case !explicit:
 				detail += " (not the entrypoint, so this is recorded rather than blocking)"
 			}
 			g.taints = append(g.taints, Taint{
 				Kind:     TaintStaticELF,
 				Detail:   detail,
 				Path:     p,
-				Blocking: explicit,
-				Global:   explicit,
+				Blocking: blocking,
+				Global:   blocking,
+				// Only the entrypoint case is a discharge. A static utility
+				// that is not a root never blocked, so recording it as
+				// "answered" would claim a test that never ran.
+				Discharged: explicit && !blocking,
 			})
 		}
 	}
