@@ -5,10 +5,16 @@
 // weaker one. pclntab is ground truth about what the linker removed from a
 // shipped artifact; a DT_NEEDED closure is ground truth only for an image that
 // is fully dynamic, does not dlopen, and has a known entrypoint. Everything
-// this package does that looks like conservatism -- the taints, the
-// always-rooted plugin directories, the entrypoint escalation -- exists to keep
-// the gap between those two situations visible instead of silently answering
-// "not reachable" for an image the closure cannot actually reason about.
+// this package does that looks like conservatism -- the taints, the plugin
+// roots, the entrypoint escalation -- exists to keep the gap between those two
+// situations visible instead of silently answering "not reachable" for an image
+// the closure cannot actually reason about.
+//
+// The plugin roots are the one place that conservatism has a limit, and it is
+// deliberate. A module the runtime opens by name is rooted because no DT_NEEDED
+// points at it -- but only once the closure reaches the library that does the
+// opening, because a PAM module in an image that loads no libpam is as dead as
+// a library nothing needs. See admitPlugins.
 package elfgraph
 
 import (

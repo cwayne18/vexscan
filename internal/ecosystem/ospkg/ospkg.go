@@ -37,6 +37,10 @@ type Plugin struct {
 	// DlopenPolicy decides whether a reachable dlopen blocks conclusions.
 	DlopenPolicy elfgraph.DlopenPolicy
 
+	// ExecPolicy decides whether an entrypoint that can start another program
+	// blocks conclusions.
+	ExecPolicy elfgraph.ExecPolicy
+
 	// Ecosystem overrides the OSV ecosystem string derived from os-release. It
 	// is the escape hatch for the distributions whose ecosystem os-release does
 	// not determine -- SUSE files base packages against the module that ships
@@ -84,6 +88,7 @@ type Plugin struct {
 type Options struct {
 	Roots              []string
 	DlopenPolicy       elfgraph.DlopenPolicy
+	ExecPolicy         elfgraph.ExecPolicy
 	Ecosystem          string
 	Packages           []Supplied
 	Mine               bool
@@ -102,6 +107,7 @@ func New(opts Options) *Plugin {
 	return &Plugin{
 		Roots:              opts.Roots,
 		DlopenPolicy:       opts.DlopenPolicy,
+		ExecPolicy:         opts.ExecPolicy,
 		Ecosystem:          opts.Ecosystem,
 		Packages:           opts.Packages,
 		Mine:               opts.Mine,
@@ -418,8 +424,10 @@ func (p *Plugin) graph(pr *prepared) (*elfgraph.Graph, error) {
 			Config:       pr.img.Config,
 			Roots:        p.Roots,
 			DlopenPolicy: p.DlopenPolicy,
+			ExecPolicy:   p.ExecPolicy,
 			ReadELF:      p.ReadELF,
 			StaticProber: cgoStaticProbe,
+			ExecProber:   goExecProbe,
 			Logf:         p.Logf,
 		})
 	})
@@ -455,6 +463,100 @@ func cgoStaticProbe(fsys target.RootFS, treePath string) (elfgraph.StaticProbe, 
 		Closed: true,
 		Why:    "it is a pure-Go binary built with CGO_ENABLED=0, so it links no C library and cannot carry a hidden copy of one",
 	}, true
+}
+
+// goExecProbe answers, for a Go entrypoint, whether it can start another
+// program.
+//
+// This is the one part of the closure's model that was never checked. The
+// closure follows what the dynamic linker maps into one process; a program that
+// execs /usr/bin/su runs libpam in a second process the closure never looks at,
+// and a not_affected on the pam package would be wrong for a reason nothing in
+// the report mentioned. Escalation covers the case where the image does not say
+// what it runs, and a shell entrypoint covers the case where what it runs is a
+// script -- but an image whose entrypoint is a single compiled binary got the
+// benefit of the doubt, and the doubt was never quantified.
+//
+// For a Go binary it can be. The function-name table survives -ldflags=-s -w,
+// so whether the binary links syscall.forkExec or syscall.Exec is a fact about
+// the file rather than an inference, and a pure-Go binary that links neither has
+// no route to a second process at all. That turns the residual into a
+// three-valued answer, and the two decided values are both worth reporting: the
+// binary that can exec gets a blocking taint it deserved all along, and the one
+// that cannot gets a discharged taint recording that the largest hole in the
+// closure's model was measured and found closed.
+//
+// Everything else -- a C entrypoint, a cgo build with no marker, an unreadable
+// file -- returns false. Those are unchanged from before this probe existed,
+// because the alternative is to block every image with a compiled non-Go
+// entrypoint on a suspicion that applies equally to all of them.
+func goExecProbe(fsys target.RootFS, treePath string, programs []string) (elfgraph.ExecProbe, bool) {
+	host, err := fsys.HostPath(treePath)
+	if err != nil {
+		return elfgraph.ExecProbe{}, false
+	}
+	scan, err := binscan.ScanSpawn(host)
+	if err != nil {
+		return elfgraph.ExecProbe{}, false
+	}
+
+	switch {
+	case scan.CanSpawn():
+		return elfgraph.ExecProbe{
+			CanSpawn: true,
+			Why:      "it links " + markerList(scan.Markers()),
+			Targets:  mentionedPrograms(scan, programs),
+		}, true
+
+	case scan.CannotSpawn():
+		return elfgraph.ExecProbe{
+			Why: "it is a pure-Go binary built with CGO_ENABLED=0 and its function-name table contains none of the standard library's process-spawning calls, so it links no C that could exec and no Go that would",
+		}, true
+	}
+
+	// A Go binary with cgo enabled and no Go-side marker. The Go routes are ruled
+	// out and the C ones are not, which is not an answer.
+	return elfgraph.ExecProbe{}, false
+}
+
+// markerList renders the matched symbols as prose. The package-path marker is
+// matched with its trailing dot, because "os/exec" alone would also match the
+// module named in a dependency list, but the dot is punctuation in a sentence
+// rather than part of the name a reader would go looking for.
+func markerList(markers []string) string {
+	out := make([]string, len(markers))
+	for i, m := range markers {
+		out[i] = strings.TrimSuffix(m, ".")
+	}
+	switch len(out) {
+	case 0:
+		return ""
+	case 1:
+		return out[0]
+	}
+	return strings.Join(out[:len(out)-1], ", ") + " and " + out[len(out)-1]
+}
+
+// mentionedPrograms are the image's executables whose paths appear in the
+// binary, as candidates for what it execs.
+//
+// Capped, because the list is a hint for a human and a Go binary large enough
+// to mention forty of an image's programs is one whose exec targets are not
+// going to be settled by reading a list. The cap costs nothing that matters:
+// the taint blocks on the strength of the spawn, not on the strength of this.
+func mentionedPrograms(scan *binscan.SpawnScan, programs []string) []string {
+	const max = 32
+	var out []string
+	for _, p := range programs {
+		if !scan.Mentions(p) {
+			continue
+		}
+		out = append(out, p)
+		if len(out) == max {
+			break
+		}
+	}
+	return out
 }
 
 // AnalyzeImage implements ecosystem.ImageAnalyzer.

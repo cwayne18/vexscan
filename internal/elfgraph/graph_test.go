@@ -563,32 +563,190 @@ func TestEntrypointResolvesThroughPATH(t *testing.T) {
 	}
 }
 
-// TestPluginDirectoriesAreAlwaysRoots: nothing has a DT_NEEDED on an NSS module
-// or an OpenSSL provider. A closure that only followed DT_NEEDED would call
-// every one of them dead code.
-func TestPluginDirectoriesAreAlwaysRoots(t *testing.T) {
-	paths := []string{
+// pluginPaths are one object from each runtime-loaded plugin family, keyed by
+// the soname of the library that opens it. The two with no loader are the
+// families rooted unconditionally.
+var pluginPaths = map[string][]string{
+	"libc.so.6": {
 		"/usr/lib/x86_64-linux-gnu/libnss_files.so.2",
-		"/usr/lib/x86_64-linux-gnu/security/pam_unix.so",
 		"/usr/lib/x86_64-linux-gnu/gconv/UTF-16.so",
+	},
+	"libpam.so.0": {
+		"/usr/lib/x86_64-linux-gnu/security/pam_unix.so",
+	},
+	"libcrypto.so.3": {
 		"/usr/lib/x86_64-linux-gnu/engines-3/afalg.so",
 		"/usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so",
+	},
+	"": {
 		"/app/node_modules/bcrypt/build/Release/bcrypt.node",
 		"/usr/lib/python3/dist-packages/cryptography/hazmat/_rust.so",
 		"/usr/lib/python3.11/lib-dynload/_ssl.so",
-	}
-	files := map[string]string{"/usr/bin/app": "", "/usr/lib/libplain.so": ""}
-	objs := fakeELF{"/usr/bin/app": exe(), "/usr/lib/libplain.so": lib()}
-	for _, p := range paths {
-		files[p] = ""
-		objs[p] = lib()
-	}
-	g := build(t, tree(t, files), objs, Options{Config: target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}}})
+	},
+}
 
-	reachable(t, g, paths...)
+// pluginTree builds an image holding every plugin in pluginPaths plus the three
+// loader libraries, with the entrypoint needing whichever loaders are named.
+func pluginTree(t *testing.T, needs ...string) *Graph {
+	t.Helper()
+	files := map[string]string{"/usr/bin/app": "", "/usr/lib/libplain.so": ""}
+	objs := fakeELF{"/usr/bin/app": exe(needs...), "/usr/lib/libplain.so": lib()}
+	for soname, paths := range pluginPaths {
+		if soname != "" {
+			p := "/usr/lib/x86_64-linux-gnu/" + soname
+			files[p], objs[p] = "", lib()
+		}
+		for _, p := range paths {
+			files[p], objs[p] = "", lib()
+		}
+	}
+	return build(t, tree(t, files), objs, Options{Config: target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}}})
+}
+
+// TestPluginsAreRootedWhenTheirLoaderIsReachable: nothing has a DT_NEEDED on an
+// NSS module or an OpenSSL provider. A closure that only followed DT_NEEDED
+// would call every one of them dead code, so once the library that opens them
+// is in the closure they are rooted by name.
+func TestPluginsAreRootedWhenTheirLoaderIsReachable(t *testing.T) {
+	g := pluginTree(t, "libc.so.6", "libpam.so.0", "libcrypto.so.3")
+
+	for _, paths := range pluginPaths {
+		reachable(t, g, paths...)
+	}
+	if got := g.GatedPlugins(); len(got) != 0 {
+		t.Errorf("GatedPlugins() = %+v with every loader reachable, want none", got)
+	}
 	// An ordinary library that nothing needs stays unreachable, or the rule
 	// would have swallowed the whole point of the closure.
 	unreachable(t, g, "/usr/lib/libplain.so")
+}
+
+// TestPluginsAreLeftOutWhenNothingCanOpenThem is the rule that makes the one
+// above safe to apply as widely as it is.
+//
+// A plugin is opened by one library -- an NSS module by libc, a PAM module by
+// libpam, an engine by libcrypto -- so an image whose closure reaches none of
+// them contains no code that could open one. Rooting them anyway is not
+// conservative, it is wrong: on a SLE BCI image with a pure-Go entrypoint the
+// plugin roots drag libpam and libcrypto into a closure the entrypoint cannot
+// reach, and those two then dlopen-taint every finding in the image.
+func TestPluginsAreLeftOutWhenNothingCanOpenThem(t *testing.T) {
+	g := pluginTree(t) // an entrypoint that needs nothing at all
+
+	for soname, paths := range pluginPaths {
+		if soname == "" {
+			// No single library opens these, so they are still rooted.
+			reachable(t, g, paths...)
+			continue
+		}
+		unreachable(t, g, paths...)
+		unreachable(t, g, "/usr/lib/x86_64-linux-gnu/"+soname)
+	}
+
+	gated := g.GatedPlugins()
+	if len(gated) != 5 {
+		t.Fatalf("GatedPlugins() = %+v, want the five plugins with a named loader", gated)
+	}
+	// Left out, but not left unsaid: the caller reports these, and it cannot if
+	// the graph does not say which library was missing.
+	for _, gp := range gated {
+		if gp.What == "" || gp.Loader == "" {
+			t.Errorf("gated plugin %+v does not say what it is or what would have opened it", gp)
+		}
+	}
+}
+
+// TestPluginAdmissionReachesAFixpoint: a loader can arrive through a plugin.
+// libcrypto is here only because an NSS module needs it, and the NSS module is
+// only a root because libc is reachable -- so a single admission pass would
+// stop before the OpenSSL provider, and the closure would depend on the order
+// the table happens to be written in.
+func TestPluginAdmissionReachesAFixpoint(t *testing.T) {
+	files := map[string]string{}
+	objs := fakeELF{}
+	add := func(p string, i *Info) { files[p], objs[p] = "", i }
+
+	add("/usr/bin/app", exe("libc.so.6"))
+	add("/usr/lib/x86_64-linux-gnu/libc.so.6", lib())
+	add("/usr/lib/x86_64-linux-gnu/libnss_odd.so.2", lib("libcrypto.so.3"))
+	add("/usr/lib/x86_64-linux-gnu/libcrypto.so.3", lib())
+	add("/usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so", lib())
+
+	g := build(t, tree(t, files), objs, Options{Config: target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}}})
+	reachable(t, g,
+		"/usr/lib/x86_64-linux-gnu/libnss_odd.so.2",
+		"/usr/lib/x86_64-linux-gnu/libcrypto.so.3",
+		"/usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so",
+	)
+}
+
+// TestEscalationAdmitsEveryPlugin: gating narrows an image that said what it
+// runs, and nothing else. An image that did not say roots every program, which
+// reaches the loaders, which admits the plugins -- so the case the gating could
+// be wrong about is exactly the case it does not apply to.
+func TestEscalationAdmitsEveryPlugin(t *testing.T) {
+	files := map[string]string{
+		"/usr/bin/other":                                 "",
+		"/usr/lib/x86_64-linux-gnu/libpam.so.0":          "",
+		"/usr/lib/x86_64-linux-gnu/security/pam_unix.so": "",
+	}
+	objs := fakeELF{
+		"/usr/bin/other":                                 exe("libpam.so.0"),
+		"/usr/lib/x86_64-linux-gnu/libpam.so.0":          lib(),
+		"/usr/lib/x86_64-linux-gnu/security/pam_unix.so": lib(),
+	}
+	// No entrypoint at all, so every program is a root.
+	g := build(t, tree(t, files), objs, Options{})
+
+	reachable(t, g, "/usr/lib/x86_64-linux-gnu/security/pam_unix.so")
+	if got := g.GatedPlugins(); len(got) != 0 {
+		t.Errorf("GatedPlugins() = %+v under escalation, want none", got)
+	}
+}
+
+// TestAPluginRootedAnotherWayIsNotReportedAsLeftOut: --roots names a PAM module
+// in an image that loads no libpam. It is a root, so it is reachable -- and it
+// must not also be listed as something no loader could open, because the
+// evidence would then contradict the closure it is attached to.
+func TestAPluginRootedAnotherWayIsNotReportedAsLeftOut(t *testing.T) {
+	const mod = "/usr/lib/x86_64-linux-gnu/security/pam_unix.so"
+	files := map[string]string{"/usr/bin/app": "", mod: ""}
+	objs := fakeELF{"/usr/bin/app": exe(), mod: lib()}
+
+	g := build(t, tree(t, files), objs, Options{
+		Config: target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}},
+		Roots:  []string{mod},
+	})
+
+	reachable(t, g, mod)
+	if got := g.GatedPlugins(); len(got) != 0 {
+		t.Errorf("GatedPlugins() = %+v for a module --roots put in the closure", got)
+	}
+}
+
+// TestSonameStemMatchingDoesNotOverreach: libcryptsetup is not libcrypto, and a
+// prefix test that thought it was would admit every OpenSSL provider in an
+// image that has no OpenSSL in its closure at all.
+func TestSonameStemMatchingDoesNotOverreach(t *testing.T) {
+	tests := []struct {
+		soname, stem string
+		want         bool
+	}{
+		{"libcrypto.so", "libcrypto.so", true},
+		{"libcrypto.so.3", "libcrypto.so", true},
+		{"libcrypto.so.1.1", "libcrypto.so", true},
+		{"libcryptsetup.so.12", "libcrypto.so", false},
+		{"libc.so.6", "libc.so", true},
+		{"libcap.so.2", "libc.so", false},
+		{"libcurl.so.4", "libc.so", false},
+		{"libpam.so.0.84.2", "libpam.so", true},
+		{"libpam_misc.so.0", "libpam.so", false},
+	}
+	for _, tt := range tests {
+		if got := matchesSoname(tt.soname, tt.stem); got != tt.want {
+			t.Errorf("matchesSoname(%q, %q) = %v, want %v", tt.soname, tt.stem, got, tt.want)
+		}
+	}
 }
 
 func TestDlopenTaint(t *testing.T) {
