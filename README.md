@@ -866,10 +866,44 @@ Presence is then decided by a **`DT_NEEDED` closure**: every ELF in the image is
 read for `DT_SONAME` / `DT_NEEDED` / `DT_RPATH` / `DT_RUNPATH`, resolved in
 `ld.so`'s search order (RPATH → `LD_LIBRARY_PATH` → RUNPATH → `ld.so.conf` →
 default dirs, matching the referrer's ELF class and machine), and reached
-transitively from the image's Entrypoint and Cmd. Directories the dynamic loader
+transitively from the image's Entrypoint and Cmd. Objects the dynamic loader
 opens by name rather than by `DT_NEEDED` — `libnss_*`, PAM modules, gconv
 converters, OpenSSL engines and providers, `*.node`, `site-packages/**/*.so` —
-are always roots.
+are rooted too, because nothing in the image points at them and a `DT_NEEDED`
+closure would call every one of them dead code.
+
+**Rooted by name, but not unconditionally.** A plugin is opened by one specific
+library — NSS modules and gconv converters by `libc`, PAM modules by `libpam`,
+engines and providers by `libcrypto` — so if the closure reaches no `libpam`,
+nothing in the image contains the call that would open a PAM module, and rooting
+one anyway is not conservative but wrong. Those four families are admitted only
+once their loader is reached, as a fixpoint: a loader can itself arrive through a
+plugin, so admission and the `DT_NEEDED` walk run to convergence together. The
+other two families are loaded by a *program* — a `.node` addon by whatever
+JavaScript runtime calls `require`, a `site-packages` extension by whatever is or
+embeds CPython — and the set of programs that qualify is open-ended enough that
+naming them would be a guess, so they are still rooted unconditionally.
+
+The narrowing only ever applies to an image that said what it runs. An image
+whose entrypoint is a shell, or absent, roots every program (see
+[Taints](#taints)), which reaches the loaders, which admits every plugin — so the
+case the gating could be wrong about is exactly the case it does not apply to. A
+plugin left out is named in the evidence of any finding it would have decided,
+along with the library that was missing:
+
+```
+libpam0g installs 2 ELF objects (/usr/lib/libpam.so.0, /usr/lib/security/pam_unix.so),
+  and the dynamic linker would load none of them starting from /app/server
+/usr/lib/security/pam_unix.so is a PAM module, and the closure reaches no libpam.so
+  that could open it
+```
+
+On a SLE BCI 15.5 image with a pure-Go entrypoint this is the difference between
+78 reachable objects and 1: `libpam`, `libcrypto`, `libselinux` and
+`libkrb5support` were in the closure only through plugin roots, all four call
+`dlopen`, and a `dlopen` taint is global — so 95 of the image's 107 OS findings
+came back `linked`, 79 of them packages the closure had already shown it reaches
+no object of.
 
 | Situation | Status | Justification | Method |
 |---|---|---|---|

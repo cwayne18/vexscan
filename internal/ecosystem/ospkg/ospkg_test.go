@@ -535,6 +535,101 @@ func TestAPureGoEntrypointDischargesTheStaticTaint(t *testing.T) {
 	}
 }
 
+// pamImage is a glibc base image in the shape that motivated plugin gating: a
+// PAM module, the libpam that opens it, and an unrelated library. libpam calls
+// dlopen -- every real one does -- so if it is in the closure its taint is
+// global and no package in the image can be ruled out.
+//
+// needs is the entrypoint's DT_NEEDED, which is how a test says whether this
+// image runs PAM.
+func pamImage(t *testing.T, needs ...string) map[string]ecosystem.Finding {
+	t.Helper()
+	img := debianImage(t,
+		target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}},
+		[]debPkg{
+			{name: "libpam0g", version: "1.5.2-6", source: "pam", files: []string{
+				"/usr/lib/libpam.so.0", "/usr/lib/security/pam_unix.so",
+			}},
+			{name: "libcurl4", version: "7.88.1-10", source: "curl", files: []string{"/usr/lib/libcurl.so.4"}},
+		},
+		map[string]string{"/usr/bin/app": ""})
+
+	libpam := lib("libpam.so.0")
+	libpam.Dlopen = true
+	p := New(Options{ReadELF: fakeELF{
+		"/usr/bin/app":                  exe(needs...),
+		"/usr/lib/libpam.so.0":          libpam,
+		"/usr/lib/security/pam_unix.so": lib("pam_unix.so", "libpam.so.0"),
+		"/usr/lib/libcurl.so.4":         lib("libcurl.so.4"),
+	}.read})
+	return statuses(t, p, img, []ecosystem.Subject{{Raw: ""}})
+}
+
+// TestPluginsWithNoLoaderDoNotHoldAnImageHostage is the plugin gating at the
+// level a user sees it, and the reason it was worth doing.
+//
+// The entrypoint here links nothing -- the shape of a pure-Go binary on a
+// distribution base image. Rooting pam_unix.so regardless pulls libpam into the
+// closure through its DT_NEEDED, libpam calls dlopen, and a dlopen taint is
+// global: on a measured SLE BCI 15.5 image that one chain turned 95 OS packages
+// into `linked`, 79 of them packages the closure had already shown it reaches
+// no object of. Nothing in the image could have opened the module.
+func TestPluginsWithNoLoaderDoNotHoldAnImageHostage(t *testing.T) {
+	got := pamImage(t)
+
+	for _, name := range []string{"pam", "curl"} {
+		f, ok := got[name]
+		if !ok {
+			t.Fatalf("no finding for %s (got %v)", name, keys(got))
+		}
+		if f.Status != ecosystem.StatusNotInPath {
+			t.Errorf("%s: status = %s, want not_in_execute_path", name, f.Status)
+		}
+		for _, e := range f.Evidence {
+			if e.Blocking {
+				t.Errorf("%s: blocking evidence from a library nothing loads: %q", name, e.Detail)
+			}
+		}
+	}
+
+	// Ruled out, and said so. "The linker would load none of them" is true of a
+	// PAM module in every image; what decided this row is that no libpam was
+	// reachable to open it, and a reader who disagrees needs to be told which
+	// library to go looking for.
+	var said bool
+	for _, e := range got["pam"].Evidence {
+		if strings.Contains(e.Detail, "pam_unix.so") && strings.Contains(e.Detail, "PAM module") &&
+			strings.Contains(e.Detail, "libpam.so") {
+			said = true
+		}
+	}
+	if !said {
+		t.Errorf("the gated PAM module left no trace in the evidence: %+v", got["pam"].Evidence)
+	}
+}
+
+// The other direction, which is what keeps the test above from being satisfied
+// by dropping plugins altogether: an image that does run PAM reaches libpam,
+// libpam opens the module, and the dlopen taint is back.
+func TestAReachableLoaderStillAdmitsItsPlugins(t *testing.T) {
+	got := pamImage(t, "libpam.so.0")
+
+	for _, name := range []string{"pam", "curl"} {
+		if f := got[name]; f.Status != ecosystem.StatusLinked {
+			t.Errorf("%s: status = %s, want linked", name, f.Status)
+		}
+	}
+	var blocking bool
+	for _, e := range got["curl"].Evidence {
+		if e.Blocking && strings.Contains(e.Detail, "dlopen") {
+			blocking = true
+		}
+	}
+	if !blocking {
+		t.Errorf("libpam is in the closure and its dlopen did not block: %+v", got["curl"].Evidence)
+	}
+}
+
 // buildGoBinary compiles a trivial program to dst with env applied to the
 // toolchain. A handwritten fixture will not do: the CGO_ENABLED setting the
 // prober reads is stamped by the build, so only a real binary carries one.
