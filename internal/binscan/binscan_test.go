@@ -143,6 +143,96 @@ func buildGoSource(t *testing.T, dst, mainGo string, env ...string) {
 	}
 }
 
+// TestStaticSymbols reads the static symbol table out of a real ELF binary,
+// which is the reader the cgo static-entrypoint discharge is built on. The
+// fixtures are cross-compiled to Linux, because a native build on a non-Linux
+// host is not ELF at all and debug/elf could not open it -- which is itself the
+// conservative "unreadable reads as stripped" path, not the symbol read under
+// test.
+//
+// The stripped build is the load-bearing case. -ldflags=-s -w throws the
+// symbol table away, and StaticSymbols must report that, because the whole
+// discipline turns on it: a vulnerable symbol absent from a table that still
+// exists is absent from the binary, but absent from a table that was discarded
+// is unknown, and unknown has to stay blocking.
+func TestStaticSymbols(t *testing.T) {
+	unstripped := filepath.Join(t.TempDir(), "app")
+	buildELF(t, unstripped)
+
+	def, stripped, err := StaticSymbols(unstripped)
+	if err != nil {
+		t.Fatalf("StaticSymbols: %v", err)
+	}
+	if stripped {
+		t.Fatal("an unstripped build reported stripped")
+	}
+	// main.main is the program's own entry function; a build that kept its
+	// symbol table kept that name, and it is the least fragile thing to assert.
+	if !contains(def, "main.main") {
+		t.Errorf("defined symbols %d do not include main.main", len(def))
+	}
+
+	stripped2 := filepath.Join(t.TempDir(), "app-stripped")
+	buildELF(t, stripped2, "-ldflags=-s -w")
+
+	def, stripped, err = StaticSymbols(stripped2)
+	if err != nil {
+		t.Fatalf("StaticSymbols (stripped): %v", err)
+	}
+	if !stripped {
+		t.Errorf("a -s -w build was not reported stripped (%d symbols read)", len(def))
+	}
+	if len(def) != 0 {
+		t.Errorf("a stripped build reported %d defined symbols, want none", len(def))
+	}
+
+	// A file that is not an ELF object cannot have anything proven absent from
+	// it, so it reads as stripped rather than erroring -- the caller's blocking
+	// default is the whole point.
+	notELF := filepath.Join(t.TempDir(), "passwd")
+	if err := os.WriteFile(notELF, []byte("root:x:0:0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, stripped, err := StaticSymbols(notELF); err != nil || !stripped {
+		t.Errorf("non-ELF file: got (stripped=%v, err=%v), want (true, nil)", stripped, err)
+	}
+}
+
+// buildELF cross-compiles a trivial program to dst as a Linux ELF, so the
+// static symbol reader has a real symbol table to read on any host.
+func buildELF(t *testing.T, dst string, flags ...string) {
+	t.Helper()
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("no go toolchain on PATH")
+	}
+	src := t.TempDir()
+	write := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(src, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("go.mod", "module example.com/probe\n\ngo 1.23\n")
+	write("main.go", "package main\n\nfunc main() {}\n")
+
+	args := append([]string{"build", "-o", dst}, flags...)
+	args = append(args, ".")
+	cmd := exec.Command("go", args...)
+	cmd.Dir = src
+	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=arm64", "CGO_ENABLED=0")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("go build unavailable in this environment: %v: %s", err, out)
+	}
+}
+
+func contains(ss []string, want string) bool {
+	for _, s := range ss {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestFindGoBinaries(t *testing.T) {
 	root := t.TempDir()
 	for _, d := range []string{"usr/bin", "etc", "proc/self"} {

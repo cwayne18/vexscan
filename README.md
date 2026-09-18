@@ -942,7 +942,7 @@ you tell them apart.
 |---|---|---|
 | `unresolved-needed` | a `DT_NEEDED` that resolved to nothing | scoped to that soname |
 | `dlopen` | a reachable ELF references `dlopen`/`dlmopen` | global, unless `--dlopen-policy=assume-none` |
-| `static-elf` | a reachable ELF has no `PT_INTERP`/`.dynamic` | blocks all C-library conclusions, unless the entrypoint is a pure-Go build |
+| `static-elf` | a reachable ELF has no `PT_INTERP`/`.dynamic` | blocks all C-library conclusions, unless the entrypoint is a pure-Go build or its symbol table clears the advisory |
 | `shell-entrypoint` | argv[0] is a shell or init shim (`sh`, `busybox`, `s6-*`), or a transparent wrapper (`tini`, `gosu`, `env`) used in a form its parser cannot read | every ELF in the standard bin dirs becomes a root |
 | `no-entrypoint` | the image config has neither Entrypoint nor Cmd — or there is no config at all, as in `--rootfs` mode | same escalation |
 | `exec` | the entrypoint is a Go binary that links a process-spawning call | global, unless `--exec-policy=assume-none`; recorded as a discharged note when the binary provably links none |
@@ -1040,6 +1040,38 @@ Before this probe both reported 48 / 125. The second one was wrong: `su` was
 found in the binary's string literals and rooted, which pulled in libpam, which
 admitted the 47 PAM modules the plugin gating had left out, and the global taint
 blocked the rest.
+
+**The cgo symbol-absence discharge.** A cgo entrypoint is exactly the case the
+pure-Go discharge cannot touch: it *might* have linked the C library in, so its
+static-elf taint stays blocking by default. But if it is **unstripped**, its own
+symbol table settles the question for a specific advisory. Under
+`--mine-advisories`, once a vulnerable symbol has been validated against the
+package it belongs to (the same namespace discipline the mined-symbol test
+uses), vexscan reads the entrypoint's `.symtab` and clears the taint for
+that finding only when:
+
+- the entrypoint is a **cgo** build (its build info records `CGO_ENABLED=1`) and
+  is **not stripped** — a stripped binary stays blocking, because absence from a
+  symbol table that was discarded is not absence from the binary;
+- the vulnerable function's **namespace is present** in the table (the binary
+  demonstrably links that library family), **and** the vulnerable function
+  itself is **absent** — so the linker included the library but not the
+  vulnerable code.
+
+```
+evidence: /app/server is a cgo binary, but its static symbol table carries the SSL_
+          namespace and not SSL_free_buffers, so the vulnerable code is not statically
+          linked into it
+```
+
+The namespace gate is the whole of the safety here, and it is the same
+open-world rule the mined-symbol layer uses: a function absent from a table that
+never mentions its library family says nothing — the family may be there under
+localised or stripped names — so a *wholly* absent namespace stays blocking, not
+discharged. This continues the [pure-Go discharge](#taints) (#24) toward the
+same end as [issue #23](https://github.com/cwayne18/vexscan/issues/23):
+maximizing the removals a scan can make with certainty, and making no other
+kind.
 
 `--roots /path/to/bin` adds entrypoints for an image whose real command comes
 from outside its own config — a Kubernetes `command:`, a sidecar, an operator —
@@ -1238,7 +1270,11 @@ known entrypoint. Concretely:
   disk. The `static-elf` taint catches this and the result is `linked` — correct
   but useless — on exactly the images people most want a clean answer for. The
   [pure-Go discharge](#taints) lifts it for a `CGO_ENABLED=0` entrypoint, which
-  covers the common distroless Go image but nothing built with cgo.
+  covers the common distroless Go image but nothing built with cgo. For an
+  unstripped cgo entrypoint, the [symbol-absence discharge](#taints) can still
+  clear a specific advisory when the vulnerable function is absent from the
+  binary's own symbol table while its namespace is present; a stripped binary,
+  or one that never links the family at all, stays `linked`.
 - **Distro base images are nearly as bad.** `debian:12` and `ubi9` ship with
   `bash` as Cmd, which triggers `shell-entrypoint`: every binary in `/usr/bin`
   becomes a root, and almost everything is reachable. On `ubi9:latest --all`,

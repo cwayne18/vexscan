@@ -17,6 +17,19 @@ const (
 	// MethodImportAbsent: the function is exported, but nothing the closure
 	// reaches references it.
 	MethodImportAbsent = "elf-import-absent"
+	// MethodStaticSymbolAbsent: a blocking static entrypoint is a cgo build --
+	// which the CGO_ENABLED=0 discharge in #24 cannot touch, because a cgo
+	// binary might have linked the C library in -- but its own static symbol
+	// table carries the vulnerable function's namespace and not the function,
+	// so the vulnerable code was provably not statically linked into it.
+	//
+	// It is the cgo analogue of #24's structural discharge. That one clears the
+	// static-elf taint when the binary provably links no C library at all; this
+	// one clears it by proof from the symbol table, for exactly the case the
+	// structural test leaves blocking. Like the other two it only ever appears
+	// under --mine-advisories, because it needs a validated vulnerable symbol to
+	// look for.
+	MethodStaticSymbolAbsent = "elf-static-symbol-absent"
 	// MethodMined marks an observation from the mining layer that changed no
 	// status -- including every case where validation rejected a hint.
 	MethodMined = "llm-mined"

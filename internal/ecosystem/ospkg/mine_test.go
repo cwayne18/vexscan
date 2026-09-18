@@ -358,3 +358,207 @@ func TestNamespaceIsTheLibraryPrefix(t *testing.T) {
 		}
 	}
 }
+
+// fakeStatic is a staticReader over a map, so the cgo static-symbol discharge
+// can be exercised against a chosen symbol table without compiling a cgo binary
+// that carries one. An entry the map does not name reads as stripped, which is
+// the conservative default an unreadable entrypoint would take.
+type fakeStatic map[string]staticEntry
+
+func (f fakeStatic) read(_ target.RootFS, path string) (defined []string, stripped, cgo bool, err error) {
+	e, ok := f[path]
+	if !ok {
+		return nil, true, false, nil
+	}
+	return e.defined, e.stripped, e.cgo, e.err
+}
+
+// TestCgoStaticSymbolDischarge is the gap #24 left: a cgo, statically linked
+// entrypoint that the CGO_ENABLED=0 discharge cannot touch, cleared instead by
+// proof from its own symbol table.
+//
+// The fixture is a static entrypoint that references nothing, and a libssl the
+// package installs that sits unreferenced on disk -- the exact shape that makes
+// the static-elf taint block. The advisory names SSL_free_buffers, and libssl
+// exports the SSL_ namespace, so the symbol validates. Whether the taint is
+// discharged then turns entirely on what the entrypoint's own table holds.
+func TestCgoStaticSymbolDischarge(t *testing.T) {
+	img := debianImage(t,
+		target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}},
+		[]debPkg{{name: "libssl3", version: "3.0.11-1", source: "openssl",
+			files: []string{"/usr/lib/libssl.so.3"}}},
+		map[string]string{"/usr/bin/app": ""})
+
+	// A static entrypoint: ET_EXEC with no PT_INTERP and nothing needed, so the
+	// closure sees it carry its libraries inside itself and libssl on disk goes
+	// unreferenced.
+	staticExe := &elfgraph.Info{Class: elf.ELFCLASS64, Machine: elf.EM_X86_64, Type: elf.ET_EXEC}
+	elves := fakeELF{
+		"/usr/bin/app":         staticExe,
+		"/usr/lib/libssl.so.3": lib("libssl.so.3"),
+	}
+
+	for _, tc := range []struct {
+		name       string
+		entry      staticEntry
+		wantStatus ecosystem.Status
+		discharge  bool
+	}{
+		// The namespace is linked in (SSL_new) and the vulnerable function is
+		// not, so the build provably lacks it: discharged, and the package's
+		// own tables not exporting it then reads as not_present.
+		{"namespace present, symbol absent", staticEntry{defined: []string{"SSL_new", "SSL_read"}, cgo: true}, ecosystem.StatusNotPresent, true},
+		// The vulnerable function is right there in the table: the code is
+		// linked in, so nothing is discharged.
+		{"vulnerable symbol present", staticEntry{defined: []string{"SSL_new", "SSL_free_buffers"}, cgo: true}, ecosystem.StatusLinked, false},
+		// No symbol table to reason over. Absence from a table that was thrown
+		// away is not absence from the binary. The symbols here are the ones
+		// that would discharge if the table were whole, so the stripped flag is
+		// the only thing left that can decline.
+		{"stripped", staticEntry{defined: []string{"SSL_new", "SSL_read"}, stripped: true, cgo: true}, ecosystem.StatusLinked, false},
+		// The family is nowhere in the table, so the binary does not visibly
+		// use openssl at all -- which is not proof it is absent, only that it is
+		// invisible. Stays blocking.
+		{"namespace absent entirely", staticEntry{defined: []string{"main.main", "runtime.main"}, cgo: true}, ecosystem.StatusLinked, false},
+		// Not known to be a cgo build, so this discharge does not apply -- the
+		// CGO_ENABLED=0 path is the only other one, and it already ran.
+		{"cgo unknown", staticEntry{defined: []string{"SSL_new"}, cgo: false}, ecosystem.StatusLinked, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := New(Options{
+				Mine:    true,
+				ReadELF: elves.read,
+				ReadSymbols: newSyms(map[string]syms{
+					"/usr/lib/libssl.so.3": {defined: []string{"SSL_new", "SSL_free", "SSL_read"}},
+				}).read,
+				readStatic: fakeStatic{"/usr/bin/app": tc.entry}.read,
+			})
+
+			f := mined(t, p, img,
+				advisory("A flaw in SSL_free_buffers allows a buffer to be freed twice."),
+				&llm.Hints{Symbols: []string{"SSL_free_buffers"}})
+
+			if f.Status != tc.wantStatus {
+				t.Errorf("status = %s, want %s", f.Status, tc.wantStatus)
+			}
+			got := evidenceFrom(f, MethodStaticSymbolAbsent)
+			if (len(got) > 0) != tc.discharge {
+				t.Errorf("static-symbol discharge evidence = %v, want present=%v", got, tc.discharge)
+			}
+			if tc.discharge {
+				why := strings.Join(got, " ")
+				if !strings.Contains(why, "SSL_free_buffers") || !strings.Contains(why, "cgo binary") {
+					t.Errorf("discharge evidence does not explain itself: %q", why)
+				}
+			}
+		})
+	}
+}
+
+// What the discharge proves is that one named binary does not carry one named
+// function. An image runs more than one program, and the proof does not travel:
+// clearing the binary that was read must leave the binary that was not read
+// blocking, or the discharge would launder every other static root in the image
+// through the one it happened to understand.
+func TestStaticDischargeOnlyClearsTheBinaryItProved(t *testing.T) {
+	img := debianImage(t,
+		target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}},
+		[]debPkg{{name: "libssl3", version: "3.0.11-1", source: "openssl",
+			files: []string{"/usr/lib/libssl.so.3"}}},
+		map[string]string{"/usr/bin/app": "", "/usr/bin/other": ""})
+
+	static := &elfgraph.Info{Class: elf.ELFCLASS64, Machine: elf.EM_X86_64, Type: elf.ET_EXEC}
+	elves := fakeELF{
+		"/usr/bin/app":         static,
+		"/usr/bin/other":       static,
+		"/usr/lib/libssl.so.3": lib("libssl.so.3"),
+	}
+
+	p := New(Options{
+		Mine: true,
+		// --roots names the second program, so both are executed and both
+		// raise a blocking static-elf taint.
+		Roots:   []string{"/usr/bin/other"},
+		ReadELF: elves.read,
+		ReadSymbols: newSyms(map[string]syms{
+			"/usr/lib/libssl.so.3": {defined: []string{"SSL_new", "SSL_free", "SSL_read"}},
+		}).read,
+		readStatic: fakeStatic{
+			"/usr/bin/app":   {defined: []string{"SSL_new", "SSL_read"}, cgo: true},
+			"/usr/bin/other": {defined: []string{"SSL_new", "SSL_free_buffers"}, cgo: true},
+		}.read,
+	})
+
+	f := mined(t, p, img,
+		advisory("A flaw in SSL_free_buffers allows a buffer to be freed twice."),
+		&llm.Hints{Symbols: []string{"SSL_free_buffers"}})
+
+	// The proof about /usr/bin/app is real and is still reported: the finding
+	// stays blocking because of the other binary, not because nothing was
+	// proved.
+	if got := evidenceFrom(f, MethodStaticSymbolAbsent); len(got) != 1 || !strings.Contains(got[0], "/usr/bin/app") {
+		t.Fatalf("discharge evidence = %v, want exactly the proof about /usr/bin/app", got)
+	}
+	if f.Status != ecosystem.StatusLinked {
+		t.Errorf("status = %s, want %s: /usr/bin/other was never read and still carries the code",
+			f.Status, ecosystem.StatusLinked)
+	}
+}
+
+// The discharge is a claim about named functions, so with no function to name
+// it has nothing to prove. Without this gate the absence test runs over an
+// empty list, every loop passes vacuously, and every finding against an image
+// with a static cgo entrypoint clears on no evidence at all -- the exact false
+// removal this whole discharge is built to refuse.
+func TestStaticDischargeNeedsAValidatedSymbol(t *testing.T) {
+	img := debianImage(t,
+		target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}},
+		[]debPkg{{name: "libssl3", version: "3.0.11-1", source: "openssl",
+			files: []string{"/usr/lib/libssl.so.3"}}},
+		map[string]string{"/usr/bin/app": ""})
+
+	elves := fakeELF{
+		"/usr/bin/app":         {Class: elf.ELFCLASS64, Machine: elf.EM_X86_64, Type: elf.ET_EXEC},
+		"/usr/lib/libssl.so.3": lib("libssl.so.3"),
+	}
+
+	for _, tc := range []struct {
+		name  string
+		hints *llm.Hints
+	}{
+		// Mining never ran, so nothing was mined and nothing can be absent.
+		{"no mining", nil},
+		// Mining ran and found nothing to name.
+		{"nothing mined", &llm.Hints{Note: "the advisory describes a protocol flaw"}},
+		// A symbol that is not in the advisory's own text was invented, and an
+		// invented name is absent from every binary ever built.
+		{"symbol not in the advisory text", &llm.Hints{Symbols: []string{"SSL_invented_by_a_model"}}},
+		// A real name from the text that the package does not export: its
+		// absence from the entrypoint says nothing either.
+		{"symbol outside the package's namespace", &llm.Hints{Symbols: []string{"EVP_PKEY_new"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := New(Options{
+				Mine:    true,
+				ReadELF: elves.read,
+				ReadSymbols: newSyms(map[string]syms{
+					"/usr/lib/libssl.so.3": {defined: []string{"SSL_new", "SSL_free", "SSL_read"}},
+				}).read,
+				// A table that would discharge, if there were anything to
+				// look up in it.
+				readStatic: fakeStatic{"/usr/bin/app": {defined: []string{"SSL_new", "SSL_read"}, cgo: true}}.read,
+			})
+
+			f := mined(t, p, img,
+				advisory("A flaw in SSL_free_buffers, reached through EVP_PKEY_new, frees a buffer twice."),
+				tc.hints)
+
+			if got := evidenceFrom(f, MethodStaticSymbolAbsent); len(got) > 0 {
+				t.Errorf("discharged with nothing validated: %v", got)
+			}
+			if f.Status != ecosystem.StatusLinked {
+				t.Errorf("status = %s, want %s", f.Status, ecosystem.StatusLinked)
+			}
+		})
+	}
+}
