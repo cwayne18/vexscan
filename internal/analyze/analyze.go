@@ -177,6 +177,9 @@ type Options struct {
 	Roots []string
 	// DlopenPolicy decides whether a reachable dlopen blocks conclusions.
 	DlopenPolicy elfgraph.DlopenPolicy
+	// ExecPolicy decides whether an entrypoint that can start another program
+	// blocks conclusions.
+	ExecPolicy elfgraph.ExecPolicy
 	// DynamicPolicy decides whether a reachable import of a computed name
 	// blocks conclusions. It is the import graph's DlopenPolicy.
 	DynamicPolicy modgraph.DynamicPolicy
@@ -491,6 +494,7 @@ func registryFor(opts Options) *ecosystem.Registry {
 		ospkg.New(ospkg.Options{
 			Roots:              opts.Roots,
 			DlopenPolicy:       opts.DlopenPolicy,
+			ExecPolicy:         opts.ExecPolicy,
 			Ecosystem:          opts.OSVEcosystem,
 			Packages:           append(opts.rpmPackages, opts.sbomOS...),
 			Mine:               opts.MineAdvisories && opts.UseLLM,

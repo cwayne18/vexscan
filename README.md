@@ -945,6 +945,7 @@ you tell them apart.
 | `static-elf` | a reachable ELF has no `PT_INTERP`/`.dynamic` | blocks all C-library conclusions, unless the entrypoint is a pure-Go build |
 | `shell-entrypoint` | argv[0] is a shell or init shim (`sh`, `busybox`, `s6-*`), or a transparent wrapper (`tini`, `gosu`, `env`) used in a form its parser cannot read | every ELF in the standard bin dirs becomes a root |
 | `no-entrypoint` | the image config has neither Entrypoint nor Cmd — or there is no config at all, as in `--rootfs` mode | same escalation |
+| `exec` | the entrypoint is a Go binary that links a process-spawning call | global, unless `--exec-policy=assume-none`; recorded as a discharged note when the binary provably links none |
 
 **The pure-Go discharge.** `static-elf` blocks because a statically linked
 entrypoint may hold a copy of the vulnerable library inside it, where
@@ -964,10 +965,81 @@ evidence: /app/server is statically linked, so the libraries it uses are inside 
 Only the entrypoint is probed, and only a Go binary whose build info records
 `CGO_ENABLED=0`. A cgo build, a non-Go static binary, or a build info that
 cannot be read leaves the taint blocking. What this discharges is *linked-in* C
-code: a pure-Go binary can still `exec` another binary in the image, and that
-one may load anything. So can a dynamically linked entrypoint, which has never
-blocked for it — the discharge puts static Go entrypoints on the same footing,
-not below it.
+code, and only that — whether the binary goes on to `exec` something else is a
+separate question, asked separately below.
+
+#### The exec probe (`--exec-policy`)
+
+The closure follows what the dynamic linker maps into **one process**. It does
+not follow a process tree. An entrypoint that runs `/usr/bin/su` loads libpam in
+a second process that nothing here looks at, and a `not_affected` on the `pam`
+package would then be wrong for a reason the report never mentioned.
+
+Escalation covers the case where the image does not say what it runs, and
+`shell-entrypoint` covers the case where what it runs is a script. An image
+whose entrypoint is one compiled binary used to get the benefit of the doubt,
+and the doubt was never measured. For a Go binary it can be.
+
+A Go binary keeps its function-name table even when fully stripped, so whether
+it links `syscall.forkExec` or `syscall.Exec` — the two chokepoints every route
+out of Go into a new process ends at, including `os/exec`, `os.StartProcess` and
+`golang.org/x/sys/unix.Exec` — is a fact about the file rather than a guess.
+That makes the answer three-valued, and the two decided values are both worth
+saying:
+
+- **It can.** A blocking, global `exec` taint. Program paths the binary mentions
+  are rooted, so their libraries are in the closure rather than reported as dead
+  code, and they are named in the evidence as a starting list for `--roots`.
+  Finding them does *not* discharge anything: a target assembled at runtime or
+  resolved through `PATH` leaves no name to find, so the list can never be known
+  to be complete.
+- **It provably cannot.** A discharged note. This is the one that matters for a
+  distroless-style image, because it turns "we assume the entrypoint does not
+  shell out" into something checked:
+
+```
+evidence: /app/server starts no other program: it is a pure-Go binary built with
+          CGO_ENABLED=0 and its function-name table contains none of the standard
+          library's process-spawning calls, so it links no C that could exec and
+          no Go that would
+```
+
+- **Unknown.** A C entrypoint, a cgo build with no Go-side marker, an unreadable
+  file. Nothing is recorded and the closure behaves exactly as it did before the
+  probe existed. Blocking here would block every image with a compiled non-Go
+  entrypoint, on a suspicion that applies to all of them equally.
+
+The asymmetry between the first two is deliberate. Finding a marker settles the
+positive claim however the binary was linked; the negative claim additionally
+requires `CGO_ENABLED=0`, because the markers are Go symbol names and a cgo
+build can reach `execve`, `system` or `posix_spawn` from C without leaving one.
+
+The test is a substring search over the whole file, not a parse of
+`.gopclntab`, and that is the conservative direction rather than the lazy one.
+The claim is an absence, and an absence proved over every byte is stronger than
+one proved over the bytes a parser managed to find — a parser that mislocated
+the table would report an empty function list and turn a binary that *does*
+exec into one that provably does not. The cost is precision the other way: a
+marker sitting in an embedded file reads as a spawn, which costs a taint, which
+is a conclusion withheld rather than a conclusion invented.
+
+`--exec-policy=assume-none` is the escape hatch, mirroring `--dlopen-policy`:
+name what the entrypoint runs with `--roots`, then assert that they are
+accounted for. The observation stays in the record as a discharged note.
+
+**Measured**, on `registry.suse.com/bci/bci-base:15.5` with a Go entrypoint at
+`/app/server`. The two images differ only in whether the entrypoint calls
+`exec.Command("/usr/bin/su", ...)`:
+
+| entrypoint | closure | affected | ruled out |
+|---|---|---|---|
+| pure Go, no spawn | 1 of 560 objects, 1 root | 48 | 125 |
+| same, plus one `exec.Command` | 81 of 560 objects, 56 roots | 143 | 30 |
+
+Before this probe both reported 48 / 125. The second one was wrong: `su` was
+found in the binary's string literals and rooted, which pulled in libpam, which
+admitted the 47 PAM modules the plugin gating had left out, and the global taint
+blocked the rest.
 
 `--roots /path/to/bin` adds entrypoints for an image whose real command comes
 from outside its own config — a Kubernetes `command:`, a sidecar, an operator —
@@ -2925,6 +2997,7 @@ Three properties are deliberate:
 | `--fixed-only` | `false` | Only report findings a fix has been published for. Prints how many it hid and how many of those are AFFECTED — see [Filtering to what you can fix](#filtering-to-what-you-can-fix---fixed-only) |
 | `--triage` | `false` | Order findings by exploitation evidence — EPSS scores and CISA's known-exploited catalog. Adds two columns and re-sorts; hides nothing and changes no severity — see [Prioritising by exploitation evidence](#prioritising-by-exploitation-evidence---triage) |
 | `--dlopen-policy` | `taint` | `taint` (block conclusions) or `assume-none` |
+| `--exec-policy` | `taint` | The same knob for a Go entrypoint that links a process-spawning call. `assume-none` asserts that what it runs is accounted for — name those with `--roots` — see [The exec probe](#the-exec-probe---exec-policy) |
 | `--dynamic-import-policy` | `taint` | The same knob for a language import graph's computed imports. These are far more common than `dlopen`, so `assume-none` discards much more |
 | `--trust-import-absence` | `false` | Let a missing dynamic import conclude `not_in_execute_path` (weaker than it looks) |
 | `--os` / `--arch` | `linux` / `amd64` | Image platform variant to pull (image mode only) |

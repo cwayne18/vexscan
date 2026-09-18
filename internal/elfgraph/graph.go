@@ -50,6 +50,10 @@ type Options struct {
 	// DlopenPolicy decides whether a reachable dlopen blocks conclusions.
 	DlopenPolicy DlopenPolicy
 
+	// ExecPolicy decides whether an entrypoint that can start another program
+	// blocks conclusions.
+	ExecPolicy ExecPolicy
+
 	// ReadELF loads ELF metadata. Defaults to the debug/elf-backed reader.
 	ReadELF Reader
 
@@ -66,8 +70,56 @@ type Options struct {
 	// .so on disk really is the answer.
 	StaticProber StaticProber
 
+	// ExecProber optionally inspects an entrypoint to decide whether it can start
+	// another program. Nil leaves the question unasked, which is what every
+	// version of this package before it did.
+	//
+	// It exists because the closure models one process image and not a process
+	// tree, and that gap has always been the largest unmeasured thing in the
+	// answer. An entrypoint that execs /usr/bin/su loads libpam in a process this
+	// package never looks at, and until something asks, the report cannot tell
+	// the difference between an image where that happens and one where it
+	// cannot. A prober turns the gap into one of three statements -- it does, it
+	// provably does not, or this is not a binary I can read -- and only the first
+	// two are worth saying.
+	ExecProber ExecProber
+
 	Logf func(string, ...any)
 }
+
+// ExecProbe is what an ExecProber concluded about one entrypoint.
+type ExecProbe struct {
+	// CanSpawn reports that the binary contains code that starts another
+	// program, so the closure is a lower bound on what the image runs.
+	CanSpawn bool
+
+	// Why explains the conclusion, in either direction, for the taint's evidence
+	// line. Required: a probe that reports a result without saying how it
+	// reached it produces a taint whose detail cannot be audited, and both
+	// directions of this test are load-bearing enough to need one. A probe with
+	// no Why is treated as having established nothing.
+	Why string
+
+	// Targets are program paths the binary mentions, as candidates for what it
+	// might exec. They are rooted, because rooting too much only widens the
+	// closure, and they are named in the evidence so a user deciding whether to
+	// pass --exec-policy=assume-none has a list to check --roots against.
+	//
+	// Never complete, and not treated as though it were: a target assembled at
+	// runtime or resolved through PATH leaves no absolute path in the file, so
+	// the taint blocks whether this is empty or not.
+	Targets []string
+}
+
+// ExecProber inspects the program at a tree-absolute path and reports whether
+// it can start another program. programs are the tree-absolute paths of every
+// executable in the image, offered so a prober can look for the ones its
+// subject mentions.
+//
+// The second result is false when nothing could be established -- a binary the
+// prober cannot read, or one whose language leaves no trace of the answer -- in
+// which case no taint is recorded and the closure behaves as it always has.
+type ExecProber func(fsys target.RootFS, path string, programs []string) (ExecProbe, bool)
 
 // StaticProbe is what a StaticProber concluded about one static entrypoint.
 type StaticProbe struct {
@@ -169,6 +221,9 @@ func Build(fsys target.RootFS, opts Options) (*Graph, error) {
 	}
 	if opts.DlopenPolicy == "" {
 		opts.DlopenPolicy = DlopenTaint
+	}
+	if opts.ExecPolicy == "" {
+		opts.ExecPolicy = ExecTaint
 	}
 
 	g := &Graph{fsys: fsys, config: opts.Config, nodes: map[string]*Node{}}
@@ -315,6 +370,103 @@ func (g *Graph) markRoots(opts Options) {
 
 	// Later argv elements are arguments, not programs -- except for the common
 	// wrapper shapes, which the shell check above already caught.
+
+	g.probeExec(opts)
+}
+
+// probeExec asks the prober whether the programs this image says it runs can
+// run anything else, and roots whatever they name.
+//
+// Only the explicit roots are probed, and only on the path where the closure
+// did not escalate. Every escalating branch above has already recorded a
+// blocking taint and rooted every executable in the image, so an entrypoint
+// that can exec tells a reader nothing they were not already told, and probing
+// the several hundred binaries escalation rooted would be paid for in I/O to
+// reach the same answer.
+func (g *Graph) probeExec(opts Options) {
+	if opts.ExecProber == nil {
+		return
+	}
+	programs := g.programs()
+
+	// Snapshotted, because rooting a candidate target appends to g.roots. The
+	// subject is what the image says it runs; a program that program might exec
+	// is already covered by the taint that rooting it came with, and chasing the
+	// chain would probe every binary a big Go program happens to name.
+	subjects := append([]string(nil), g.roots...)
+	for _, p := range subjects {
+		if g.nodes[p].Kind != RootExplicit {
+			continue
+		}
+		// Why is part of the condition rather than only the message. A probe
+		// that reports "cannot exec" without saying how it established that
+		// produces a discharged taint indistinguishable from a real one, and a
+		// discharge is exactly the claim a reader has to be able to check.
+		pr, ok := opts.ExecProber(g.fsys, p, programs)
+		if !ok || pr.Why == "" {
+			continue
+		}
+		if !pr.CanSpawn {
+			g.taints = append(g.taints, Taint{
+				Kind:       TaintExec,
+				Detail:     fmt.Sprintf("%s starts no other program: %s", p, pr.Why),
+				Path:       p,
+				Discharged: true,
+			})
+			continue
+		}
+
+		// Rooting the candidates before the walk, so the libraries they need are
+		// in the closure. It does not discharge anything -- the list cannot be
+		// complete -- but a closure that already contains the obvious targets is
+		// the one worth having if the user goes on to assert --exec-policy=
+		// assume-none.
+		var rooted []string
+		for _, t := range pr.Targets {
+			c := g.Canon(t)
+			if n, exists := g.nodes[c]; !exists || !n.Info.IsProgram() || c == p {
+				continue
+			}
+			g.addRoot(c, fmt.Sprintf("named in %s, which can exec", p), RootExplicit)
+			rooted = append(rooted, c)
+		}
+
+		assumed := opts.ExecPolicy == ExecAssumeNone
+		detail := fmt.Sprintf("%s can start another program (%s), and the closure follows one process and not what it launches",
+			p, pr.Why)
+		switch {
+		case len(rooted) > 0:
+			detail += fmt.Sprintf("; it names %s, rooted here, but a target built at runtime or found on PATH leaves no name to find",
+				strings.Join(rooted, ", "))
+		default:
+			detail += "; it names no program path this image has, so there is nothing to root on its behalf"
+		}
+		if assumed {
+			detail += ". --exec-policy=assume-none says to take what it runs as accounted for"
+		} else {
+			detail += ". Name what it runs with --roots and re-run with --exec-policy=assume-none"
+		}
+		g.taints = append(g.taints, Taint{
+			Kind:       TaintExec,
+			Detail:     detail,
+			Path:       p,
+			Blocking:   !assumed,
+			Global:     !assumed,
+			Discharged: assumed,
+		})
+	}
+}
+
+// programs are the tree-absolute paths of every executable in the image, for a
+// prober to look for mentions of.
+func (g *Graph) programs() []string {
+	var out []string
+	for _, p := range g.order {
+		if g.nodes[p].Info.IsProgram() {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // wrapperRule parses one exec wrapper's argument grammar and returns the argv it

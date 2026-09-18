@@ -68,6 +68,7 @@ func main() {
 		osvURL     = flag.String("osv-url", "", "OSV API root to query instead of "+osv.DefaultBaseURL+": a caching proxy or a mirror (env: VEXSCAN_OSV_URL)")
 		osvDir     = flag.String("osv-dir", "", "answer lookups from a local OSV data export (a directory or an all.zip) for offline use; version matching then happens here (env: VEXSCAN_OSV_DIR)")
 		dlopen     = flag.String("dlopen-policy", "taint", "what a reachable dlopen does to the closure: taint (block conclusions) or assume-none")
+		execPol    = flag.String("exec-policy", "taint", "what an entrypoint that can start another program does to the closure: taint (block conclusions) or assume-none")
 		dynamic    = flag.String("dynamic-import-policy", "taint", "what an import of a computed name does to the import graph: taint (block conclusions) or assume-none")
 		triageOn   = flag.Bool("triage", false, "order findings by exploitation evidence (EPSS + CISA known-exploited); adds columns, hides nothing, changes no severity")
 		mine       = flag.Bool("mine-advisories", false, "with --llm, let the model read each advisory's prose for symbols to check against the target")
@@ -242,6 +243,10 @@ func main() {
 	if err != nil {
 		fail("%v", err)
 	}
+	execPolicy, err := elfgraph.ParseExecPolicy(*execPol)
+	if err != nil {
+		fail("%v", err)
+	}
 	dynamicPolicy, err := modgraph.ParseDynamicPolicy(*dynamic)
 	if err != nil {
 		fail("%v", err)
@@ -370,6 +375,7 @@ func main() {
 		DistroFeeds:        distroFeedProviders,
 		VendorScorers:      vendorScorers,
 		DlopenPolicy:       dlopenPolicy,
+		ExecPolicy:         execPolicy,
 		DynamicPolicy:      dynamicPolicy,
 		GoVersion:          *goVersion,
 		UseLLM:             *useLLM,
@@ -853,7 +859,7 @@ var flagGroups = []struct {
 	{"What to check", []string{"package", "cves", "cves-file", "all", "ecosystem", "severity", "fixed-only", "module"}},
 	{"Source repo (--repo)", []string{"ref", "repo-path", "go-version"}},
 	{"Container image", []string{"os", "arch", "module-version"}},
-	{"Reachability", []string{"roots", "dlopen-policy", "dynamic-import-policy", "trust-import-absence"}},
+	{"Reachability", []string{"roots", "dlopen-policy", "exec-policy", "dynamic-import-policy", "trust-import-absence"}},
 	{"Advisory sources", []string{"osv-url", "osv-dir", "osv-ecosystem", "prefer-vendor", "distro-feeds"}},
 	{"VEX", []string{"vexhub", "vex-out", "vex-author", "vex-format", "vex-merge-into",
 		"vex-publisher-namespace", "vex-publisher-category"}},

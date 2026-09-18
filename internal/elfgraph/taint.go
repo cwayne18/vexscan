@@ -39,6 +39,15 @@ const (
 	// absence of any config at all. There is nothing to root the closure at,
 	// so the same escalation applies.
 	TaintNoEntrypoint TaintKind = "no-entrypoint"
+
+	// TaintExec is an entrypoint that can start another program. The closure
+	// models one process image, not a process tree, so what the entrypoint execs
+	// -- and every library that program would load -- is outside it.
+	//
+	// Unlike the other kinds this one is also recorded when it does not apply,
+	// discharged, because the interesting fact about an entrypoint that cannot
+	// exec is that somebody checked. See ExecProber.
+	TaintExec TaintKind = "exec"
 )
 
 // Taint is one recorded reason a not_affected conclusion is unavailable.
@@ -106,4 +115,29 @@ func ParseDlopenPolicy(s string) (DlopenPolicy, error) {
 		return DlopenAssumeNone, nil
 	}
 	return "", fmt.Errorf("unknown dlopen policy %q: want %q or %q", s, DlopenTaint, DlopenAssumeNone)
+}
+
+// ExecPolicy decides what an entrypoint that can start another program does to
+// the closure.
+type ExecPolicy string
+
+const (
+	// ExecTaint is the default: record it and block not_affected.
+	ExecTaint ExecPolicy = "taint"
+
+	// ExecAssumeNone takes the user's word that the programs the entrypoint runs
+	// are accounted for -- named with --roots, or known not to matter --
+	// recording the observation without letting it block.
+	ExecAssumeNone ExecPolicy = "assume-none"
+)
+
+// ParseExecPolicy validates an --exec-policy value.
+func ParseExecPolicy(s string) (ExecPolicy, error) {
+	switch ExecPolicy(s) {
+	case "", ExecTaint:
+		return ExecTaint, nil
+	case ExecAssumeNone:
+		return ExecAssumeNone, nil
+	}
+	return "", fmt.Errorf("unknown exec policy %q: want %q or %q", s, ExecTaint, ExecAssumeNone)
 }
