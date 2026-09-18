@@ -194,6 +194,7 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 			Detail: fmt.Sprintf("%s installs %s, and the dynamic linker would load none of them starting from %s",
 				pkg.Name, objects(files.ELF), e.entrypoint()),
 		})
+		f.Evidence = append(f.Evidence, e.gated(files.ELF)...)
 
 	case len(files.Reachable) == 0:
 		// Unreachable, but something about this image makes the closure an
@@ -207,6 +208,7 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 			Detail: fmt.Sprintf("%s installs %s and the closure reaches none of them, but this image cannot be closed over",
 				pkg.Name, objects(files.ELF)),
 		})
+		f.Evidence = append(f.Evidence, e.gated(files.ELF)...)
 		f.Evidence = append(f.Evidence, blockers...)
 		f.Reachability = "installed but not reached by the shared-library closure, which this image blocks from being conclusive"
 
@@ -354,6 +356,68 @@ func (e evaluator) discharged() []ecosystem.Evidence {
 		out = append(out, ecosystem.Evidence{Origin: MethodClosure, Detail: t.Detail})
 	}
 	return out
+}
+
+// gated explains the package's objects that are runtime-loaded plugins the
+// closure declined to root.
+//
+// "The dynamic linker would load none of them" is true of a PAM module in every
+// image, because nothing has a DT_NEEDED on one; what decided this row is that
+// no libpam was reachable to open it either. That is a stronger claim and a
+// more falsifiable one -- a reader who thinks the image does run PAM knows
+// exactly which library to go looking for -- so it is said rather than left
+// implied by a sentence about DT_NEEDED.
+//
+// Grouped by family and loader, because the pam package installs fifty-odd
+// modules and one line per module would bury the finding.
+func (e evaluator) gated(elfFiles []string) []ecosystem.Evidence {
+	byPath := map[string]elfgraph.GatedPlugin{}
+	for _, gp := range e.g.GatedPlugins() {
+		byPath[gp.Path] = gp
+	}
+	if len(byPath) == 0 {
+		return nil
+	}
+
+	type group struct {
+		gp    elfgraph.GatedPlugin
+		paths []string
+	}
+	var order []string
+	groups := map[string]*group{}
+	for _, f := range elfFiles {
+		gp, ok := byPath[f]
+		if !ok {
+			continue
+		}
+		key := gp.What + "\x00" + gp.Loader
+		if groups[key] == nil {
+			groups[key] = &group{gp: gp}
+			order = append(order, key)
+		}
+		groups[key].paths = append(groups[key].paths, f)
+	}
+
+	var out []ecosystem.Evidence
+	for _, key := range order {
+		g := groups[key]
+		detail := fmt.Sprintf("%s is %s, and the closure reaches no %s that could open it",
+			g.paths[0], g.gp.What, g.gp.Loader)
+		if n := len(g.paths); n > 1 {
+			detail = fmt.Sprintf("%d of those are %s (%s, %s%s), and the closure reaches no %s that could open them",
+				n, g.gp.Plural, g.paths[0], g.paths[1], ellipsis(n), g.gp.Loader)
+		}
+		out = append(out, ecosystem.Evidence{Origin: MethodClosure, Detail: detail})
+	}
+	return out
+}
+
+// ellipsis is ", ..." once a list has more than the two entries prose names.
+func ellipsis(n int) string {
+	if n > 2 {
+		return ", ..."
+	}
+	return ""
 }
 
 // taints maps the recorded taints in scope for this package to evidence. When

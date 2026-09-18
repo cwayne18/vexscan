@@ -50,6 +50,10 @@ type Options struct {
 	// DlopenPolicy decides whether a reachable dlopen blocks conclusions.
 	DlopenPolicy DlopenPolicy
 
+	// ExecPolicy decides whether an entrypoint that can start another program
+	// blocks conclusions.
+	ExecPolicy ExecPolicy
+
 	// ReadELF loads ELF metadata. Defaults to the debug/elf-backed reader.
 	ReadELF Reader
 
@@ -66,8 +70,56 @@ type Options struct {
 	// .so on disk really is the answer.
 	StaticProber StaticProber
 
+	// ExecProber optionally inspects an entrypoint to decide whether it can start
+	// another program. Nil leaves the question unasked, which is what every
+	// version of this package before it did.
+	//
+	// It exists because the closure models one process image and not a process
+	// tree, and that gap has always been the largest unmeasured thing in the
+	// answer. An entrypoint that execs /usr/bin/su loads libpam in a process this
+	// package never looks at, and until something asks, the report cannot tell
+	// the difference between an image where that happens and one where it
+	// cannot. A prober turns the gap into one of three statements -- it does, it
+	// provably does not, or this is not a binary I can read -- and only the first
+	// two are worth saying.
+	ExecProber ExecProber
+
 	Logf func(string, ...any)
 }
+
+// ExecProbe is what an ExecProber concluded about one entrypoint.
+type ExecProbe struct {
+	// CanSpawn reports that the binary contains code that starts another
+	// program, so the closure is a lower bound on what the image runs.
+	CanSpawn bool
+
+	// Why explains the conclusion, in either direction, for the taint's evidence
+	// line. Required: a probe that reports a result without saying how it
+	// reached it produces a taint whose detail cannot be audited, and both
+	// directions of this test are load-bearing enough to need one. A probe with
+	// no Why is treated as having established nothing.
+	Why string
+
+	// Targets are program paths the binary mentions, as candidates for what it
+	// might exec. They are rooted, because rooting too much only widens the
+	// closure, and they are named in the evidence so a user deciding whether to
+	// pass --exec-policy=assume-none has a list to check --roots against.
+	//
+	// Never complete, and not treated as though it were: a target assembled at
+	// runtime or resolved through PATH leaves no absolute path in the file, so
+	// the taint blocks whether this is empty or not.
+	Targets []string
+}
+
+// ExecProber inspects the program at a tree-absolute path and reports whether
+// it can start another program. programs are the tree-absolute paths of every
+// executable in the image, offered so a prober can look for the ones its
+// subject mentions.
+//
+// The second result is false when nothing could be established -- a binary the
+// prober cannot read, or one whose language leaves no trace of the answer -- in
+// which case no taint is recorded and the closure behaves as it always has.
+type ExecProber func(fsys target.RootFS, path string, programs []string) (ExecProbe, bool)
 
 // StaticProbe is what a StaticProber concluded about one static entrypoint.
 type StaticProbe struct {
@@ -151,6 +203,11 @@ type Graph struct {
 	order  []string
 	roots  []string
 	taints []Taint
+
+	// pending are the runtime-loaded plugins waiting for their loader to turn
+	// up in the closure, and after the walk has finished the ones whose loader
+	// never did. See admitPlugins.
+	pending []pendingPlugin
 }
 
 // Build indexes every ELF object in the tree and resolves the closure rooted at
@@ -165,6 +222,9 @@ func Build(fsys target.RootFS, opts Options) (*Graph, error) {
 	if opts.DlopenPolicy == "" {
 		opts.DlopenPolicy = DlopenTaint
 	}
+	if opts.ExecPolicy == "" {
+		opts.ExecPolicy = ExecTaint
+	}
 
 	g := &Graph{fsys: fsys, config: opts.Config, nodes: map[string]*Node{}}
 	if err := g.index(opts); err != nil {
@@ -177,6 +237,9 @@ func Build(fsys target.RootFS, opts Options) (*Graph, error) {
 	g.collectTaints(opts)
 
 	opts.Logf("  %d of %d reachable from %d roots", g.CountReachable(), len(g.order), len(g.roots))
+	if summary := g.gatedSummary(); summary != "" {
+		opts.Logf("  %s", summary)
+	}
 	return g, nil
 }
 
@@ -219,14 +282,26 @@ func (g *Graph) index(opts Options) error {
 
 // markRoots decides where execution starts.
 func (g *Graph) markRoots(opts Options) {
-	// Plugin directories are rooted unconditionally. Nothing has a DT_NEEDED
-	// on an NSS module or a PAM module -- they are found by name at runtime --
-	// so a closure that only followed DT_NEEDED would report every one of them
-	// as dead code, which is exactly backwards.
+	// Plugins are rooted by name, because nothing has a DT_NEEDED on an NSS
+	// module or a PAM module and a closure that only followed DT_NEEDED would
+	// report every one of them as dead code.
+	//
+	// Rooted by name, but not unconditionally. A plugin is loaded *by* one
+	// specific library -- NSS modules and gconv converters by libc, PAM modules
+	// by libpam, engines and providers by libcrypto -- and if the closure does
+	// not reach that library, nothing in this image can load the plugin. Those
+	// wait in g.pending until the walk says otherwise; the families whose loader
+	// this package cannot name are rooted here and now. See admitPlugins.
 	for _, p := range g.order {
-		if why, ok := alwaysRoot(p); ok {
-			g.addRoot(p, why, RootPlugin)
+		fam, ok := pluginClass(p)
+		if !ok {
+			continue
 		}
+		if fam.loader == "" {
+			g.addRoot(p, fam.what+", loaded by name", RootPlugin)
+			continue
+		}
+		g.pending = append(g.pending, pendingPlugin{path: p, fam: fam})
 	}
 
 	for _, r := range opts.Roots {
@@ -295,6 +370,103 @@ func (g *Graph) markRoots(opts Options) {
 
 	// Later argv elements are arguments, not programs -- except for the common
 	// wrapper shapes, which the shell check above already caught.
+
+	g.probeExec(opts)
+}
+
+// probeExec asks the prober whether the programs this image says it runs can
+// run anything else, and roots whatever they name.
+//
+// Only the explicit roots are probed, and only on the path where the closure
+// did not escalate. Every escalating branch above has already recorded a
+// blocking taint and rooted every executable in the image, so an entrypoint
+// that can exec tells a reader nothing they were not already told, and probing
+// the several hundred binaries escalation rooted would be paid for in I/O to
+// reach the same answer.
+func (g *Graph) probeExec(opts Options) {
+	if opts.ExecProber == nil {
+		return
+	}
+	programs := g.programs()
+
+	// Snapshotted, because rooting a candidate target appends to g.roots. The
+	// subject is what the image says it runs; a program that program might exec
+	// is already covered by the taint that rooting it came with, and chasing the
+	// chain would probe every binary a big Go program happens to name.
+	subjects := append([]string(nil), g.roots...)
+	for _, p := range subjects {
+		if g.nodes[p].Kind != RootExplicit {
+			continue
+		}
+		// Why is part of the condition rather than only the message. A probe
+		// that reports "cannot exec" without saying how it established that
+		// produces a discharged taint indistinguishable from a real one, and a
+		// discharge is exactly the claim a reader has to be able to check.
+		pr, ok := opts.ExecProber(g.fsys, p, programs)
+		if !ok || pr.Why == "" {
+			continue
+		}
+		if !pr.CanSpawn {
+			g.taints = append(g.taints, Taint{
+				Kind:       TaintExec,
+				Detail:     fmt.Sprintf("%s starts no other program: %s", p, pr.Why),
+				Path:       p,
+				Discharged: true,
+			})
+			continue
+		}
+
+		// Rooting the candidates before the walk, so the libraries they need are
+		// in the closure. It does not discharge anything -- the list cannot be
+		// complete -- but a closure that already contains the obvious targets is
+		// the one worth having if the user goes on to assert --exec-policy=
+		// assume-none.
+		var rooted []string
+		for _, t := range pr.Targets {
+			c := g.Canon(t)
+			if n, exists := g.nodes[c]; !exists || !n.Info.IsProgram() || c == p {
+				continue
+			}
+			g.addRoot(c, fmt.Sprintf("named in %s, which can exec", p), RootExplicit)
+			rooted = append(rooted, c)
+		}
+
+		assumed := opts.ExecPolicy == ExecAssumeNone
+		detail := fmt.Sprintf("%s can start another program (%s), and the closure follows one process and not what it launches",
+			p, pr.Why)
+		switch {
+		case len(rooted) > 0:
+			detail += fmt.Sprintf("; it names %s, rooted here, but a target built at runtime or found on PATH leaves no name to find",
+				strings.Join(rooted, ", "))
+		default:
+			detail += "; it names no program path this image has, so there is nothing to root on its behalf"
+		}
+		if assumed {
+			detail += ". --exec-policy=assume-none says to take what it runs as accounted for"
+		} else {
+			detail += ". Name what it runs with --roots and re-run with --exec-policy=assume-none"
+		}
+		g.taints = append(g.taints, Taint{
+			Kind:       TaintExec,
+			Detail:     detail,
+			Path:       p,
+			Blocking:   !assumed,
+			Global:     !assumed,
+			Discharged: assumed,
+		})
+	}
+}
+
+// programs are the tree-absolute paths of every executable in the image, for a
+// prober to look for mentions of.
+func (g *Graph) programs() []string {
+	var out []string
+	for _, p := range g.order {
+		if g.nodes[p].Info.IsProgram() {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // wrapperRule parses one exec wrapper's argument grammar and returns the argv it
@@ -486,7 +658,14 @@ func (g *Graph) addRoot(p, why string, kind RootKind) {
 	n.Root, n.Why, n.Kind = true, why, kind
 }
 
-// walkClosure resolves DT_NEEDED breadth-first from the roots.
+// walkClosure resolves DT_NEEDED breadth-first from the roots, admitting
+// plugin roots as the loaders that would load them come into reach.
+//
+// The admission is a fixpoint rather than a second pass, because a loader can
+// arrive through a plugin: libcrypto is reached from an OpenSSL engine, and an
+// engine is only admitted once libcrypto is reached. The queue and the seen set
+// are carried across rounds, so an object is still visited at most once and the
+// whole thing costs one walk however many rounds it takes.
 func (g *Graph) walkClosure(opts Options) {
 	sort.Strings(g.roots)
 
@@ -504,7 +683,21 @@ func (g *Graph) walkClosure(opts Options) {
 	ldLibraryPath := splitPathList(envValue(opts.Config, "LD_LIBRARY_PATH"))
 
 	seen := map[string]bool{}
-	for len(queue) > 0 {
+	for {
+		// Each time the queue drains, ask which pending plugins the closure has
+		// now earned. Nothing admitted means the fixpoint is reached and the
+		// rest of g.pending is what no loader in this image could open.
+		if len(queue) == 0 {
+			admitted := g.admitPlugins()
+			if len(admitted) == 0 {
+				break
+			}
+			for _, p := range admitted {
+				queue = append(queue, frame{path: p})
+			}
+			continue
+		}
+
 		cur := queue[0]
 		queue = queue[1:]
 		if seen[cur.path] {
@@ -569,6 +762,9 @@ func (g *Graph) walkClosure(opts Options) {
 			queue = append(queue, frame{path: dep, rpath: childRPath})
 		}
 	}
+
+	// Plugins admitted mid-walk were appended after the initial sort.
+	sort.Strings(g.roots)
 }
 
 // resolve finds the file a DT_NEEDED entry names.
@@ -799,29 +995,225 @@ func (g *Graph) CountReachable() int {
 	return n
 }
 
-// alwaysRoot reports whether a path is a plugin the runtime loads by name
-// rather than by DT_NEEDED, and therefore has to be rooted even though nothing
-// in the image refers to it.
-func alwaysRoot(p string) (string, bool) {
+// pluginFamily is a class of object the runtime opens by name rather than
+// through DT_NEEDED, together with what does the opening.
+type pluginFamily struct {
+	// what names the family, with its article, for the root's Why line and for
+	// the evidence on a package whose plugins were left out.
+	what string
+	// plural is what for more than one of them.
+	plural string
+
+	// loader is the soname stem of the one library that loads this family --
+	// "libpam.so", which matches libpam.so.0 and libpam.so.0.84.2 alike -- or ""
+	// when this package cannot name a single loader, in which case the plugin is
+	// rooted unconditionally as it always was.
+	loader string
+}
+
+// pluginFamilies are the runtime-loaded plugin classes, in match order.
+//
+// Only the families whose loader is a specific library are gated. The other two
+// are loaded by a program -- a .node addon by whatever JavaScript runtime calls
+// require, a site-packages extension by whatever embeds or is CPython -- and the
+// set of programs that qualify is open-ended enough (node, bun, deno, electron;
+// python3.11, uwsgi, anything linking libpython) that a rule naming them would
+// be a guess. A guess in this direction is a false negative, so they keep the
+// unconditional rooting and cost what they always cost.
+var pluginFamilies = []struct {
+	match func(p, base string) bool
+	fam   pluginFamily
+}{
+	{
+		func(p, base string) bool { return strings.HasPrefix(base, "libnss_") && isSharedObject(base) },
+		pluginFamily{"a glibc NSS module", "glibc NSS modules", "libc.so"},
+	},
+	{
+		func(p, base string) bool { return strings.HasPrefix(base, "pam_") && strings.Contains(p, "/security/") },
+		pluginFamily{"a PAM module", "PAM modules", "libpam.so"},
+	},
+	{
+		func(p, base string) bool { return strings.Contains(p, "/gconv/") },
+		pluginFamily{"an iconv character-set converter", "iconv character-set converters", "libc.so"},
+	},
+	{
+		func(p, base string) bool { return strings.Contains(p, "/engines-") },
+		pluginFamily{"an OpenSSL engine", "OpenSSL engines", "libcrypto.so"},
+	},
+	{
+		func(p, base string) bool { return strings.Contains(p, "/ossl-modules/") },
+		pluginFamily{"an OpenSSL provider", "OpenSSL providers", "libcrypto.so"},
+	},
+	{
+		func(p, base string) bool { return strings.HasSuffix(base, ".node") },
+		pluginFamily{"a Node.js native addon", "Node.js native addons", ""},
+	},
+	{
+		func(p, base string) bool {
+			return isSharedObject(base) && (strings.Contains(p, "/site-packages/") ||
+				strings.Contains(p, "/dist-packages/") || strings.Contains(p, "/lib-dynload/"))
+		},
+		pluginFamily{"a Python extension module", "Python extension modules", ""},
+	},
+}
+
+// pluginClass reports whether a path is a plugin the runtime loads by name
+// rather than by DT_NEEDED, and which family it belongs to.
+func pluginClass(p string) (pluginFamily, bool) {
 	base := path.Base(p)
-	switch {
-	case strings.HasPrefix(base, "libnss_") && isSharedObject(base):
-		return "glibc NSS module, loaded by name", true
-	case strings.HasPrefix(base, "pam_") && strings.Contains(p, "/security/"):
-		return "PAM module, loaded by name", true
-	case strings.Contains(p, "/gconv/"):
-		return "iconv character-set converter, loaded by name", true
-	case strings.Contains(p, "/engines-"):
-		return "OpenSSL engine, loaded by name", true
-	case strings.Contains(p, "/ossl-modules/"):
-		return "OpenSSL provider, loaded by name", true
-	case strings.HasSuffix(base, ".node"):
-		return "Node.js native addon, loaded by require", true
-	case isSharedObject(base) && (strings.Contains(p, "/site-packages/") ||
-		strings.Contains(p, "/dist-packages/") || strings.Contains(p, "/lib-dynload/")):
-		return "Python extension module, loaded by import", true
+	for _, r := range pluginFamilies {
+		if r.match(p, base) {
+			return r.fam, true
+		}
 	}
-	return "", false
+	return pluginFamily{}, false
+}
+
+// pendingPlugin is a plugin whose family has a named loader, waiting to see
+// whether the closure reaches it.
+type pendingPlugin struct {
+	path string
+	fam  pluginFamily
+}
+
+// admitPlugins roots the pending plugins whose loader the closure has reached,
+// and returns them so the caller can walk on from there.
+//
+// This is the one place the closure decides *not* to look at code that is
+// sitting in the image, so it is worth being exact about why it is sound. A
+// plugin is not reached by DT_NEEDED from anything; it is opened by name, and
+// by one specific library -- dlopen("libnss_files.so.2") lives in glibc,
+// dlopen of a PAM module lives in libpam, an engine is opened by libcrypto. If
+// no object the closure reaches is that library, then no code that runs in this
+// image contains the call that would open the plugin, and the plugin is as dead
+// as a library nothing has a DT_NEEDED on.
+//
+// What it does not cover is a program the closure never modelled execing
+// something that does load the plugin. That is the same residual the closure
+// already carries everywhere -- it models one process image, not a process tree
+// -- and it is the case escalation exists for: an image whose entrypoint is a
+// shell, or unknown, roots every program, which reaches libc and libpam and
+// libcrypto, which admits every plugin. The narrowing only ever applies to an
+// image that said what it runs.
+func (g *Graph) admitPlugins() []string {
+	if len(g.pending) == 0 {
+		return nil
+	}
+	loaders := g.reachableLoaders()
+
+	var admitted []string
+	var still []pendingPlugin
+	for _, pp := range g.pending {
+		// Already in the closure by a stronger route: named with --roots, swept
+		// up by escalation, or actually the target of somebody's DT_NEEDED. It
+		// is not waiting on a loader, and reporting it as left out would put a
+		// sentence in the evidence that the closure's own answer contradicts.
+		if n := g.nodes[pp.path]; n != nil && (n.Root || n.Reachable) {
+			continue
+		}
+
+		by, ok := loaders[pp.fam.loader]
+		if !ok {
+			still = append(still, pp)
+			continue
+		}
+		g.addRoot(pp.path, fmt.Sprintf("%s, which %s opens by name", pp.fam.what, by), RootPlugin)
+		admitted = append(admitted, pp.path)
+	}
+	g.pending = still
+	return admitted
+}
+
+// reachableLoaders maps each loader soname stem a pending plugin is waiting on
+// to a reachable object that provides it.
+//
+// Both DT_SONAME and the file name are matched, because the name is what
+// DT_NEEDED resolution would have used for an object that declares no soname,
+// and admitting a plugin on a weaker match errs towards a larger closure.
+func (g *Graph) reachableLoaders() map[string]string {
+	want := map[string]bool{}
+	for _, pp := range g.pending {
+		want[pp.fam.loader] = true
+	}
+
+	out := map[string]string{}
+	for _, p := range g.order {
+		n := g.nodes[p]
+		if !n.Reachable {
+			continue
+		}
+		for stem := range want {
+			if _, done := out[stem]; done {
+				continue
+			}
+			if matchesSoname(n.Info.Soname, stem) || matchesSoname(path.Base(p), stem) {
+				out[stem] = p
+			}
+		}
+	}
+	return out
+}
+
+// matchesSoname reports whether a soname is a version of a stem: "libcrypto.so"
+// matches libcrypto.so and libcrypto.so.3 but not libcryptsetup.so.12.
+func matchesSoname(soname, stem string) bool {
+	return soname == stem || strings.HasPrefix(soname, stem+".")
+}
+
+// GatedPlugin is a runtime-loaded plugin the closure left out because no object
+// it reaches could open one.
+type GatedPlugin struct {
+	// Path is the plugin.
+	Path string
+	// What and Plural name its family, for prose.
+	What, Plural string
+	// Loader is the soname stem of the library that would have opened it, and
+	// that the closure does not reach.
+	Loader string
+}
+
+// GatedPlugins returns the plugins admitPlugins declined, in path order.
+//
+// Callers report them. A package whose only code is a PAM module no libpam
+// could open is genuinely unreachable, but "the linker would not load it" is a
+// thinner account than the one this package actually has, and the reader
+// deciding whether to believe the row is owed the real one.
+func (g *Graph) GatedPlugins() []GatedPlugin {
+	out := make([]GatedPlugin, 0, len(g.pending))
+	for _, pp := range g.pending {
+		out = append(out, GatedPlugin{
+			Path: pp.path, What: pp.fam.what, Plural: pp.fam.plural, Loader: pp.fam.loader,
+		})
+	}
+	return out
+}
+
+// gatedSummary is the scan-log line for what the gating left out, or "" when it
+// left out nothing.
+func (g *Graph) gatedSummary() string {
+	if len(g.pending) == 0 {
+		return ""
+	}
+	counts := map[string]int{}
+	for _, pp := range g.pending {
+		counts[pp.fam.loader]++
+	}
+	stems := make([]string, 0, len(counts))
+	for s := range counts {
+		stems = append(stems, s)
+	}
+	sort.Slice(stems, func(i, j int) bool {
+		if counts[stems[i]] != counts[stems[j]] {
+			return counts[stems[i]] > counts[stems[j]]
+		}
+		return stems[i] < stems[j]
+	})
+	parts := make([]string, 0, len(stems))
+	for _, s := range stems {
+		parts = append(parts, fmt.Sprintf("%d need %s", counts[s], s))
+	}
+	return fmt.Sprintf("%d runtime-loaded plugin(s) left out, nothing reachable opens them: %s",
+		len(g.pending), strings.Join(parts, ", "))
 }
 
 func isSharedObject(base string) bool {

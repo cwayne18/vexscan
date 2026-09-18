@@ -116,6 +116,13 @@ func buildGoBinary(t *testing.T, dst string) {
 // so a test can pin CGO_ENABLED and read back what the build recorded.
 func buildGoBinaryEnv(t *testing.T, dst string, env ...string) {
 	t.Helper()
+	buildGoSource(t, dst, "package main\n\nfunc main() {}\n", env...)
+}
+
+// buildGoSource compiles a given main.go to dst, so a test can choose what the
+// program does rather than only how it was built.
+func buildGoSource(t *testing.T, dst, mainGo string, env ...string) {
+	t.Helper()
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("no go toolchain on PATH")
 	}
@@ -126,7 +133,7 @@ func buildGoBinaryEnv(t *testing.T, dst string, env ...string) {
 		}
 	}
 	write("go.mod", "module example.com/probe\n\ngo 1.23\n")
-	write("main.go", "package main\n\nfunc main() {}\n")
+	write("main.go", mainGo)
 
 	cmd := exec.Command("go", "build", "-o", dst, ".")
 	cmd.Dir = src
