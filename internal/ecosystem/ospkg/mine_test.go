@@ -562,3 +562,173 @@ func TestStaticDischargeNeedsAValidatedSymbol(t *testing.T) {
 		})
 	}
 }
+
+// dlopenELF is the shape every test below shares: an entrypoint that links
+// libssl and also calls dlopen, so the image carries a global blocking dlopen
+// taint while the package's own objects are still perfectly readable.
+func dlopenELF() fakeELF {
+	caller := exe("libssl.so.3")
+	caller.Dlopen = true
+	return fakeELF{
+		"/usr/bin/app":         caller,
+		"/usr/lib/libssl.so.3": lib("libssl.so.3"),
+	}
+}
+
+// blockingEvidence reports the details of the evidence lines that are marked as
+// blocking, which is what a caller has to count to know whether a conclusion was
+// withheld.
+func blockingEvidence(f ecosystem.Finding) []string {
+	var out []string
+	for _, e := range f.Evidence {
+		if e.Blocking {
+			out = append(out, e.Detail)
+		}
+	}
+	return out
+}
+
+// The whole point of splitting presence from reachability. A dlopen call
+// somewhere in the image says the closure is a lower bound on what loads. It
+// does not say the package's symbol tables are lying, and "the advisory's
+// function is exported by nothing this package installs" is read out of exactly
+// those tables -- so it is still answerable, and before this split it was not.
+//
+// This is not a niche shape. Every Debian and RHEL base layer ships between
+// fifteen and thirty dlopen callers, and one surviving caller was enough to
+// withhold every mined not_present in the image.
+func TestDlopenDoesNotWithholdTheSymbolAbsenceAnswer(t *testing.T) {
+	p := New(Options{
+		Mine:    true,
+		ReadELF: dlopenELF().read,
+		ReadSymbols: newSyms(map[string]syms{
+			"/usr/lib/libssl.so.3": {defined: []string{"SSL_new", "SSL_free", "SSL_read"}},
+		}).read,
+	})
+
+	f := mined(t, p, minedImage(t),
+		advisory("A flaw in SSL_free_buffers allows a buffer to be freed twice."),
+		&llm.Hints{Symbols: []string{"SSL_free_buffers"}})
+
+	if f.Status != ecosystem.StatusNotPresent || f.Method != MethodDynsymAbsent {
+		t.Fatalf("status = %s via %s, want %s via %s",
+			f.Status, f.Method, ecosystem.StatusNotPresent, MethodDynsymAbsent)
+	}
+	if got := blockingEvidence(f); len(got) > 0 {
+		t.Errorf("a conclusion was reached with blocking evidence still attached: %v", got)
+	}
+
+	// Reached, but not by pretending the image is closed. The dlopen call is
+	// still in the report, because an image with a runtime loader in it and one
+	// without must not produce the same evidence.
+	var mentioned bool
+	for _, e := range f.Evidence {
+		if strings.Contains(e.Detail, "calls dlopen") {
+			mentioned = true
+		}
+	}
+	if !mentioned {
+		t.Error("the dlopen call was dropped from the evidence rather than recorded as not bearing on the answer")
+	}
+}
+
+// The other half of the split, and the one that keeps it honest. Reachability
+// is what dlopen actually threatens, so the closure's own answer stays
+// withheld: the package is unreferenced on disk, and without knowing what the
+// dlopen call opens that is not the same as unreachable.
+func TestDlopenStillWithholdsTheClosureAnswer(t *testing.T) {
+	// An entrypoint that needs nothing, so libssl sits on disk unreferenced,
+	// and that calls dlopen, so it might open it anyway.
+	caller := exe()
+	caller.Dlopen = true
+	elves := fakeELF{
+		"/usr/bin/app":         caller,
+		"/usr/lib/libssl.so.3": lib("libssl.so.3"),
+	}
+
+	p := New(Options{
+		Mine:    true,
+		ReadELF: elves.read,
+		ReadSymbols: newSyms(map[string]syms{
+			// This build does export the function, so the presence question is
+			// answered the other way and only the closure is left to ask.
+			"/usr/lib/libssl.so.3": {defined: []string{"SSL_new", "SSL_free_buffers"}},
+		}).read,
+	})
+
+	f := mined(t, p, minedImage(t),
+		advisory("A flaw in SSL_free_buffers allows a buffer to be freed twice."),
+		&llm.Hints{Symbols: []string{"SSL_free_buffers"}})
+
+	if f.Status != ecosystem.StatusLinked {
+		t.Errorf("status = %s, want %s: an unreferenced library in an image with a dlopen call in it is not a library that will not load",
+			f.Status, ecosystem.StatusLinked)
+	}
+	if got := blockingEvidence(f); len(got) == 0 {
+		t.Error("the answer was withheld without saying what withheld it")
+	}
+}
+
+// The exemption is specific to the taints that cannot hide code. A static
+// entrypoint can: it carries its libraries inside itself, so the package's
+// export tables are not a complete account of what is in the image, and the
+// presence question goes back to being unanswerable.
+func TestAStaticEntrypointStillWithholdsTheSymbolAbsenceAnswer(t *testing.T) {
+	static := &elfgraph.Info{Class: elf.ELFCLASS64, Machine: elf.EM_X86_64, Type: elf.ET_EXEC, Dlopen: true}
+	elves := fakeELF{
+		"/usr/bin/app":         static,
+		"/usr/lib/libssl.so.3": lib("libssl.so.3"),
+	}
+
+	p := New(Options{
+		Mine:    true,
+		ReadELF: elves.read,
+		ReadSymbols: newSyms(map[string]syms{
+			"/usr/lib/libssl.so.3": {defined: []string{"SSL_new", "SSL_free", "SSL_read"}},
+		}).read,
+		// Nothing can account for what is inside it: not a cgo build the symbol
+		// table could be read from, and not a pure-Go one.
+		readStatic: fakeStatic{"/usr/bin/app": {stripped: true, cgo: true}}.read,
+	})
+
+	f := mined(t, p, minedImage(t),
+		advisory("A flaw in SSL_free_buffers allows a buffer to be freed twice."),
+		&llm.Hints{Symbols: []string{"SSL_free_buffers"}})
+
+	if f.Status != ecosystem.StatusLinked {
+		t.Errorf("status = %s, want %s: the entrypoint may hold a copy of the code the package's tables do not describe",
+			f.Status, ecosystem.StatusLinked)
+	}
+}
+
+// The import-absent answer is the other reachability claim, and it has to stay
+// on the full blockers for the same reason the closure's does. "Nothing the
+// closure reaches imports this function" is a statement about what the closure
+// reaches, and an unresolved dlopen call is precisely the reason the closure is
+// not the whole story -- whatever it opens could be the importer.
+func TestDlopenStillWithholdsTheImportAbsentAnswer(t *testing.T) {
+	p := New(Options{
+		Mine:               true,
+		TrustImportAbsence: true,
+		ReadELF:            dlopenELF().read,
+		ReadSymbols: newSyms(map[string]syms{
+			// The function is in this build, and the entrypoint that links the
+			// library does not call it -- so the only thing between here and
+			// not_in_path is the dlopen call.
+			"/usr/lib/libssl.so.3": {defined: []string{"SSL_new", "SSL_free_buffers"}},
+			"/usr/bin/app":         {undefined: []string{"SSL_new"}},
+		}).read,
+	})
+
+	f := mined(t, p, minedImage(t),
+		advisory("A flaw in SSL_free_buffers allows a buffer to be freed twice."),
+		&llm.Hints{Symbols: []string{"SSL_free_buffers"}})
+
+	if f.Status == ecosystem.StatusNotInPath {
+		t.Errorf("status = %s: the closure is not a complete account of what imports what while a dlopen call in it is unresolved",
+			f.Status)
+	}
+	if got := blockingEvidence(f); len(got) == 0 {
+		t.Error("the answer was withheld without saying what withheld it")
+	}
+}

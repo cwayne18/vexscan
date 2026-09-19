@@ -141,6 +141,13 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 		blockers = e.blockersExcept(files.ELF, cleared)
 	}
 
+	// The two questions this function can answer are gated separately. Whether
+	// the vulnerable code is in the image is a claim about what the package's
+	// objects define; whether it would be loaded is a claim about the closure.
+	// A dlopen call breaks the second and leaves the first standing, so gating
+	// both on the same set withholds an answer the evidence supports.
+	presence := e.presenceBlockers(files.ELF, cleared)
+
 	// Recorded first, before anything the closure goes on to conclude, because
 	// a discharged taint is the ground the conclusion stands on rather than a
 	// footnote to it.
@@ -151,17 +158,19 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 
 	// The mined-symbol layer runs before the closure is consulted, because it
 	// answers a stronger question: whether the vulnerable function is in this
-	// build at all. It is gated on there being no blocking taint for the same
-	// reason the closure is -- a statically linked entrypoint may hold a copy
-	// of the vulnerable code, and the package's own export tables say nothing
-	// about what is inside it.
+	// build at all. It is gated on the presence blockers only. A statically
+	// linked entrypoint may hold a copy of the vulnerable code that the
+	// package's export tables say nothing about, so that one still withholds
+	// the answer -- but a dlopen call cannot put a function into a library that
+	// does not export one, and neither can an unresolved DT_NEEDED.
 	if sym.Usable {
 		f.Evidence = append(f.Evidence, ecosystem.Evidence{Origin: MethodMined, Detail: sym.Why})
 		switch {
-		case len(sym.Defined) == 0 && len(blockers) == 0:
+		case len(sym.Defined) == 0 && len(presence) == 0:
 			f.Status = ecosystem.StatusNotPresent
 			f.Justification = "vulnerable_code_not_present"
 			f.Method = MethodDynsymAbsent
+			f.Evidence = append(f.Evidence, reachabilityNotes(blockers)...)
 			return f
 
 		case len(sym.Defined) > 0 && len(sym.Importers) == 0 && len(files.Reachable) > 0:
@@ -332,6 +341,55 @@ func (e evaluator) blockersExcept(elfFiles []string, cleared map[string]string) 
 	return e.taints(elfFiles, true, cleared)
 }
 
+// presenceBlockers are the blockers that bear on whether the vulnerable code is
+// in the image at all, as opposed to whether the closure reaches it. See
+// TaintKind.ThreatensPresence for why the two differ.
+//
+// It exists because the dynsym-absent conclusion is a different claim from the
+// closure's. "No object this package installs defines the vulnerable function"
+// is read out of the package's own symbol tables, and a dlopen call elsewhere
+// in the image cannot make it false -- dlopen decides which objects get loaded,
+// not what is inside them. Gating that conclusion on every dlopen in the image
+// is what kept it from ever firing: a Debian base layer has fifteen dlopen
+// callers in it before the application is added, and only one of them has to
+// survive for the answer to be withheld.
+func (e evaluator) presenceBlockers(elfFiles []string, cleared map[string]string) []ecosystem.Evidence {
+	return e.taintsWhere(elfFiles, true, cleared, elfgraph.TaintKind.ThreatensPresence)
+}
+
+// reachabilityNotes restates the taints that still stand for a finding decided
+// on presence, as notes rather than blockers.
+//
+// They are not dropped. An image whose closure could not be completed and an
+// image whose closure was clean must never produce the same report, even when
+// the answer did not turn on the difference -- a reader weighing the row is
+// entitled to see that the image has fifteen runtime loaders in it. They carry
+// Blocking false because for this conclusion that is simply true: nothing was
+// overridden or waved away, they do not bear on it.
+func reachabilityNotes(blockers []ecosystem.Evidence) []ecosystem.Evidence {
+	if len(blockers) == 0 {
+		return nil
+	}
+	out := make([]ecosystem.Evidence, 0, len(blockers)+1)
+	out = append(out, ecosystem.Evidence{
+		Origin: MethodClosure,
+		Detail: fmt.Sprintf("%d %s stop the closure being a complete account of what loads, which withholds any answer about reachability but not this one: choosing to load an object cannot add a symbol the object does not define",
+			len(blockers), noun(len(blockers))),
+	})
+	for _, b := range blockers {
+		b.Blocking = false
+		out = append(out, b)
+	}
+	return out
+}
+
+func noun(n int) string {
+	if n == 1 {
+		return "observation does"
+	}
+	return "observations"
+}
+
 // discharged are the taints that would have blocked this package's conclusion
 // and were answered: a static entrypoint a prober could account for, a dlopen
 // call the user waved off with --dlopen-policy=assume-none.
@@ -424,6 +482,12 @@ func ellipsis(n int) string {
 // cleared is non-nil, a blocking static-elf taint whose entrypoint path it names
 // is skipped: the cgo static-symbol discharge answered it for this finding.
 func (e evaluator) taints(elfFiles []string, blocking bool, cleared map[string]string) []ecosystem.Evidence {
+	return e.taintsWhere(elfFiles, blocking, cleared, nil)
+}
+
+// taintsWhere is taints narrowed to the kinds keep accepts. A nil keep takes
+// every kind.
+func (e evaluator) taintsWhere(elfFiles []string, blocking bool, cleared map[string]string, keep func(elfgraph.TaintKind) bool) []ecosystem.Evidence {
 	sonames := map[string]bool{}
 	for _, f := range elfFiles {
 		sonames[path.Base(f)] = true
@@ -435,6 +499,9 @@ func (e evaluator) taints(elfFiles []string, blocking bool, cleared map[string]s
 	var out []ecosystem.Evidence
 	for _, t := range e.g.Taints() {
 		if t.Blocking != blocking {
+			continue
+		}
+		if keep != nil && !keep(t.Kind) {
 			continue
 		}
 		if t.Kind == elfgraph.TaintStaticELF && cleared[t.Path] != "" {
