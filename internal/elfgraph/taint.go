@@ -50,6 +50,42 @@ const (
 	TaintExec TaintKind = "exec"
 )
 
+// ThreatensPresence says whether this kind of taint can put a copy of the
+// vulnerable code somewhere a package's own symbol tables do not describe.
+//
+// Two different questions get asked of an image, and the taints do not bear on
+// them equally. "Would the dynamic linker load this library" is about
+// reachability, and every taint here undermines it: each one is a way the
+// closure is a lower bound on what runs. "Does any object this package ships
+// define the vulnerable function" is about presence, and most taints say
+// nothing about it -- dlopen chooses which of the image's objects to load, and
+// choosing to load an object cannot add a symbol the object does not define.
+// Read a package's tables, find the function in none of them, and dlopen has no
+// way to make that answer wrong.
+//
+// A static binary is the case that does. It carries its libraries inside
+// itself, so the vulnerable code can be running with no file on disk that
+// exports it, and there the package's tables genuinely do not describe
+// everything in the image.
+//
+// The shell-entrypoint and no-entrypoint kinds are filed with the static case
+// rather than against it, on the grounds that the program nobody has identified
+// may be exactly such a binary. Neither blocks today -- they escalate the root
+// set instead of withholding an answer, so they never reach this test -- and
+// the classification is here to be right if that ever changes.
+//
+// The list is written as the exemptions rather than the members so that a kind
+// added later blocks both questions until someone makes the argument that it
+// only blocks one. Getting that default backwards would quietly widen every
+// not_present conclusion in the tool.
+func (k TaintKind) ThreatensPresence() bool {
+	switch k {
+	case TaintDlopen, TaintUnresolvedNeeded:
+		return false
+	}
+	return true
+}
+
 // Taint is one recorded reason a not_affected conclusion is unavailable.
 type Taint struct {
 	Kind TaintKind `json:"kind"`
