@@ -39,7 +39,7 @@ func main() {
 	flag.Var(&images, "image", "container image reference to inspect; repeatable")
 	flag.Var(&packages, "package", "package to check: a purl, an ecosystem:name shorthand (deb:openssl), or a bare name; repeatable")
 	flag.Var(&ecosystems, "ecosystem", "restrict to these ecosystems (golang, os, pypi, npm, maven, or a distro like debian); repeatable")
-	flag.Var(&roots, "roots", "extra entrypoints for the reachability closures when the image config declares none; repeatable")
+	flag.Var(&roots, "roots", "extra entrypoints for the reachability closures; a path that names no ELF object in the image blocks conclusions rather than being skipped; repeatable")
 	flag.Var(&rpms, "rpm", "rpm file to scan without installing: a path, a directory, or a URL; repeatable (reads only the header)")
 	flag.Var(&vexhubs, "vexhub", "VEX Hub repo, raw URL, or local dir to check findings against; repeatable, earliest wins")
 	flag.Var(&vexMergeInto, "vex-merge-into", "with --vex-out, also add every statement to this merged \"master\" document in the hub, "+

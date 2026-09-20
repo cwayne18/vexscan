@@ -434,6 +434,15 @@ vexscan --rootfs /mnt/rootfs --all --roots /usr/bin/myapp --roots /usr/bin/worke
 Name what actually runs. A root that is a wrapper script rather than a real
 program makes things *worse*, not better — see the npm measurement below.
 
+A `--roots` path that names no ELF object in the image is a **blocking**
+`missing-root` taint, not a skipped argument. Misspell it and the closure would
+otherwise carry on one root short, reporting code it never looked at as
+unreachable — and since `--roots` is usually paired with
+`--exec-policy=assume-none`, there would be nothing left to withhold the
+conclusion. So a typo costs you every answer for that image rather than buying
+you wrong ones. The taint names the path that failed, and says whether it was
+absent or present-but-not-an-ELF-object.
+
 ### Measured against the same image, both ways
 
 `docker export` of `debian:12` into a directory, scanned with `--rootfs`, versus
