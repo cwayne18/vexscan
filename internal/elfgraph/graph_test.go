@@ -1095,3 +1095,114 @@ func TestParseDlopenPolicy(t *testing.T) {
 		t.Error("an unknown policy was accepted")
 	}
 }
+
+// TestEscalationStandsDownForAssertedRoots pins the bargain in
+// unknownEntrypoint. Escalation and a non-blocking taint go together: rooting
+// every program cannot under-report, so nothing needs withholding. Dropping
+// escalation is therefore allowed only against both halves of an assertion --
+// roots that resolve, and --exec-policy=assume-none -- and the three ways of
+// having only part of one must all still escalate.
+func TestEscalationStandsDownForAssertedRoots(t *testing.T) {
+	files := map[string]string{
+		"/entry.sh":       "#!/bin/sh\nexec /usr/bin/app\n",
+		"/bin/sh":         "",
+		"/usr/bin/app":    "",
+		"/usr/bin/unused": "",
+	}
+	objs := fakeELF{
+		"/bin/sh":         exe(),
+		"/usr/bin/app":    exe(),
+		"/usr/bin/unused": exe(),
+	}
+	cfg := target.ImageConfig{Entrypoint: []string{"/bin/sh", "/entry.sh"}}
+
+	escalated := func(g *Graph) int {
+		n := 0
+		for _, node := range g.Nodes() {
+			if node.Kind == RootEscalated {
+				n++
+			}
+		}
+		return n
+	}
+
+	// The three partial assertions. Each must leave the over-approximation in
+	// place: a narrow closure with nothing guarding it is how reachable code
+	// gets reported as dead.
+	for _, tc := range []struct {
+		name string
+		opts Options
+	}{
+		{"no assertion", Options{Config: cfg}},
+		{"roots alone", Options{Config: cfg, Roots: []string{"/usr/bin/app"}}},
+		{"assume-none alone", Options{Config: cfg, ExecPolicy: ExecAssumeNone}},
+		// The interaction with TestMissingRootBlocks: a root that resolves to
+		// nothing is not a root, so the assertion is not half-kept, it is
+		// absent, and the closure must not narrow on the strength of it.
+		{"unresolvable root with assume-none", Options{
+			Config:     cfg,
+			Roots:      []string{"/usr/bin/nope"},
+			ExecPolicy: ExecAssumeNone,
+		}},
+	} {
+		t.Run(tc.name+" still escalates", func(t *testing.T) {
+			g := build(t, tree(t, files), objs, tc.opts)
+			if escalated(g) == 0 {
+				t.Fatalf("escalation stood down without both halves of the assertion; roots are %v", g.roots)
+			}
+			reachable(t, g, "/usr/bin/unused")
+			tt := hasTaint(g, TaintShellEntrypoint)
+			if tt == nil {
+				t.Fatalf("no shell-entrypoint taint; taints are %v", g.Taints())
+			}
+			if tt.Discharged {
+				t.Error("the taint reads as discharged, but nothing discharged it")
+			}
+		})
+	}
+
+	// A typo must still be caught on the way through, or the previous subtest
+	// passes for the wrong reason -- escalating because the path was junk
+	// rather than because the assertion was refused.
+	t.Run("unresolvable root still blocks", func(t *testing.T) {
+		g := build(t, tree(t, files), objs, Options{
+			Config:     cfg,
+			Roots:      []string{"/usr/bin/nope"},
+			ExecPolicy: ExecAssumeNone,
+		})
+		if tt := hasTaint(g, TaintMissingRoot); tt == nil || !tt.Blocking {
+			t.Fatalf("a --roots typo stopped blocking; taints are %v", g.Taints())
+		}
+	})
+
+	t.Run("both halves stands down", func(t *testing.T) {
+		g := build(t, tree(t, files), objs, Options{
+			Config:     cfg,
+			Roots:      []string{"/usr/bin/app"},
+			ExecPolicy: ExecAssumeNone,
+		})
+		if n := escalated(g); n != 0 {
+			t.Fatalf("still escalated %d program(s) despite both halves of the assertion", n)
+		}
+		reachable(t, g, "/usr/bin/app")
+		// The whole point: a program the user did not name is no longer
+		// treated as running.
+		unreachable(t, g, "/usr/bin/unused")
+
+		// Standing down must not make the reason disappear. The user has to be
+		// able to see what their answer was spent on.
+		tt := hasTaint(g, TaintShellEntrypoint)
+		if tt == nil {
+			t.Fatalf("the shell-entrypoint taint vanished; taints are %v", g.Taints())
+		}
+		if !tt.Discharged {
+			t.Error("the taint is not marked discharged, so it reads as an open question")
+		}
+		if tt.Blocking {
+			t.Error("the taint blocks despite the assertion that answers it")
+		}
+		if !strings.Contains(tt.Detail, "assume-none") || !strings.Contains(tt.Detail, "--roots") {
+			t.Errorf("detail does not say which assertion it stood down for: %q", tt.Detail)
+		}
+	})
+}
