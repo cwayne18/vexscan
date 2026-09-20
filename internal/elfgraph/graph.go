@@ -311,6 +311,7 @@ func (g *Graph) markRoots(opts Options) {
 	// worst of the options -- the run where this happens is exactly the run
 	// where --exec-policy=assume-none has also been passed, so nothing else is
 	// left to withhold the conclusion. See TaintMissingRoot.
+	var rooted int
 	for _, r := range opts.Roots {
 		c := g.Canon(r)
 		if _, ok := g.nodes[c]; !ok {
@@ -329,15 +330,17 @@ func (g *Graph) markRoots(opts Options) {
 			continue
 		}
 		g.addRoot(c, "named by --roots", RootExplicit)
+		rooted++
 	}
 
 	argv := opts.Config.Argv()
 	if len(argv) == 0 {
-		g.taints = append(g.taints, Taint{
-			Kind:   TaintNoEntrypoint,
-			Detail: "nothing declares an entrypoint -- no image config, or one that sets neither Entrypoint nor Cmd -- so every executable is treated as a root; name the real ones with --roots",
-		})
-		g.escalate(opts, "no entrypoint")
+		if g.unknownEntrypoint(opts, rooted, TaintNoEntrypoint,
+			"nothing declares an entrypoint -- no image config, or one that sets neither Entrypoint nor Cmd",
+			"", "no entrypoint") {
+			return
+		}
+		g.probeExec(opts)
 		return
 	}
 
@@ -350,38 +353,39 @@ func (g *Graph) markRoots(opts Options) {
 	// certainty is left in place, and the shell check below escalates as before.
 	argv = g.peelWrappers(opts, argv)
 	if len(argv) == 0 {
-		g.taints = append(g.taints, Taint{
-			Kind:   TaintNoEntrypoint,
-			Detail: "the entrypoint is an exec wrapper that forwards to no command, so what runs is unknown; name it with --roots",
-		})
-		g.escalate(opts, "wrapper names no command")
+		if g.unknownEntrypoint(opts, rooted, TaintNoEntrypoint,
+			"the entrypoint is an exec wrapper that forwards to no command, so what runs is unknown",
+			"", "wrapper names no command") {
+			return
+		}
+		g.probeExec(opts)
 		return
 	}
 
 	argv0 := argv[0]
 	base := path.Base(argv0)
 	if shells[base] || strings.HasSuffix(base, ".sh") {
-		g.taints = append(g.taints, Taint{
-			Kind:   TaintShellEntrypoint,
-			Detail: fmt.Sprintf("entrypoint %q runs something other than itself, so every executable is treated as a root", strings.Join(argv, " ")),
-			Path:   argv0,
-		})
-		g.escalate(opts, "shell entrypoint")
+		escalated := g.unknownEntrypoint(opts, rooted, TaintShellEntrypoint,
+			fmt.Sprintf("entrypoint %q runs something other than itself", strings.Join(argv, " ")),
+			argv0, "shell entrypoint")
 		// The shim itself is still executed.
 		if p, ok := g.lookupCommand(opts, argv0); ok {
 			g.addRoot(p, "entrypoint", RootExplicit)
+		}
+		if !escalated {
+			g.probeExec(opts)
 		}
 		return
 	}
 
 	p, ok := g.lookupCommand(opts, argv0)
 	if !ok {
-		g.taints = append(g.taints, Taint{
-			Kind:   TaintNoEntrypoint,
-			Detail: fmt.Sprintf("entrypoint %q is not an ELF object in this image, so every executable is treated as a root", argv0),
-			Path:   argv0,
-		})
-		g.escalate(opts, "unresolvable entrypoint")
+		if g.unknownEntrypoint(opts, rooted, TaintNoEntrypoint,
+			fmt.Sprintf("entrypoint %q is not an ELF object in this image", argv0),
+			argv0, "unresolvable entrypoint") {
+			return
+		}
+		g.probeExec(opts)
 		return
 	}
 	g.addRoot(p, "entrypoint", RootExplicit)
@@ -390,6 +394,60 @@ func (g *Graph) markRoots(opts Options) {
 	// wrapper shapes, which the shell check above already caught.
 
 	g.probeExec(opts)
+}
+
+// unknownEntrypoint records that the closure cannot tell where execution
+// starts, and either escalates or stands on the roots the user named. It
+// reports whether it escalated.
+//
+// Escalation is safe to pair with a non-blocking taint because the two go
+// together: a closure that roots every program in the image cannot
+// under-report, so there is nothing left for the unknown entrypoint to reach
+// and nothing to withhold. Dropping escalation while leaving the taint a note
+// would break that bargain and leave a narrow closure with nothing guarding
+// it -- the exact shape that reports reachable code as dead.
+//
+// So it is dropped only against an assertion, and only against both halves of
+// one. --roots alone is not enough: it says where execution starts, not that
+// nothing else does, and a shell is free to run things the user never named.
+// --exec-policy=assume-none supplies the second half, and it is the same
+// assertion TaintExec already accepts one program away -- a Go entrypoint that
+// can exec is allowed to have its targets assumed accounted for, and there is
+// no principled reason a shell that execs should be refused the same answer.
+// Refusing it is what made a hardened image unanswerable: 491 of 668 objects
+// rooted because the entrypoint was a shell script, so 144 of 145 findings came
+// back reachable no matter what the user knew about the image.
+//
+// Both ways the taint is raised and both ways it is evidence. What changes is
+// what it costs: escalating it is a note on a closure that already roots
+// everything; standing on --roots it is a discharged taint, recorded as the
+// ground the conclusion stands on rather than dropped.
+func (g *Graph) unknownEntrypoint(opts Options, rooted int, kind TaintKind, what, p, why string) bool {
+	if rooted == 0 || opts.ExecPolicy != ExecAssumeNone {
+		g.taints = append(g.taints, Taint{
+			Kind:   kind,
+			Detail: what + ", so every executable is treated as a root; name the real ones with --roots and re-run with --exec-policy=assume-none",
+			Path:   p,
+		})
+		g.escalate(opts, why)
+		return true
+	}
+	g.taints = append(g.taints, Taint{
+		Kind: kind,
+		Detail: fmt.Sprintf("%s, but --roots names %s this image has and --exec-policy=assume-none says what they start is accounted for, "+
+			"so the closure starts from those rather than from every executable in the image", what, plural(rooted, "program")),
+		Path:       p,
+		Discharged: true,
+	})
+	return false
+}
+
+// plural renders a count with its noun, for evidence a person reads.
+func plural(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
 }
 
 // probeExec asks the prober whether the programs this image says it runs can
