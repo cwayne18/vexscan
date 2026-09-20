@@ -93,13 +93,18 @@ func (br *batchReport) failed() bool {
 type scanTarget struct {
 	ref      string
 	storeRef string
+
+	// assert is what the fleet list said about this image and no other. Nil
+	// for every target that did not come from a list line that carried one,
+	// which is all of them for --image and --haul. See scanAssert.
+	assert *scanAssert
 }
 
-// imageTargets is the plain case: a list of references, each its own address.
-func imageTargets(refs []string) []scanTarget {
-	out := make([]scanTarget, 0, len(refs))
-	for _, r := range refs {
-		out = append(out, scanTarget{ref: r})
+// imageTargets is the plain case: a list of entries, each its own address.
+func imageTargets(entries []imageEntry) []scanTarget {
+	out := make([]scanTarget, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, scanTarget{ref: e.ref, assert: e.assert})
 	}
 	return out
 }
@@ -251,11 +256,18 @@ func scanBatch(ctx context.Context, opts analyze.Options, targets []scanTarget, 
 		Targets:       len(targets),
 		order:         targetRefs(targets),
 	}
+	// The run's options are the defaults; a target that came from a list line
+	// carrying assertions gets them overlaid on a copy. Copied per image rather
+	// than mutated in place, or image four would inherit image three's roots
+	// and conclude things about a closure it never had.
+	base := opts
 	for i, t := range targets {
 		ref := t.ref
 		logf("[%d/%d] %s", i+1, len(targets), ref)
+		opts := base
 		opts.Image = ref
 		opts.ImageLayoutRef = t.storeRef
+		t.assert.apply(&opts)
 
 		// Per-image, because the descriptor records what this scan of this
 		// image cost, and a fleet's total tells a reader nothing about the one

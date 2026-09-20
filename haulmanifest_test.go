@@ -263,7 +263,7 @@ func TestReadImageListAcceptsAHaulerManifest(t *testing.T) {
 	}
 
 	var (
-		got []string
+		got []imageEntry
 		err error
 	)
 	stderrOf(t, func() { got, err = readImageList(context.Background(), path) })
@@ -271,8 +271,8 @@ func TestReadImageListAcceptsAHaulerManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{"docker.io/library/alpine:3.20", "ghcr.io/org/app:v1.2.3"}
-	if !equalStrings(got, want) {
-		t.Errorf("readImageList = %v, want %v", got, want)
+	if !equalStrings(entryRefs(got), want) {
+		t.Errorf("readImageList = %v, want %v", entryRefs(got), want)
 	}
 }
 
