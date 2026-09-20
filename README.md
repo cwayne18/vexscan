@@ -992,7 +992,7 @@ you tell them apart.
 | `unresolved-needed` | a `DT_NEEDED` that resolved to nothing | scoped to that soname |
 | `dlopen` | a reachable ELF references `dlopen`/`dlmopen` | global, unless `--dlopen-policy=assume-none` |
 | `static-elf` | a reachable ELF has no `PT_INTERP`/`.dynamic` | blocks all C-library conclusions, unless the entrypoint is a pure-Go build or its symbol table clears the advisory |
-| `shell-entrypoint` | argv[0] is a shell or init shim (`sh`, `busybox`, `s6-*`), or a transparent wrapper (`tini`, `gosu`, `env`) used in a form its parser cannot read | every ELF in the standard bin dirs becomes a root |
+| `shell-entrypoint` | argv[0] is a shell or init shim (`sh`, `busybox`, `s6-*`), or a transparent wrapper (`tini`, `gosu`, `env`) used in a form its parser cannot read | every ELF in the standard bin dirs becomes a root — unless you assert past it, see below |
 | `no-entrypoint` | the image config has neither Entrypoint nor Cmd — or there is no config at all, as in `--rootfs` mode | same escalation |
 | `exec` | the entrypoint is a Go binary that links a process-spawning call | global, unless `--exec-policy=assume-none`; recorded as a discharged note when the binary provably links none |
 | `missing-root` | a `--roots` path that names no ELF object in the image | global, always — see below |
@@ -1013,6 +1013,36 @@ closure does not know what it missed, so it does not get to keep the answers it
 happened to reach. The evidence names the path and says whether it was absent
 or present-but-not-an-ELF-object, since pointing at a shell script instead of
 the program it runs is a different mistake from a typo.
+
+**Asserting past escalation.** Escalation and a *non-blocking* taint go
+together, and it is worth seeing why. Rooting every program in the image cannot
+under-report — there is nothing left for the unknown entrypoint to reach — so
+there is nothing to withhold, and the taint is a note rather than a block. That
+bargain is also why escalation is so expensive: on
+`rancher/hardened-calico:v3.28.1`, a `/bin/bash` entrypoint rooted **491 of 668
+objects**, and 144 of 145 OS findings came back reachable no matter what you
+knew about the image.
+
+You can buy your way out, but only with both halves of the assertion:
+
+```
+--roots /usr/bin/calico-node --exec-policy=assume-none
+```
+
+`--roots` alone is not enough, and neither is `--exec-policy=assume-none` alone.
+The first says where execution *starts*, not that nothing else does — a shell is
+free to run things you did not name. The second supplies the missing half, and
+it is the same assertion `exec` already accepts one program away: a Go
+entrypoint that can spawn is allowed to have its targets assumed accounted for,
+and there is no principled reason a shell that spawns should be refused the same
+answer. Given both, the closure stands on what you named — 491 roots drop to 9,
+the reachable set from 595 objects to 15, and 141 of 148 findings become
+provably unreached instead of 1 of 145.
+
+A `--roots` path that resolves to nothing does not count toward the assertion,
+so a typo escalates *and* raises `missing-root`. The taint itself is never
+dropped either way: escalating it is a note, and standing on your roots it
+becomes a **discharged** taint naming the assertion it was spent on.
 
 **The pure-Go discharge.** `static-elf` blocks because a statically linked
 entrypoint may hold a copy of the vulnerable library inside it, where
