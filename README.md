@@ -201,6 +201,46 @@ ghcr.io/myorg/worker@sha256:9f2a...
 behind authentication should be fetched by whatever holds the token and piped
 in with `-`.
 
+### Per-image assertions
+
+`--roots`, `--exec-policy`, `--dlopen-policy` and `--dynamic-import-policy` are
+process-global. What they *assert* is not. "This entrypoint execs `iptables`,
+and `iptables` is the whole list" is true of one image in a fleet of sixty;
+applied to the other fifty-nine it is meaningless at best. And since an
+unresolvable `--roots` path is a blocking `missing-root` taint (see
+[Taints](#taints)), a global `--roots` aimed at one image withholds every
+conclusion about the rest.
+
+So a list line may carry its own:
+
+```
+# the one that shells out to iptables
+rancher/mirrored-kube-vip-kube-vip-iptables:v0.6.0 roots=/usr/sbin/xtables-nft-multi exec-policy=assume-none
+
+# a sidecar whose entrypoint is the whole program
+rancher/hardened-coredns:v1.11.1-build20240910
+
+rancher/nginx-ingress-controller:v1.10.4-hardened3 roots=/nginx-ingress-controller,/usr/sbin/nginx exec-policy=assume-none
+```
+
+| key | value |
+|---|---|
+| `roots=` | comma-separated paths; repeatable on the line. **Replaces** the global `--roots` for this image rather than adding to it — a line that names its own roots is a complete statement about what that image runs |
+| `exec-policy=` | `taint` or `assume-none` |
+| `dlopen-policy=` | `taint` or `assume-none` |
+| `dynamic-import-policy=` | `taint` or `assume-none` |
+
+A key the line does not mention inherits the global flag, so a list can loosen
+one image and leave the rest alone — or tighten one back to `taint` under a
+global `assume-none`.
+
+Two rules, both about not guessing on your behalf. An unknown key or an invalid
+value is an error, reported before anything is pulled, rather than a line
+quietly skipped: skipping fails closed, but it leaves you believing you asked
+for something you did not. And an image named twice where either line carries
+assertions is an error too — that is not a repeat, it is the list saying the
+image runs two different things, and there is no safe way to pick one.
+
 ### Why one process and not a shell loop
 
 Everything expensive is shared across the images: the OSV client, the `--triage`
@@ -433,6 +473,15 @@ vexscan --rootfs /mnt/rootfs --all --roots /usr/bin/myapp --roots /usr/bin/worke
 
 Name what actually runs. A root that is a wrapper script rather than a real
 program makes things *worse*, not better — see the npm measurement below.
+
+A `--roots` path that names no ELF object in the image is a **blocking**
+`missing-root` taint, not a skipped argument. Misspell it and the closure would
+otherwise carry on one root short, reporting code it never looked at as
+unreachable — and since `--roots` is usually paired with
+`--exec-policy=assume-none`, there would be nothing left to withhold the
+conclusion. So a typo costs you every answer for that image rather than buying
+you wrong ones. The taint names the path that failed, and says whether it was
+absent or present-but-not-an-ELF-object.
 
 ### Measured against the same image, both ways
 
@@ -946,6 +995,24 @@ you tell them apart.
 | `shell-entrypoint` | argv[0] is a shell or init shim (`sh`, `busybox`, `s6-*`), or a transparent wrapper (`tini`, `gosu`, `env`) used in a form its parser cannot read | every ELF in the standard bin dirs becomes a root |
 | `no-entrypoint` | the image config has neither Entrypoint nor Cmd — or there is no config at all, as in `--rootfs` mode | same escalation |
 | `exec` | the entrypoint is a Go binary that links a process-spawning call | global, unless `--exec-policy=assume-none`; recorded as a discharged note when the binary provably links none |
+| `missing-root` | a `--roots` path that names no ELF object in the image | global, always — see below |
+
+**`missing-root`.** The one taint raised by what you said rather than by what
+the image holds, and the one that most needs raising. `--roots` is how you
+answer an `exec` taint — *it runs this, now conclude* — so a root that silently
+went missing would take the closure down with it while
+`--exec-policy=assume-none` discharged the taint that had been withholding the
+answer. Measured on `rancher/mirrored-kube-vip-kube-vip-iptables:v1.2.3`, one
+transposed character in `--roots /usr/sbin/xtables-nft-multi` flipped seven
+OpenSSL CVEs from `linked` to `not_in_execute_path`, and the report was
+byte-identical in size to the correct one.
+
+So it blocks, globally, and it blocks *everything* for that image — including
+the findings the correct run could have answered. Once a root is missing the
+closure does not know what it missed, so it does not get to keep the answers it
+happened to reach. The evidence names the path and says whether it was absent
+or present-but-not-an-ELF-object, since pointing at a shell script instead of
+the program it runs is a different mistake from a typo.
 
 **The pure-Go discharge.** `static-elf` blocks because a statically linked
 entrypoint may hold a copy of the vulnerable library inside it, where

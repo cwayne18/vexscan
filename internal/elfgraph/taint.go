@@ -48,6 +48,22 @@ const (
 	// discharged, because the interesting fact about an entrypoint that cannot
 	// exec is that somebody checked. See ExecProber.
 	TaintExec TaintKind = "exec"
+
+	// TaintMissingRoot is a --roots path the closure could not start from: one
+	// naming nothing in the image, or naming a file that is not an ELF object.
+	//
+	// This is the only taint raised by what the user said rather than by what
+	// the image contains, and it is the one that most needs raising. --roots is
+	// how a user answers an exec taint -- "it runs this, now conclude" -- so a
+	// root that silently goes missing takes the closure down with it while
+	// --exec-policy=assume-none discharges the taint that was withholding the
+	// answer. Dropping it with a log line makes a typo and a correct run produce
+	// byte-identical reports, one of which is wrong.
+	//
+	// It threatens presence as well as reachability, by the default in
+	// ThreatensPresence: the program nobody could find may be exactly the static
+	// binary carrying a copy of the vulnerable code.
+	TaintMissingRoot TaintKind = "missing-root"
 )
 
 // ThreatensPresence says whether this kind of taint can put a copy of the

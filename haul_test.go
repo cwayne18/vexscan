@@ -131,7 +131,7 @@ func TestUnqualifiedListsOnlyImages(t *testing.T) {
 // nothing about a registry scan may change because a haul scan needs two names.
 func TestImageTargetsAndTargetRefs(t *testing.T) {
 	refs := []string{"alpine:3.20", "ghcr.io/org/app:v1"}
-	targets := imageTargets(refs)
+	targets := imageTargets([]imageEntry{{ref: refs[0]}, {ref: refs[1]}})
 	if len(targets) != 2 {
 		t.Fatalf("imageTargets = %v", targets)
 	}

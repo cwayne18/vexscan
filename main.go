@@ -39,7 +39,7 @@ func main() {
 	flag.Var(&images, "image", "container image reference to inspect; repeatable")
 	flag.Var(&packages, "package", "package to check: a purl, an ecosystem:name shorthand (deb:openssl), or a bare name; repeatable")
 	flag.Var(&ecosystems, "ecosystem", "restrict to these ecosystems (golang, os, pypi, npm, maven, or a distro like debian); repeatable")
-	flag.Var(&roots, "roots", "extra entrypoints for the reachability closures when the image config declares none; repeatable")
+	flag.Var(&roots, "roots", "extra entrypoints for the reachability closures; a path that names no ELF object in the image blocks conclusions rather than being skipped; repeatable")
 	flag.Var(&rpms, "rpm", "rpm file to scan without installing: a path, a directory, or a URL; repeatable (reads only the header)")
 	flag.Var(&vexhubs, "vexhub", "VEX Hub repo, raw URL, or local dir to check findings against; repeatable, earliest wins")
 	flag.Var(&vexMergeInto, "vex-merge-into", "with --vex-out, also add every statement to this merged \"master\" document in the hub, "+
@@ -47,7 +47,7 @@ func main() {
 	flag.Var(&severities, "severity", "only report these severities: "+
 		strings.Join(cvss.Labels, ", ")+"; comma-separated or repeatable (UNKNOWN must be named to be shown)")
 	var (
-		imagesFrom = flag.String("images-from", "", "scan every image named in this list: a file with one reference per line, a hauler manifest, a URL, or '-' for stdin")
+		imagesFrom = flag.String("images-from", "", "scan every image named in this list: a file with one reference per line, a hauler manifest, a URL, or '-' for stdin; a line may carry its own roots= and *-policy= assertions")
 		haulPath   = flag.String("haul", "", "scan every image inside a hauler haul, without a registry: a .tar.zst, a tar, or an unpacked store directory")
 		rootfs     = flag.String("rootfs", "", "filesystem tree on disk to inspect: an unpacked image, a mounted volume, a machine's own /")
 		repo       = flag.String("repo", "", "git source repo to analyze via govulncheck source mode, e.g. github.com/rancher/rancher")
@@ -279,6 +279,12 @@ func main() {
 	// anything is pulled -- so an unreadable list is an error reported in the
 	// first second of the run rather than one discovered between image three
 	// and image four.
+	// --image names bare references; only a list can carry per-image
+	// assertions, because only a list has somewhere to put them.
+	entries := make([]imageEntry, 0, len(images))
+	for _, r := range dedupe(images) {
+		entries = append(entries, imageEntry{ref: r})
+	}
 	if *imagesFrom != "" {
 		list, err := readImageList(ctx, *imagesFrom)
 		if err != nil {
@@ -287,12 +293,12 @@ func main() {
 		if len(list) == 0 {
 			fail("--images-from %s named no images", *imagesFrom)
 		}
-		images = append(images, list...)
+		entries = append(entries, list...)
 	}
 	// A reference given twice is scanned once. Two identical rows in a fleet
 	// table say nothing the first one did not, and the pull behind the second
 	// is minutes nobody asked for.
-	images = dedupe(images)
+	entries = dedupeEntries(entries)
 
 	// The haul is opened here for the same reason: a haul that is not one, or
 	// one with nothing scannable in it, is an error reported before any work
@@ -311,7 +317,7 @@ func main() {
 		// through os.Exit, which runs no defers.
 		haulDir, targets, afterScan = h.Dir, t, func() { h.Close() }
 	} else {
-		targets = imageTargets(images)
+		targets = imageTargets(entries)
 	}
 
 	// Whether the report is a batch is decided by the flags, not by how many
@@ -783,6 +789,32 @@ func gistDescription(res *analyze.Result) string {
 	return desc
 }
 
+// dedupeEntries is dedupe over fleet-list entries, keyed on the reference.
+//
+// A repeat keeps the first occurrence's position but takes the assertions from
+// whichever occurrence carried them. parseImageList already rejects a list that
+// names one image twice, so the only way two entries can share a reference is
+// --image naming what the list also names -- and --image has nowhere to write
+// an assertion, so the two can never contradict each other. Dropping the later
+// one wholesale would silently discard the assertion instead, which costs the
+// user the conclusions they asked for and says nothing about why.
+func dedupeEntries(entries []imageEntry) []imageEntry {
+	at := make(map[string]int, len(entries))
+	out := make([]imageEntry, 0, len(entries))
+	for _, e := range entries {
+		i, ok := at[e.ref]
+		if !ok {
+			at[e.ref] = len(out)
+			out = append(out, e)
+			continue
+		}
+		if out[i].assert == nil {
+			out[i].assert = e.assert
+		}
+	}
+	return out
+}
+
 // dedupe drops repeats while keeping the first occurrence's position, so a list
 // still renders in the order it was written.
 func dedupe(vals []string) []string {
@@ -903,6 +935,12 @@ Examples:
   vexscan --images-from fleet.txt --format summary
   kubectl get pods -A -o jsonpath='{..image}' | tr ' ' '\n' | \
     vexscan --images-from - --format summary
+
+  # A fleet list line may assert about its own image, since --roots and the
+  # policy flags are process-global and what they claim is not:
+  #   rancher/mirrored-kube-vip-kube-vip-iptables:v0.6.0 \
+  #     roots=/usr/sbin/xtables-nft-multi exec-policy=assume-none
+  #   rancher/hardened-coredns:v1.11.1-build20240910
 
   # A hauler haul, scanned in the airgap it was carried into -- no registry
   vexscan --haul rke2-airgap.tar.zst --all --format summary

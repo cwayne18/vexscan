@@ -980,6 +980,96 @@ func TestExplicitRoots(t *testing.T) {
 	}
 }
 
+// A --roots path the closure cannot start from must block, not warn.
+//
+// The scenario is the one the exec taint sends users to: an entrypoint that can
+// start another program, a user naming that program with --roots, and
+// --exec-policy=assume-none to say the naming is complete. Mistype the path and
+// the root is gone while the taint that was withholding conclusions is
+// discharged -- so the run that concluded nothing and the run that concluded
+// everything look the same. Nothing but this taint stands between the two.
+func TestMissingRootBlocks(t *testing.T) {
+	files := map[string]string{
+		"/usr/bin/app":        "",
+		"/opt/job/runner":     "",
+		"/usr/bin/wrapper.sh": "#!/bin/sh\nexec app\n",
+	}
+	objs := fakeELF{"/usr/bin/app": exe(), "/opt/job/runner": exe()}
+	cfg := target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}}
+
+	t.Run("absent path", func(t *testing.T) {
+		g := build(t, tree(t, files), objs, Options{
+			Config: cfg,
+			Roots:  []string{"/opt/job/runnr"}, // one transposition from the real one
+		})
+		tt := hasTaint(g, TaintMissingRoot)
+		if tt == nil {
+			t.Fatalf("a --roots path naming nothing in the image raised no taint; taints are %v", g.Taints())
+		}
+		if !tt.Blocking {
+			t.Error("the missing-root taint does not block, so a typo still buys conclusions")
+		}
+		if !tt.Global {
+			t.Error("the missing-root taint is scoped; the root that went missing could have reached any package")
+		}
+		if !strings.Contains(tt.Detail, "/opt/job/runnr") {
+			t.Errorf("detail does not name the path that failed: %q", tt.Detail)
+		}
+	})
+
+	// The case that matters most: assume-none discharges the exec taint, and
+	// this one has to survive that or the report is wrong and silent.
+	t.Run("survives assume-none", func(t *testing.T) {
+		g := build(t, tree(t, files), objs, Options{
+			Config:     cfg,
+			Roots:      []string{"/opt/job/runnr"},
+			ExecPolicy: ExecAssumeNone,
+		})
+		if hasTaint(g, TaintMissingRoot) == nil || len(g.BlockingTaints()) == 0 {
+			t.Fatalf("--exec-policy=assume-none cleared the missing root too; blocking taints are %v", g.BlockingTaints())
+		}
+	})
+
+	// A file that is there but is not an ELF object is a different mistake --
+	// pointing at the shell script rather than at what it runs -- and saying so
+	// is the difference between a user fixing it and a user re-checking a path
+	// that was never wrong.
+	t.Run("present but not ELF", func(t *testing.T) {
+		g := build(t, tree(t, files), objs, Options{
+			Config: cfg,
+			Roots:  []string{"/usr/bin/wrapper.sh"},
+		})
+		tt := hasTaint(g, TaintMissingRoot)
+		if tt == nil {
+			t.Fatalf("a --roots path that is not an ELF object raised no taint; taints are %v", g.Taints())
+		}
+		if !strings.Contains(tt.Detail, "not an ELF object") {
+			t.Errorf("detail does not say the file was found but unusable: %q", tt.Detail)
+		}
+	})
+
+	// The other direction. A root that resolves must not raise it, or every
+	// correct run drowns in a warning and the taint stops meaning anything.
+	t.Run("resolving root is clean", func(t *testing.T) {
+		g := build(t, tree(t, files), objs, Options{
+			Config: cfg,
+			Roots:  []string{"/opt/job/runner"},
+		})
+		if tt := hasTaint(g, TaintMissingRoot); tt != nil {
+			t.Errorf("a --roots path that resolved raised %v", tt)
+		}
+	})
+}
+
+// A missing root withholds not_present as well as not_in_execute_path: the
+// program nobody could find may be the static binary carrying a copy of the
+// vulnerable code, so the package's own symbol tables do not settle it either.
+func TestMissingRootThreatensPresence(t *testing.T) {
+	if !TaintMissingRoot.ThreatensPresence() {
+		t.Error("TaintMissingRoot does not threaten presence, so an unfindable root still buys not_present")
+	}
+}
+
 func TestNonELFFilesAreNotNodes(t *testing.T) {
 	g := build(t, tree(t, map[string]string{
 		"/usr/bin/app":        "",

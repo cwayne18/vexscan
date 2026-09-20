@@ -304,10 +304,28 @@ func (g *Graph) markRoots(opts Options) {
 		g.pending = append(g.pending, pendingPlugin{path: p, fam: fam})
 	}
 
+	// A --roots path that does not resolve blocks rather than warns. The user
+	// named a program they say execution starts at; the closure does not have
+	// it, so the closure is short a root, and a closure short a root reports
+	// code it would have reached as unreachable. Warning and carrying on is the
+	// worst of the options -- the run where this happens is exactly the run
+	// where --exec-policy=assume-none has also been passed, so nothing else is
+	// left to withhold the conclusion. See TaintMissingRoot.
 	for _, r := range opts.Roots {
 		c := g.Canon(r)
 		if _, ok := g.nodes[c]; !ok {
-			opts.Logf("  ! --roots %s is not an ELF object in this image", r)
+			detail := fmt.Sprintf("--roots %s names nothing in this image, so the closure is missing a root and cannot be trusted to be complete; check the path, or drop it", r)
+			if _, err := g.fsys.Stat(c); err == nil {
+				detail = fmt.Sprintf("--roots %s is in this image but is not an ELF object -- a script, or a wrapper -- so the closure cannot start from it, and whatever it goes on to run is outside the closure; name that program instead", r)
+			}
+			opts.Logf("  ! %s", detail)
+			g.taints = append(g.taints, Taint{
+				Kind:     TaintMissingRoot,
+				Detail:   detail,
+				Path:     r,
+				Blocking: true,
+				Global:   true,
+			})
 			continue
 		}
 		g.addRoot(c, "named by --roots", RootExplicit)
