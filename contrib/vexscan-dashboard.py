@@ -179,6 +179,8 @@ a.card:hover { border-color: var(--link); border-left-color: var(--link); }
 .card-vexed        { border-left-color: var(--ok-border); }
 .card-undetermined { border-left-color: var(--sev-medium-border); }
 .card-ruled-out    { border-left-color: var(--link); }
+.card-remediation  { border-left-color: var(--link); border-left-style: dashed; }
+.card-remediation .k { color: var(--link); }
 
 /* ---- Tables ---- */
 .report-table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -333,6 +335,20 @@ tr.f-detail > td {
 
 .muted { color: var(--muted); }
 .nofix { color: var(--muted); font-style: italic; }
+
+/* ---- Remediation ---- */
+.rem-summary {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--link);
+  border-radius: 6px;
+  background: var(--box-bg);
+  padding: 12px 16px;
+  margin: 4px 0 8px;
+}
+.rem-summary .rem-line { margin: 0 0 4px; font-weight: 600; }
+.rem-summary .rem-line:last-of-type { margin-bottom: 0; }
+.rem-summary p.muted { margin: 4px 0 0; font-weight: 400; }
+.report-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
 
 /* ---- Banners ---- */
 .banner {
@@ -647,6 +663,85 @@ def sort_key(f):
         component(f),
         short_advisory(f),
     )
+
+
+# ---------------------------------------------------------------------------
+# Debian version comparison
+#
+# A straight port of internal/debver, which is itself dpkg's verrevcmp
+# (deb-version(7)). The fix plan needs it for one thing: when a package carries
+# several advisories fixed in different point releases, pick the newest as the
+# upgrade target, because a distro point release is cumulative and installing
+# the latest clears every earlier one. Scoped to Debian/Ubuntu on purpose --
+# other ecosystems order their versions differently and are left un-collapsed.
+# ---------------------------------------------------------------------------
+
+
+def _deb_order(c):
+    """Each byte's dpkg sort weight, matching debver.order."""
+    if c.isdigit():
+        return 0
+    if c.isalpha() and c.isascii():
+        return ord(c)
+    if c == "~":
+        return -1
+    return ord(c) + 256
+
+
+def _deb_verrevcmp(a, b):
+    """Compare one upstream-or-revision fragment, matching debver.verrevcmp."""
+    i, j = 0, 0
+    la, lb = len(a), len(b)
+    while i < la or j < lb:
+        while (i < la and not a[i].isdigit()) or (j < lb and not b[j].isdigit()):
+            ac = _deb_order(a[i]) if i < la else 0
+            bc = _deb_order(b[j]) if j < lb else 0
+            if ac != bc:
+                return -1 if ac < bc else 1
+            i += 1
+            j += 1
+        while i < la and a[i] == "0":
+            i += 1
+        while j < lb and b[j] == "0":
+            j += 1
+        first_diff = 0
+        while i < la and a[i].isdigit() and j < lb and b[j].isdigit():
+            if first_diff == 0:
+                first_diff = ord(a[i]) - ord(b[j])
+            i += 1
+            j += 1
+        if i < la and a[i].isdigit():
+            return 1
+        if j < lb and b[j].isdigit():
+            return -1
+        if first_diff:
+            return -1 if first_diff < 0 else 1
+    return 0
+
+
+def _deb_split(v):
+    """Break a version into (epoch, upstream, revision), matching debver.split."""
+    epoch = 0
+    colon = v.find(":")
+    if colon >= 0 and v[:colon].isdigit():
+        epoch = int(v[:colon])
+        v = v[colon + 1:]
+    dash = v.rfind("-")
+    if dash >= 0:
+        return epoch, v[:dash], v[dash + 1:]
+    return epoch, v, ""
+
+
+def deb_compare(a, b):
+    """-1 if a sorts before b, +1 if after, 0 if equal (Debian algorithm)."""
+    ea, ua, ra = _deb_split(a)
+    eb, ub, rb = _deb_split(b)
+    if ea != eb:
+        return -1 if ea < eb else 1
+    c = _deb_verrevcmp(ua, ub)
+    if c != 0:
+        return c
+    return _deb_verrevcmp(ra, rb)
 
 
 # ---------------------------------------------------------------------------
@@ -1040,6 +1135,273 @@ def findings_table(rows, is_vex_section):
     return "".join(out)
 
 
+# ---------------------------------------------------------------------------
+# Remediation view (--format fixplan, as a panel)
+#
+# The findings tables above answer "what is wrong with this image". This
+# answers the next question, the one asked once the AFFECTED table is a hundred
+# rows long: "what do I do about it". It is the same population --format fixplan
+# reorganises -- affected, and not already answered by a VEX statement -- folded
+# from a wall of per-CVE rows into a short list of upgrades, each annotated with
+# how many advisories it clears and the worst severity among them.
+#
+# It is a view, not a filter. Every affected finding with no published fix is
+# still listed, under its own heading, because a remediation plan that silently
+# dropped the un-fixable rows would read as complete when it is not.
+# ---------------------------------------------------------------------------
+
+
+def dpkg_plugins(res):
+    """Which ecosystem ids produced Debian-comparable versions, so an upgrade
+    may fold to its newest fix. A plugin qualifies only when every OSV
+    ecosystem it detected is a Debian or Ubuntu one; a mixed or unknown
+    analyzer stays on the safe, un-collapsed path."""
+    out = set()
+    for e in res.get("ecosystems") or []:
+        names = e.get("ecosystems") or []
+        if not names:
+            continue
+        if all(is_debian_family(n) for n in names):
+            out.add(e.get("id", ""))
+    return out
+
+
+def is_debian_family(ecosystem):
+    family = ecosystem.split(":", 1)[0]
+    return family.lower() in ("debian", "ubuntu")
+
+
+def group_upgrades(findings, dpkg):
+    """Collapse fixable findings into upgrade actions, mirroring groupUpgrades.
+
+    For a dpkg-orderable ecosystem every advisory on a package folds into one
+    row whose target is the newest fix of them all. For any other ecosystem the
+    published fixed version is part of the key, so distinct targets stay
+    distinct rows rather than risk naming the wrong one as newest.
+    """
+    index = {}
+    order = []
+    for f in findings:
+        pkg = component(f)
+        eco = f.get("ecosystem", "")
+        collapse = eco in dpkg
+        fixed = f.get("fixed_version") or ""
+        key = "\x00".join([eco, pkg, f.get("version", "")])
+        if not collapse:
+            key += "\x00" + fixed
+        u = index.get(key)
+        if u is None:
+            u = {
+                "ecosystem": eco,
+                "pkg": pkg,
+                "current": f.get("version", ""),
+                "fixed_in": fixed,
+                "advisories": {},
+                "top_rank": 6,
+                "top_label": "UNKNOWN",
+                "kev": False,
+            }
+            index[key] = u
+            order.append(u)
+        if collapse and fixed and deb_compare(fixed, u["fixed_in"]) > 0:
+            u["fixed_in"] = fixed
+        adv = short_advisory(f)
+        u["advisories"][adv] = f
+        rank = SEVERITY_RANK.get(display_severity(f), 6)
+        if rank < u["top_rank"]:
+            u["top_rank"] = rank
+            u["top_label"] = display_severity(f)
+        if priority_band(f) == BAND_KEV:
+            u["kev"] = True
+
+    # Worst first: known-exploited, then severity, then the biggest wins, then a
+    # stable name order so the plan is diffable between runs.
+    order.sort(key=lambda u: (
+        0 if u["kev"] else 1,
+        u["top_rank"],
+        -len(u["advisories"]),
+        u["ecosystem"],
+        u["pkg"],
+    ))
+    return order
+
+
+def fixplan_population(res):
+    """Split the affected-and-unvexed findings into fixable and no-fix, and
+    count what the plan declines to plan for. Mirrors writeFixSummary's
+    population so the two never disagree."""
+    fixable, no_fix = [], []
+    vexed = undetermined = 0
+    for f in res.get("findings") or []:
+        b = bucket_of(f)
+        if b == BUCKET_VEXED:
+            vexed += 1
+            continue
+        if b == BUCKET_UNDETERMINED:
+            undetermined += 1
+            continue
+        if b != BUCKET_AFFECTED:
+            continue
+        if f.get("fixed_version"):
+            fixable.append(f)
+        else:
+            no_fix.append(f)
+    return fixable, no_fix, vexed, undetermined
+
+
+def unique_advisories(findings):
+    return len({short_advisory(f) for f in findings})
+
+
+def build_fixplan(res):
+    """The remediation plan and its population, computed once so the summary
+    card and the section below it cannot disagree."""
+    fixable, no_fix, vexed, undetermined = fixplan_population(res)
+    plan = group_upgrades(fixable, dpkg_plugins(res))
+    return plan, fixable, no_fix, vexed, undetermined
+
+
+def remediation_card(res):
+    """The fifth verdict card: the one action the page can name. It links to the
+    remediation panel and is omitted entirely when nothing is affected, so it
+    never appears reading '0 upgrades' on a clean image."""
+    plan, fixable, no_fix, _, _ = build_fixplan(res)
+    if not fixable and not no_fix:
+        return ""
+    if plan:
+        cleared = unique_advisories(fixable)
+        adv = "advisory" if cleared == 1 else "advisories"
+        n = len(plan)
+        note = "%s to upgrade · clears %d %s" % (plural(n, "package"), cleared, adv)
+    else:
+        n, note = len(no_fix), "affected, no fix has shipped yet"
+    return (
+        '<a class="card card-remediation" href="#remediation">'
+        '<div class="k">Remediation</div><div class="n">%d</div>'
+        '<div class="note">%s</div></a>' % (n, esc(note))
+    )
+
+
+def remediation_summary(fixable, no_fix, upgrades, vexed, undetermined):
+    """The plan's count of itself, mirroring writeFixSummary -- every number
+    named by its unit, and what the plan omits said out loud."""
+    total = len(fixable) + len(no_fix)
+    cleared = unique_advisories(fixable)
+    lines = []
+    if total == 0:
+        lines.append("No affected findings to fix.")
+    else:
+        lines.append("%d of %d affected findings have a fix." % (len(fixable), total))
+    if upgrades:
+        adv = "advisory" if cleared == 1 else "advisories"
+        line = "Upgrading %s clears %d %s" % (plural(upgrades, "package"), cleared, adv)
+        if no_fix:
+            has = "finding has" if len(no_fix) == 1 else "findings have"
+            line += "; %d %s no fix yet" % (len(no_fix), has)
+        lines.append(line + ".")
+    elif no_fix:
+        lines.append("No published fixes yet for any of the %s affected."
+                     % plural(len(no_fix), "finding"))
+    asides = []
+    if vexed:
+        asides.append("%d already answered by a vendor VEX statement, so not planned for"
+                      % vexed)
+    if undetermined:
+        asides.append("%d undetermined finding%s not shown; see the sections below"
+                      % (undetermined, "" if undetermined == 1 else "s"))
+    return lines, asides
+
+
+def upgrade_detail(u):
+    """The expanded row for one upgrade: every advisory it clears, worst first,
+    so the CLEARS count can be checked rather than trusted."""
+    advs = sorted(u["advisories"].values(), key=sort_key)
+    items = []
+    for f in advs:
+        badges = severity_badge(display_severity(f))
+        if priority_band(f) == BAND_KEV:
+            badges += " " + kev_badge(f)
+        items.append(
+            '<li><span class="origin">%s</span>%s<span>%s</span></li>'
+            % (advisory_link(short_advisory(f)), badges,
+               esc(f.get("id", "") if f.get("id") != short_advisory(f) else "")))
+    return (
+        '<dl class="detail-grid">'
+        "<dt>upgrade</dt><dd>%s <span class=\"muted\">&rarr;</span> %s</dd>"
+        "<dt>package</dt><dd>%s <span class=\"muted\">(%s)</span></dd>"
+        "</dl><ul class=\"evidence\">%s</ul>"
+        % (esc(u["current"]), esc(u["fixed_in"]), esc(u["pkg"]), esc(u["ecosystem"]),
+           "".join(items))
+    )
+
+
+def upgrade_table(plan):
+    show_eco = len({u["ecosystem"] for u in plan}) > 1
+    show_kev = any(u["kev"] for u in plan)
+
+    headers = ['<th class="expander"></th>']
+    if show_eco:
+        headers.append("<th>Ecosystem</th>")
+    headers += ["<th>Package</th>", "<th>Current</th>", "<th>Fixed in</th>",
+                '<th class="num" title="Distinct advisories this one upgrade clears">Clears</th>',
+                "<th>Severity</th>"]
+    if show_kev:
+        headers.append('<th title="Clears something in CISA\'s Known Exploited catalog">KEV</th>')
+    width = len(headers)
+
+    out = ['<div class="table-wrap"><table class="report-table"><thead><tr>%s</tr></thead>'
+           % "".join(headers)]
+    for u in plan:
+        cells = ['<td class="expander" aria-hidden="true">&#9656;</td>']
+        if show_eco:
+            cells.append('<td class="mono">%s</td>' % esc(u["ecosystem"]))
+        cells += [
+            '<td class="mono">%s</td>' % esc(u["pkg"]),
+            '<td class="mono">%s</td>' % esc(u["current"]),
+            '<td class="mono">%s</td>' % esc(u["fixed_in"]),
+            '<td class="num">%d</td>' % len(u["advisories"]),
+            '<td class="nowrap">%s</td>' % severity_badge(u["top_label"]),
+        ]
+        if show_kev:
+            cells.append('<td class="nowrap">%s</td>' % (
+                '<span class="kev">yes</span>' if u["kev"] else ""))
+        search = " ".join([u["pkg"], u["current"], u["fixed_in"], u["ecosystem"]]
+                          + list(u["advisories"].keys())).lower()
+        out.append(
+            '<tbody class="f-group" data-search="%s">'
+            '<tr class="f-row" tabindex="0" role="button" aria-expanded="false">%s</tr>'
+            '<tr class="f-detail" hidden><td colspan="%d">%s</td></tr>'
+            "</tbody>" % (esc(search), "".join(cells), width, upgrade_detail(u))
+        )
+    out.append("</table></div>")
+    return "".join(out)
+
+
+def render_remediation(res):
+    plan, fixable, no_fix, vexed, undetermined = build_fixplan(res)
+    if not fixable and not no_fix:
+        return ""
+
+    lines, asides = remediation_summary(fixable, no_fix, len(plan), vexed, undetermined)
+
+    summary = "".join('<p class="rem-line">%s</p>' % esc(l) for l in lines)
+    if asides:
+        summary += "".join('<p class="muted">(%s.)</p>' % esc(a) for a in asides)
+
+    body = [anchored(2, "Remediation", "remediation"),
+            '<div class="rem-summary">%s</div>' % summary]
+
+    if plan:
+        body.append(anchored(3, "Upgrade — apply these to clear the fixable findings",
+                             "remediation-upgrade"))
+        body.append(upgrade_table(plan))
+    if no_fix:
+        body.append(anchored(3, "No fix yet — affected, but no patch has shipped",
+                             "remediation-nofix"))
+        body.append(findings_table(sorted(no_fix, key=sort_key), False))
+    return "".join(body)
+
+
 def render_sections(findings):
     by_bucket = {key: [] for key, _, _ in SECTIONS}
     for f in findings:
@@ -1076,9 +1438,10 @@ CARD_NOTES = {
 }
 
 
-def render_cards(counts, link=True):
+def render_cards(counts, link=True, extra=""):
     """The four verdict totals. `link` is off on the fleet index, which has no
-    sections of its own to jump to."""
+    sections of its own to jump to. `extra` is appended as-is, for the single
+    target page's remediation card, which is an action rather than a verdict."""
     cards = []
     for key, title, _ in SECTIONS:
         n = counts.get(key, 0)
@@ -1090,7 +1453,7 @@ def render_cards(counts, link=True):
             '<div class="n">%d</div><div class="note">%s</div></%s>'
             % (tag, esc(key), attrs, esc(title), n, esc(CARD_NOTES[key]), tag)
         )
-    return '<div class="cards">%s</div>' % "".join(cards)
+    return '<div class="cards">%s%s</div>' % ("".join(cards), extra)
 
 
 def render_headline(res, counts):
@@ -1345,7 +1708,8 @@ def render_report(res, source_name, nav_href=None):
         "<h1>%s</h1>" % esc(target),
         '<p class="page-sub">%s</p>' % esc(sub),
         render_headline(res, counts),
-        render_cards(counts),
+        render_cards(counts, extra=remediation_card(res)),
+        render_remediation(res),
         filter_bar,
         '<div id="sections">%s</div>' % sections_html,
         render_coverage(res),
