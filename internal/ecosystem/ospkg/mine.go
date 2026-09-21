@@ -2,6 +2,7 @@ package ospkg
 
 import (
 	"strings"
+	"unicode"
 
 	"github.com/cwayne18/vexscan/internal/elfgraph"
 	"github.com/cwayne18/vexscan/internal/llm"
@@ -53,8 +54,8 @@ type symbolCheck struct {
 // checkSymbols applies the hallucination containment rule and then looks the
 // surviving symbols up in the package's export tables.
 //
-// The rule has two gates, and a hint that fails either is inert -- recorded as
-// an observation, never as a reason.
+// The rule has three gates, and a hint that fails any of them is inert --
+// recorded as an observation, never as a reason.
 //
 // The first gate is that a mined symbol must appear *literally* in the
 // advisory's own text. The model was instructed to extract rather than infer,
@@ -70,9 +71,18 @@ type symbolCheck struct {
 // "wholly_invented_thing" are equally absent from libssl, and only one of them
 // says anything about the build.
 //
-// What survives both gates is a name this advisory really used, drawn from the
-// namespace this package really exports. Its absence from the export table is
-// then a fact about which version was compiled, which is the whole point.
+// The third gate is that the absence has to be informative. The first two say
+// where the name came from; neither says the name is a function this build would
+// have exported, and that is the premise the conclusion actually rests on. A
+// struct tag, a build macro and a name the library exports under a different
+// ABI decoration all sit in the right namespace and are all absent from every
+// version ever built, so their absence is guaranteed rather than observed. See
+// informativeAbsence.
+//
+// What survives all three is a name this advisory really used, drawn from the
+// namespace this package really exports, whose absence is a fact about this
+// build rather than about the name. That absence is then a fact about which
+// version was compiled, which is the whole point.
 func (e evaluator) checkSymbols(adv *osv.Advisory, hints *llm.Hints, elfFiles []string) symbolCheck {
 	if hints == nil {
 		return symbolCheck{Why: "advisory mining was not run for this advisory"}
@@ -113,6 +123,21 @@ func (e evaluator) checkSymbols(adv *osv.Advisory, hints *llm.Hints, elfFiles []
 		return symbolCheck{Why: "no mined symbol (" + strings.Join(literal, ", ") +
 			") shares a namespace with anything " + e.st.pkg.Name + " exports, so its absence is not evidence"}
 	}
+
+	var informative []string
+	var uninformative []string
+	for _, s := range validated {
+		if why, ok := informativeAbsence(defined, s); ok {
+			informative = append(informative, s)
+		} else {
+			uninformative = append(uninformative, why)
+		}
+	}
+	if len(informative) == 0 {
+		return symbolCheck{Why: "no mined symbol's absence from " + e.st.pkg.Name +
+			" says anything about which version was built: " + strings.Join(uninformative, "; ")}
+	}
+	validated = informative
 
 	c := symbolCheck{Validated: validated, Usable: true}
 	for _, s := range validated {
@@ -180,6 +205,65 @@ func (e evaluator) symbols(elfFiles []string) (defined map[string]bool, importer
 		}
 	}
 	return defined, importers
+}
+
+// informativeAbsence reports whether a mined symbol's absence from defined says
+// anything about which version was built, and if not, why not.
+//
+// The namespace gate establishes that a name belongs to the right software. It
+// does not establish that the name is a *function this build would have
+// exported*, and that premise is the one the whole absence test rests on. Two
+// ways it fails, both observed against Rancher's images, and both of which
+// produce an absence that was guaranteed before the image was ever opened:
+//
+// A name that is not a function. A namespace is shared by far more than its
+// functions -- OSSL_CMP_CTX is a struct tag, OPENSSL_NO_COMP_ALG is a build
+// macro, SSL_OP_NO_RX_CERTIFICATE_COMPRESSION is an option constant, ASN1_TYPE
+// is a type -- and none of them appears in any symbol table, of any version,
+// ever. C spells these in upper case and has since it had a preprocessor, so
+// the absence of a lower-case letter is the signal. It costs the occasional
+// real all-caps export (MD5, SHA1) the chance to be ruled out, which is a lost
+// conclusion rather than a wrong one.
+//
+// A name the package exports under a different decoration. PCRE2 builds one
+// library per code unit width and suffixes every export accordingly, so an
+// advisory written about pcre2_compile is absent from libpcre2-8 -- which
+// exports pcre2_compile_8 -- no matter which version it is. Normalising that
+// suffix off both sides catches it: if the package exports the same function
+// under its own decoration, the function is there and the miss was ours.
+func informativeAbsence(defined map[string]bool, sym string) (string, bool) {
+	if !strings.ContainsFunc(sym, unicode.IsLower) {
+		return sym + " is spelled as a macro, constant or type rather than a function, " +
+			"and no build of any version exports one of those", false
+	}
+	if defined[sym] {
+		// Exported under its own name, so there is no absence to explain and
+		// nothing for this gate to say. The caller takes the Defined branch.
+		return "", true
+	}
+	base := undecorate(sym)
+	for d := range defined {
+		if undecorate(d) == base {
+			return sym + " is exported as " + d + ", so the package has the function and the " +
+				"name in the advisory is just the undecorated one", false
+		}
+	}
+	return "", true
+}
+
+// undecorate strips an ABI-width suffix, so pcre2_compile_8, pcre2_compile_32
+// and pcre2_compile all compare equal.
+func undecorate(sym string) string {
+	i := strings.LastIndexByte(sym, '_')
+	if i <= 0 || i == len(sym)-1 {
+		return sym
+	}
+	for _, r := range sym[i+1:] {
+		if !unicode.IsDigit(r) {
+			return sym
+		}
+	}
+	return sym[:i]
 }
 
 // advisoryText is everything the advisory says, for the literal-substring gate.
