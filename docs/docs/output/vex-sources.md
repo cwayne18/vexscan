@@ -108,16 +108,26 @@ they do not compile, or fixed it in a point release whose version an upstream OS
 range does not know about. Both are false positives that a version match — and
 vexscan's own OSV lookup — still flags.
 
+**SUSE's feed runs by default.** For a SUSE Linux Enterprise image — including
+the SLE BCI base images the RKE2 and K3s hardened builds sit on — the CSAF-VEX
+feed is consulted without a flag, because it is safe to consult unasked: it
+speaks only for the SUSE family (so it declines every other image and never
+touches the network for one), and it can only ever move a false positive out of
+`AFFECTED`, never invent a clean. `--distro-feeds` additionally turns on the
+feeds that are still opt-in — Debian's tracker today — and `--distro-feeds=false`
+consults none, for an air-gapped run that wants no network at all.
+
 ```sh
-vexscan --image debian:12 --all --distro-feeds
+vexscan --image registry.suse.com/bci/bci-base:15.5 --all   # SUSE feed already on
+vexscan --image debian:12 --all --distro-feeds              # add the opt-in feeds
 ```
 
 Today this reads the [Debian security
 tracker](https://security-tracker.debian.org/tracker/) for Debian images
-(`ID=debian`) and SUSE's CSAF-VEX feed for the SUSE Linux Enterprise family
-including BCI (`ID=sles` and kin — see below); Ubuntu, Alpine and Red Hat track
-security in separate databases and will be separate feeds. Two verdicts, and only
-two, move a row:
+(`ID=debian`, with `--distro-feeds`) and SUSE's CSAF-VEX feed for the SUSE Linux
+Enterprise family including BCI (`ID=sles` and kin — see below, on by default);
+Ubuntu, Alpine and Red Hat track security in separate databases and will be
+separate feeds. Two verdicts, and only two, move a row:
 
 - **not-affected** — the tracker's `fixed_version: "0"` for the image's release,
   meaning Debian's build never contained the flaw.
@@ -142,8 +152,9 @@ false positive sitting in `AFFECTED`, never invent a clean.
 The tracker's bulk JSON is large, so the feed is streamed and filtered to the
 handful of source packages the scan actually asked about rather than held in
 memory whole. If the download is truncated or malformed the whole feed is
-rejected — a short read never partially clears findings. It is off by default
-because it is a network fetch; `--distro-feeds` turns it on.
+rejected — a short read never partially clears findings. The opt-in feeds are
+off by default because they are a network fetch; `--distro-feeds` turns them on,
+and `--distro-feeds=false` turns off the SUSE feed that is otherwise on.
 
 **Known limitation: package provenance.** The feed is keyed by the image's
 `VERSION_ID` (e.g. Debian 12 → bookworm), so a verdict is read from that

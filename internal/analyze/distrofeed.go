@@ -188,6 +188,20 @@ func isOSPackage(f Finding) bool {
 	return f.Ecosystem == "os"
 }
 
+// anyOSPackage reports whether the scan produced a single OS-package finding.
+// It is what gates the distro-feed pass: with SUSE's feed on by default, a scan
+// that found no OS package -- a language-only image, a scratch image -- must not
+// pay a feed's os-release read or its warning for a lookup that would match
+// nothing.
+func anyOSPackage(findings []Finding) bool {
+	for i := range findings {
+		if isOSPackage(findings[i]) {
+			return true
+		}
+	}
+	return false
+}
+
 // preferVendorScores overrides each finding's Severity and CVSS with a preferred
 // vendor's own score, in place, wherever --prefer-vendor named a vendor that
 // scored one of the finding's CVEs.

@@ -871,7 +871,13 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 		preferVendorScores(ctx, opts.VendorScorers, result.Findings, sets.All, logf)
 	}
 	var distroOS *OSInfo
-	if len(opts.DistroFeeds) > 0 {
+	// Only when there is an OS-package finding for a feed to speak to. The SUSE
+	// feed is on by default now, so this guard is what keeps that default free:
+	// an image with no OS findings -- a scratch image, a pure language image --
+	// reads no os-release and logs nothing, rather than warning about a missing
+	// one for a feed it was never going to consult.
+	feedsApply := len(opts.DistroFeeds) > 0 && anyOSPackage(result.Findings)
+	if feedsApply {
 		distroOS = readOSInfo(img.FS, logf)
 	}
 	// Filtering here, rather than in the renderer, is what keeps every count
@@ -889,7 +895,7 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	// the ones that cost money or count rows. See fixedOnlyFilter.
 	result.Findings, result.WithheldUnfixed = fixedOnlyFilter(result.Findings, opts.FixedOnly)
 	result.VEXHubs = vexOverlay(ctx, opts.VEXHubs, result.Findings, run.resolver.aliases(), logf)
-	if len(opts.DistroFeeds) > 0 {
+	if feedsApply {
 		// After vexOverlay so a user's --vexhub outranks an automatic feed, and
 		// read from the tree the plugins already walked.
 		//
