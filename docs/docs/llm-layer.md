@@ -42,6 +42,31 @@ a file list that had to be reconstructed rather than read. Both are cases where
 "the module is not here" could equally mean "we did not look in the right
 place".
 
+The OS validation adds a **shape** gate, for the same reason the Java one below
+does. A namespace is shared by far more than its functions, so passing the
+namespace check is not evidence that the name is something a symbol table would
+ever have held. Two kinds get refused:
+
+- **Names that are not functions.** `OSSL_CMP_CTX` is a struct tag,
+  `OPENSSL_NO_COMP_ALG` is a build macro, `SSL_OP_NO_RX_CERTIFICATE_COMPRESSION`
+  is an option constant. All three sit in a namespace libcrypto really exports
+  and none of them is in any build's symbol table, so their absence is
+  guaranteed rather than observed. C spells these in upper case, so a name with
+  no lower-case letter is refused. The cost is that a genuinely all-caps export
+  like `MD5` can no longer be ruled out — a lost conclusion, not a wrong one.
+- **Names the package exports under a different decoration.** PCRE2 ships one
+  library per code-unit width and suffixes every export, so an advisory written
+  about `pcre2_compile` is absent from `libpcre2-8-0` — which exports
+  `pcre2_compile_8` — in every version ever built. Normalising the width suffix
+  off both sides catches it.
+
+Both were found by running a real miner against Rancher's RKE2 v1.36.0 images
+and auditing every rule-out it produced. Without this gate, eleven package rows
+across four of them were cleared on the strength of a struct tag, a build macro,
+an option constant, a type name or a code-unit suffix. Three CVEs left their
+reports entirely — the clearing hit every row they appeared on — and two more
+survived only because a sibling package row happened to stay open.
+
 The Java validation adds two gates of its own. A mined name must be **shaped
 like a class** — a dotted name whose last segment is capitalised — because there
 is no `doLookup.class` and concluding absence from a method name's absence would

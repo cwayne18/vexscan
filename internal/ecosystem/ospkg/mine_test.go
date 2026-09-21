@@ -62,6 +62,12 @@ func minedELF() fakeELF {
 // returns the finding for the openssl component.
 func mined(t *testing.T, p *Plugin, img *target.Image, adv *osv.Advisory, hints *llm.Hints) ecosystem.Finding {
 	t.Helper()
+	return minedModule(t, p, img, adv, hints, "openssl")
+}
+
+// minedModule is mined for an image whose package is not openssl.
+func minedModule(t *testing.T, p *Plugin, img *target.Image, adv *osv.Advisory, hints *llm.Hints, module string) ecosystem.Finding {
+	t.Helper()
 	ctx := context.Background()
 
 	if ok, err := p.DetectImage(ctx, img); err != nil || !ok {
@@ -90,11 +96,11 @@ func mined(t *testing.T, p *Plugin, img *target.Image, adv *osv.Advisory, hints 
 		t.Fatal(err)
 	}
 	for _, f := range findings {
-		if f.Module == "openssl" {
+		if f.Module == module {
 			return f
 		}
 	}
-	t.Fatal("no finding for openssl")
+	t.Fatalf("no finding for %s", module)
 	return ecosystem.Finding{}
 }
 
@@ -730,5 +736,198 @@ func TestDlopenStillWithholdsTheImportAbsentAnswer(t *testing.T) {
 	}
 	if got := blockingEvidence(f); len(got) == 0 {
 		t.Error("the answer was withheld without saying what withheld it")
+	}
+}
+
+// The third gate, against the names that actually got through the first two.
+//
+// Every row here was a real vulnerable_code_not_present on a Rancher RKE2
+// image: the mined name sat in a namespace the package exports, so the
+// namespace gate passed it, and it was absent from the export table because it
+// is not the kind of thing that ever appears in one. Two of these -- the struct
+// tag and the build macro -- took their CVE out of the report entirely, because
+// the same name was mined against both libcrypto3 and libssl3 and cleared both.
+func TestAnAbsenceGuaranteedByTheNameIsNotEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		exports []string
+		text    string
+		symbol  string
+		want    string
+	}{
+		{
+			// ALPINE-CVE-2026-63074. OSSL_CMP_CTX is the context struct; the
+			// functions are OSSL_CMP_CTX_new and friends.
+			name:    "a struct tag",
+			exports: []string{"OSSL_CMP_CTX_new", "OSSL_CMP_CTX_free"},
+			text:    "A flaw in OSSL_CMP_CTX handling allows a double free.",
+			symbol:  "OSSL_CMP_CTX",
+			want:    "macro, constant or type",
+		},
+		{
+			// ALPINE-CVE-2025-66199. The advisory names the build flag that
+			// *disables* the vulnerable code, so concluding from its absence
+			// does not merely prove nothing, it points the wrong way.
+			name:    "a build macro",
+			exports: []string{"OPENSSL_init_ssl", "OPENSSL_malloc"},
+			text:    "Builds configured with OPENSSL_NO_COMP_ALG are unaffected.",
+			symbol:  "OPENSSL_NO_COMP_ALG",
+			want:    "macro, constant or type",
+		},
+		{
+			// Same advisory, the other name it offered.
+			name:    "an option constant",
+			exports: []string{"SSL_new", "SSL_free"},
+			text:    "Peers may negotiate compression unless SSL_OP_NO_RX_CERTIFICATE_COMPRESSION is set.",
+			symbol:  "SSL_OP_NO_RX_CERTIFICATE_COMPRESSION",
+			want:    "macro, constant or type",
+		},
+		{
+			// ALPINE-CVE-2026-28388, which stayed in the report only because a
+			// sibling package happened to carry it.
+			name:    "a flag constant",
+			exports: []string{"X509_verify_cert", "X509_V_FLAG_CRL_CHECK"},
+			text:    "Certificates are mis-validated when X509_V_FLAG_USE_DELTAS is set.",
+			symbol:  "X509_V_FLAG_USE_DELTAS",
+			want:    "macro, constant or type",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := New(Options{
+				Mine:    true,
+				ReadELF: minedELF().read,
+				ReadSymbols: newSyms(map[string]syms{
+					"/usr/lib/libssl.so.3": {defined: tc.exports},
+					"/usr/bin/app":         {undefined: []string{tc.exports[0]}},
+				}).read,
+			})
+
+			f := mined(t, p, minedImage(t), advisory(tc.text), &llm.Hints{Symbols: []string{tc.symbol}})
+
+			if f.Status == ecosystem.StatusNotPresent {
+				t.Errorf("status = not_present: a name no build exports was read as a missing function")
+			}
+			if f.Method == MethodDynsymAbsent {
+				t.Errorf("method = %s, want the dynsym conclusion withheld", f.Method)
+			}
+			why := strings.Join(evidenceFrom(f, MethodMined), " ")
+			if !strings.Contains(why, tc.want) {
+				t.Errorf("the refusal is not explained: %q", why)
+			}
+			if !strings.Contains(why, tc.symbol) {
+				t.Errorf("the refusal does not name the symbol it rejected: %q", why)
+			}
+		})
+	}
+}
+
+// pcre2Image is a package that suffixes every export with its code-unit width,
+// which is how PCRE2, PCRE and ICU all ship.
+func pcre2Image(t *testing.T) *target.Image {
+	t.Helper()
+	return debianImage(t,
+		target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}},
+		[]debPkg{{name: "libpcre2-8-0", version: "10.42-1", source: "pcre2",
+			files: []string{"/usr/lib/libpcre2-8.so.0"}}},
+		map[string]string{"/usr/bin/app": ""})
+}
+
+func pcre2ELF() fakeELF {
+	return fakeELF{
+		"/usr/bin/app":             exe("libpcre2-8.so.0"),
+		"/usr/lib/libpcre2-8.so.0": lib("libpcre2-8.so.0"),
+	}
+}
+
+// SUSE-SU-2026:4241-1, which vanished from the hardened-calico report.
+//
+// The 8-bit build exports pcre2_compile_8. An advisory written about
+// pcre2_compile_32, or about the undecorated pcre2_dfa_match that the
+// documentation uses, is absent from it for a reason that has nothing to do
+// with which version was compiled -- and would be absent from every version.
+func TestAnAbsenceExplainedByABIDecorationIsNotEvidence(t *testing.T) {
+	for _, tc := range []struct{ name, symbol, text string }{
+		{"the wrong code-unit width", "pcre2_compile_32",
+			"A flaw in pcre2_compile_32 allows an out-of-bounds read."},
+		{"the undecorated documentation name", "pcre2_dfa_match",
+			"A flaw in pcre2_dfa_match allows an out-of-bounds read."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := New(Options{
+				Mine:    true,
+				ReadELF: pcre2ELF().read,
+				ReadSymbols: newSyms(map[string]syms{
+					"/usr/lib/libpcre2-8.so.0": {defined: []string{
+						"pcre2_compile_8", "pcre2_dfa_match_8", "pcre2_match_8"}},
+					"/usr/bin/app": {undefined: []string{"pcre2_match_8"}},
+				}).read,
+			})
+
+			f := minedModule(t, p, pcre2Image(t), advisory(tc.text),
+				&llm.Hints{Symbols: []string{tc.symbol}}, "pcre2")
+
+			if f.Status == ecosystem.StatusNotPresent || f.Method == MethodDynsymAbsent {
+				t.Errorf("status/method = %s/%s: a decoration mismatch was read as a missing function",
+					f.Status, f.Method)
+			}
+			why := strings.Join(evidenceFrom(f, MethodMined), " ")
+			if !strings.Contains(why, "undecorated") {
+				t.Errorf("the refusal is not explained: %q", why)
+			}
+		})
+	}
+}
+
+// The gate must not eat the case the layer exists for. A lower-case name that
+// the package does not export under any decoration is still a fact about the
+// build, and TestASymbolTheLibraryDoesNotExportIsNotPresent is the other half
+// of this: it asserts the conclusion is still reached.
+func TestUndecorateLeavesOrdinaryNamesAlone(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"pcre2_compile_8", "pcre2_compile"},
+		{"pcre2_compile_32", "pcre2_compile"},
+		{"pcre2_compile", "pcre2_compile"},
+		{"SSL_free_buffers", "SSL_free_buffers"},
+		{"d2i_X509", "d2i_X509"},
+		{"BIO_free", "BIO_free"},
+		{"sqlite3_open_v2", "sqlite3_open_v2"},
+		{"foo_", "foo_"},
+		{"_8", "_8"},
+	} {
+		if got := undecorate(tc.in); got != tc.want {
+			t.Errorf("undecorate(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// The decoration check must not fire on a symbol the package actually exports.
+//
+// A library that ships both the undecorated name and a width-suffixed alias --
+// pcre2_compile alongside pcre2_compile_8 -- would otherwise have the alias
+// explain away an absence that is not happening: the advisory's name is right
+// there in the export table. There is no absence to be uninformative about, so
+// the check has to stand down before it looks for a decorated twin.
+func TestADecoratedTwinDoesNotMaskAnExportedSymbol(t *testing.T) {
+	p := New(Options{
+		Mine:    true,
+		ReadELF: pcre2ELF().read,
+		ReadSymbols: newSyms(map[string]syms{
+			"/usr/lib/libpcre2-8.so.0": {defined: []string{"pcre2_compile", "pcre2_compile_8"}},
+			// Nothing imports it, so reaching the Defined branch is observable
+			// as the import-absent note.
+			"/usr/bin/app": {undefined: []string{"pcre2_match_8"}},
+		}).read,
+	})
+
+	f := minedModule(t, p, pcre2Image(t),
+		advisory("A flaw in pcre2_compile allows an out-of-bounds read."),
+		&llm.Hints{Symbols: []string{"pcre2_compile"}}, "pcre2")
+
+	why := strings.Join(evidenceFrom(f, MethodMined), " ")
+	if strings.Contains(why, "undecorated") {
+		t.Errorf("an exported symbol was explained away as a decoration artifact: %q", why)
+	}
+	if got := evidenceFrom(f, MethodImportAbsent); len(got) != 1 {
+		t.Errorf("the Defined branch was not reached: mined evidence = %q, import-absent = %v", why, got)
 	}
 }

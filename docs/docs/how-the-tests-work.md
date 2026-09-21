@@ -306,11 +306,14 @@ evidence: /app/server is a cgo binary, but its static symbol table carries the S
           linked into it
 ```
 
-The namespace gate is the whole of the safety here, and it is the same
-open-world rule the mined-symbol layer uses: a function absent from a table that
-never mentions its library family says nothing — the family may be there under
+The namespace gate does most of the safety here, and it is the same open-world
+rule the mined-symbol layer uses: a function absent from a table that never
+mentions its library family says nothing — the family may be there under
 localised or stripped names — so a *wholly* absent namespace stays blocking, not
-discharged. This continues the [pure-Go discharge](#taints) (#24) toward the
+discharged. It is not sufficient on its own, though, and the
+[shape gate](./llm-layer.md) that backs it up applies here too: this path
+consumes the same validated symbols, so a name that is not a function never
+reaches it. This continues the [pure-Go discharge](#taints) (#24) toward the
 same end as [issue #23](https://github.com/cwayne18/vexscan/issues/23):
 maximizing the removals a scan can make with certainty, and making no other
 kind.
