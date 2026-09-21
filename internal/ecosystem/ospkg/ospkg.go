@@ -644,6 +644,7 @@ func (p *Plugin) AnalyzeImage(_ context.Context, img *target.Image, items []ecos
 			out = append(out, ev.evaluate(item.Component, req))
 		}
 	}
+	p.suggestRoots(g, out)
 	return out, nil
 }
 
