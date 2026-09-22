@@ -19,7 +19,7 @@ The JSON is `schema_version: 2`:
   "ecosystems": [ { "id": "os", "components": 65, "error": "" } ],
   "unreadable": { "count": 3, "paths": ["/opt/vendor"] },  // omitted when nothing was skipped
   "vex_hubs": [ { "url": "...", "author": "...", "products": 1082, "matched": 3 } ],  // only with --vexhub
-  "distro_feeds": [ { "name": "Debian Security Tracker", "matched": 4, "cleared": 4 } ],  // only with --distro-feeds
+  "distro_feeds": [ { "name": "SUSE Security Team", "matched": 4, "cleared": 4 } ],  // SUSE by default on a SUSE image; other feeds with --distro-feeds
   "triage": {  // only with --triage
     "epss_date": "2026-08-04", "kev_date": "2026.08.04",  // the feeds' own dates, not today's
     "epss_stale": true, "kev_stale": true,   // a cached copy was used; omitted when false

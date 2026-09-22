@@ -95,7 +95,7 @@ func main() {
 		colorMode   = flag.String("color", "auto", "colourise the text report: auto, always, never")
 		quiet       = flag.Bool("quiet", false, "suppress progress logging on stderr")
 		noPager     = flag.Bool("no-pager", false, "never page the output, even when stdout is a terminal")
-		distroFeeds = flag.Bool("distro-feeds", false, "clear OS-package false positives with the distribution's own security feed (Debian, SUSE; network, off by default)")
+		distroFeeds = flag.Bool("distro-feeds", false, "also consult the opt-in distribution feeds (Debian today); SUSE's CSAF-VEX runs by default for SUSE images, pass --distro-feeds=false to consult none (network)")
 	)
 	flag.Var(&preferVendors, "prefer-vendor", "favour this vendor's own CVSS score over the OSV-derived one, e.g. 'suse'; repeatable for priority, can lower a rating (network)")
 	flag.Usage = usage
@@ -254,7 +254,21 @@ func main() {
 	// --prefer-vendor and --distro-feeds both draw on the same vendor sources, so
 	// they are resolved together: distroSources shares one provider instance per
 	// vendor between them and reports any --prefer-vendor name it cannot score.
-	distroFeedProviders, vendorScorers := distroSources(*distroFeeds, preferVendors)
+	//
+	// SUSE's CSAF-VEX feed runs by default for the SUSE Linux Enterprise family:
+	// it never rewrites a status, only moves a vendor-cleared row to ALREADY
+	// VEXED, and an unreachable feed leaves every finding exactly where the local
+	// scan put it -- so consulting it costs a SUSE image nothing but false
+	// positives it can retire, and costs any other image nothing at all because
+	// the provider declines to speak for one. An explicit --distro-feeds=false
+	// opts out of every feed, for an air-gapped run that wants no network.
+	suseByDefault := true
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "distro-feeds" && !*distroFeeds {
+			suseByDefault = false
+		}
+	})
+	distroFeedProviders, vendorScorers := distroSources(*distroFeeds, suseByDefault, preferVendors)
 
 	// The two advisory-source flags name the same thing twice, and honouring
 	// both would mean silently picking one -- on a flag whose whole purpose is
@@ -598,6 +612,15 @@ func triageLoader(on bool) *triage.Loader {
 // favours a vendor's own CVSS score. It returns the feed providers the first
 // turns on and the scorers the second names, in --prefer-vendor priority order.
 //
+// SUSE's feed is not gated on --distro-feeds. suseByDefault carries it: it is
+// true on an ordinary run and false only when the user typed --distro-feeds=false
+// to silence every feed. SUSE runs by default because the feed is safe to
+// consult unasked -- it Handles the SUSE Linux Enterprise family alone, so it is
+// a no-op (and touches no network) on any other image, and it can only ever move
+// a false positive out of AFFECTED, never invent a clean. --distro-feeds adds the
+// feeds that are still opt-in because they are not yet in this position, Debian's
+// tracker today.
+//
 // The two are built together so a vendor consulted by both is a single instance,
 // which matters because the SUSE provider caches the CSAF documents it reads: a
 // scan run with `--distro-feeds --prefer-vendor suse` then downloads each
@@ -606,7 +629,7 @@ func triageLoader(on bool) *triage.Loader {
 // A --prefer-vendor name for a vendor that publishes no score vexscan can read is
 // reported and dropped rather than silently ignored: today only SUSE does, so
 // `--prefer-vendor debian` says so instead of quietly changing nothing.
-func distroSources(feedsOn bool, prefer []string) ([]distrofeed.Provider, []distrofeed.Scorer) {
+func distroSources(feedsOn, suseByDefault bool, prefer []string) ([]distrofeed.Provider, []distrofeed.Scorer) {
 	// One instance per vendor, shared between the two lists.
 	suseP := suse.New()
 
@@ -626,13 +649,16 @@ func distroSources(feedsOn bool, prefer []string) ([]distrofeed.Provider, []dist
 		}
 	}
 
+	// Each feed is keyed to the os-release it Handles, so an image only ever
+	// consults the one that speaks for it: Debian's security tracker for
+	// Debian, SUSE's CSAF-VEX for the SUSE Linux Enterprise family (including
+	// SLE BCI images). Red Hat CSAF and Alpine secdb join as they land.
 	var feeds []distrofeed.Provider
 	if feedsOn {
-		// Each feed is keyed to the os-release it Handles, so an image only ever
-		// consults the one that speaks for it: Debian's security tracker for
-		// Debian, SUSE's CSAF-VEX for the SUSE Linux Enterprise family (including
-		// SLE BCI images). Red Hat CSAF and Alpine secdb join as they land.
-		feeds = []distrofeed.Provider{debian.New(), suseP}
+		feeds = append(feeds, debian.New())
+	}
+	if feedsOn || suseByDefault {
+		feeds = append(feeds, suseP)
 	}
 	return feeds, scorers
 }
