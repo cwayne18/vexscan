@@ -98,7 +98,7 @@ func selectProposals(results []*analyze.Result, timestamp string) (proposals []P
 			if !ruledOut(f) {
 				continue
 			}
-			c, ok := claimFor(f, timestamp)
+			c, ok := claimFor(f, timestamp, res.Runtime)
 			if !ok {
 				skipped++
 				continue
@@ -139,7 +139,7 @@ func ruledOut(f analyze.Finding) bool {
 
 // claimFor builds the claim a ruled-out finding becomes, or reports ok=false
 // when the finding lacks what a matchable statement needs.
-func claimFor(f analyze.Finding, timestamp string) (Claim, bool) {
+func claimFor(f analyze.Finding, timestamp string, rt *analyze.RuntimeAssertion) (Claim, bool) {
 	if f.Product == "" || f.PURL == "" {
 		return Claim{}, false
 	}
@@ -147,16 +147,40 @@ func claimFor(f analyze.Finding, timestamp string) (Claim, bool) {
 	if name == "" {
 		return Claim{}, false
 	}
+	just := justification(f)
 	return Claim{
 		Vuln:          name,
 		Aliases:       aliases,
 		Product:       f.Product,
 		Subcomponent:  f.PURL,
 		Status:        StatusNotAffected,
-		Justification: justification(f),
-		Impact:        impact(f),
+		Justification: just,
+		Impact:        impact(f, conditionOn(just, rt)),
 		Timestamp:     timestamp,
 	}, true
+}
+
+// conditionOn returns the runtime assertion a claim with this justification
+// actually rests on, or nil when the claim stands without one.
+//
+// Only the execute-path conclusion is conditional. --roots and the policy flags
+// change the closure -- where execution starts, and which taints are allowed to
+// withhold -- so a statement that the vulnerable code is not on the execute path
+// is true relative to what the user said the image runs. The other two
+// justifications are not: whether the package is installed, and whether its own
+// objects define the advisory's function, are read out of the image and out of
+// the package's symbol tables, and no assertion about the entrypoint moves
+// either.
+//
+// Attaching the condition to all three would be the easy thing and the wrong
+// one. A reader who sees it on every statement learns to skip it, which is the
+// same outcome as not writing it -- and it would be inaccurate besides, since it
+// would claim a dependency that is not there.
+func conditionOn(justification string, rt *analyze.RuntimeAssertion) *analyze.RuntimeAssertion {
+	if justification != "vulnerable_code_not_in_execute_path" {
+		return nil
+	}
+	return rt
 }
 
 // vulnIDs is the id a statement is filed under and the aliases it is also known
@@ -219,7 +243,14 @@ func justification(f analyze.Finding) string {
 
 // impact is the human sentence that explains, to whoever reviews the PR, how
 // vexscan reached the verdict for this finding.
-func impact(f analyze.Finding) string {
+//
+// When the verdict rests on something the user asserted rather than on the image
+// alone, the assertion is written into the same sentence. It goes last and it
+// goes in full: whoever reviews the pull request this statement lands in is the
+// person best placed to say "that is not how we run it", and they can only say
+// so if the condition is in front of them. A statement that hides its condition
+// is not a weaker statement, it is an unfalsifiable one.
+func impact(f analyze.Finding, rt *analyze.RuntimeAssertion) string {
 	var b strings.Builder
 	b.WriteString("Ruled out by vexscan")
 	if f.Method != "" {
@@ -230,6 +261,9 @@ func impact(f analyze.Finding) string {
 			fmt.Fprintf(&b, ": %s", e.Detail)
 			break
 		}
+	}
+	if s := rt.Sentence(); s != "" {
+		fmt.Fprintf(&b, ". Conditional: %s", s)
 	}
 	return b.String()
 }

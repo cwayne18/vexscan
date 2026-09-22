@@ -2197,3 +2197,43 @@ func TestTheUncomparableCaveatIsAbsentWhenVersionsCompare(t *testing.T) {
 		t.Errorf("a report with comparable versions carried the uncomparable caveat:\n%s", out)
 	}
 }
+
+// A report whose RULED OUT rows rest on what the user asserted must say so, in
+// the caveats -- which writeFooter repeats -- rather than in the provenance line.
+// The assertion is not a fact about the run, it is a condition on the rows, and a
+// reader who scrolls past the top of a long report still needs it.
+func TestRuntimeAssertionIsACaveat(t *testing.T) {
+	res := &analyze.Result{
+		SchemaVersion: analyze.SchemaVersion, Target: "rancher/hardened-calico:v3.32.0", Mode: "image",
+		Runtime: &analyze.RuntimeAssertion{
+			Roots:          []string{"/usr/bin/calico-node"},
+			Profile:        "calico",
+			ExecAssumeNone: true,
+		},
+	}
+	// Long enough that the footer fires, which is the case the repetition exists
+	// for: on a real Rancher image this section is sixty rows and the header
+	// scrolled away a screen ago.
+	for i := 0; i < footerThreshold; i++ {
+		res.Findings = append(res.Findings, analyze.Finding{
+			CVE: fmt.Sprintf("CVE-2026-%04d", i), Package: "a",
+			Status: analyze.StatusNotInPath, Severity: "HIGH",
+		})
+	}
+	out := renderText(res, renderOpts{})
+	if !strings.Contains(out, "conditional") || !strings.Contains(out, `"calico"`) ||
+		!strings.Contains(out, "/usr/bin/calico-node") {
+		t.Errorf("the runtime assertion is not in the report:\n%s", out)
+	}
+	// Repeated, like every other caveat, so the bottom of a long report carries
+	// it too.
+	if n := strings.Count(out, "/usr/bin/calico-node"); n < 2 {
+		t.Errorf("the assertion appeared %d time(s), want it in the header and the footer:\n%s", n, out)
+	}
+
+	// And absent entirely when nothing was asserted.
+	res.Runtime = nil
+	if out := renderText(res, renderOpts{}); strings.Contains(out, "conditional") {
+		t.Errorf("an unasserted run printed a condition:\n%s", out)
+	}
+}

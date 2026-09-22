@@ -228,3 +228,99 @@ func TestDedupeEntriesKeepsAssertions(t *testing.T) {
 		t.Errorf("order changed: %v", entryRefs(got))
 	}
 }
+
+// A fleet list whose images repeat the same three shapes should say each shape
+// once. The profile supplies the defaults; the line overrides what is different
+// about its own image; the name rides along so a conclusion can say which
+// profile it rests on.
+func TestParseImageListProfiles(t *testing.T) {
+	got, err := parseImageList(`
+[profile go-daemon] exec-policy=assume-none
+[profile calico]    roots=/usr/bin/calico-node exec-policy=assume-none   # the one with a CNI plugin dir
+
+docker.io/rancher/hardened-calico:v3.32.0 profile=calico
+docker.io/rancher/hardened-coredns:v1.11.1 profile=go-daemon roots=/coredns
+docker.io/rancher/hardened-etcd:v3.5.13 profile=go-daemon
+alpine:3.20
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"docker.io/rancher/hardened-calico:v3.32.0",
+		"docker.io/rancher/hardened-coredns:v1.11.1",
+		"docker.io/rancher/hardened-etcd:v3.5.13",
+		"alpine:3.20",
+	}
+	if !equalStrings(entryRefs(got), want) {
+		t.Fatalf("refs = %v, want %v", entryRefs(got), want)
+	}
+
+	calico := got[0].assert
+	if calico == nil || !equalStrings(calico.Roots, []string{"/usr/bin/calico-node"}) {
+		t.Errorf("calico roots = %+v, want the profile's", calico)
+	}
+	if calico.Profile != "calico" {
+		t.Errorf("calico profile name = %q, want calico", calico.Profile)
+	}
+
+	// The line's own roots replace the profile's rather than adding to them: a
+	// line that names what it runs is a complete statement about that image.
+	coredns := got[1].assert
+	if coredns == nil || !equalStrings(coredns.Roots, []string{"/coredns"}) {
+		t.Errorf("coredns roots = %+v, want only its own", coredns)
+	}
+	if coredns.ExecPolicy == nil || *coredns.ExecPolicy != elfgraph.ExecAssumeNone {
+		t.Errorf("coredns lost the profile's exec-policy: %+v", coredns)
+	}
+	if coredns.Profile != "go-daemon" {
+		t.Errorf("coredns profile name = %q, want go-daemon", coredns.Profile)
+	}
+
+	// A profile that asserts only a policy contributes only that policy. It must
+	// not acquire roots from the line above it that happened to name some.
+	etcd := got[2].assert
+	if etcd == nil || etcd.Roots != nil {
+		t.Errorf("etcd roots = %+v, want none from a roots-less profile", etcd)
+	}
+	if got[3].assert != nil {
+		t.Errorf("a bare line picked up an assertion: %+v", got[3].assert)
+	}
+}
+
+// Every way of being wrong about a profile is an error before anything is
+// pulled, for the reason an unknown key already is: failing closed still leaves
+// the user believing they asked for something they did not.
+func TestParseImageListProfileErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		list string
+	}{
+		{"used but never defined", "alpine:3.20 profile=nope\n"},
+		{"defined twice", "[profile a] exec-policy=assume-none\n[profile a] roots=/x\nalpine:3.20 profile=a\n"},
+		{"asserts nothing", "[profile a]\nalpine:3.20 profile=a\n"},
+		{"no closing bracket", "[profile a exec-policy=assume-none\n"},
+		{"names no profile", "[profile ] exec-policy=assume-none\n"},
+		{"unknown key inside", "[profile a] roots=/x bogus=1\nalpine:3.20 profile=a\n"},
+		{"bad value inside", "[profile a] exec-policy=maybe\nalpine:3.20 profile=a\n"},
+		{"empty profile name on a line", "alpine:3.20 profile=\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := parseImageList(tc.list); err == nil {
+				t.Error("parseImageList accepted it")
+			}
+		})
+	}
+}
+
+// A profile defined after the images that use it is the natural layout for a
+// list that grew one odd image at a time, and there is no reason to reject it.
+func TestParseImageListProfileDefinedLater(t *testing.T) {
+	got, err := parseImageList("alpine:3.20 profile=late\n[profile late] roots=/bin/busybox\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].assert == nil || !equalStrings(got[0].assert.Roots, []string{"/bin/busybox"}) {
+		t.Errorf("parseImageList = %+v", got)
+	}
+}
