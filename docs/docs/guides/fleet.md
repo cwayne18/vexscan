@@ -58,6 +58,7 @@ rancher/nginx-ingress-controller:v1.10.4-hardened3 roots=/nginx-ingress-controll
 | `exec-policy=` | `taint` or `assume-none` |
 | `dlopen-policy=` | `taint` or `assume-none` |
 | `dynamic-import-policy=` | `taint` or `assume-none` |
+| `profile=` | the name of a `[profile ...]` block to take these keys from; see [Named profiles](#named-profiles) |
 
 A key the line does not mention inherits the global flag, so a list can loosen
 one image and leave the rest alone — or tighten one back to `taint` under a
@@ -69,6 +70,47 @@ quietly skipped: skipping fails closed, but it leaves you believing you asked
 for something you did not. And an image named twice where either line carries
 assertions is an error too — that is not a repeat, it is the list saying the
 image runs two different things, and there is no safe way to pick one.
+
+### Named profiles
+
+A real fleet is a hundred images whose deployment shapes repeat: a hardened Go
+daemon with one entrypoint, a supervisor wrapped in a shell, a CLI that execs
+nothing. Spelling the same `exec-policy=assume-none` out on sixty lines makes
+the list unmaintainable, and — worse — makes it *drift*, as half the lines get
+updated and the other half keep asserting something that stopped being true.
+
+A profile is the same assertion said once:
+
+```
+[profile go-daemon] exec-policy=assume-none
+[profile calico]    roots=/usr/bin/calico-node exec-policy=assume-none
+
+docker.io/rancher/hardened-calico:v3.32.0-build20260511   profile=calico
+docker.io/rancher/hardened-coredns:v1.11.1-build20240910  profile=go-daemon roots=/coredns
+docker.io/rancher/hardened-etcd:v3.5.21-build20250612     profile=go-daemon
+```
+
+A `[profile NAME]` line takes exactly the keys an image line takes, minus
+`profile=` itself. Definitions are collected before any image line is read, so a
+list can keep its profiles at the bottom, or put one beside the odd image it
+exists for, rather than being forced into define-before-use order.
+
+A key stated on the image line wins over the same key in the profile it names,
+so `profile=go-daemon roots=/coredns` is the daemon policy with this image's own
+root. The `roots=` rule is unchanged: the first `roots=` on a line clears
+whatever the profile supplied rather than adding to it, and later `roots=` on
+that same line append.
+
+The name is carried onto the scan, into the report, and into the emitted VEX, so
+a conclusion that rests on a profile says which one — `under the asserted
+runtime profile "calico"`. That is the point of naming a profile rather than
+expanding it: a reviewer reading the document six months later can look the name
+up and disagree with it. See
+[Conditional conclusions](../output/vex-output.md#conditional-conclusions).
+
+A profile that asserts nothing, a name defined twice, and a name used but never
+defined are all errors, reported with their line number before anything is
+pulled.
 
 ### Why one process and not a shell loop
 
