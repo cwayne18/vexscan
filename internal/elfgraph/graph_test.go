@@ -1099,6 +1099,66 @@ func TestBoundedLoaderNameOnlyConfigStillDischarges(t *testing.T) {
 	}
 }
 
+// TestBoundedLoaderUnreadableConfigStaysBlocking: a config that is there but
+// cannot be read is the one case where the scan learns nothing, and "learned
+// nothing" must not be spelled the same as "found nothing". Reading it as clean
+// would make an unreadable openssl.cnf strictly better for the image's score
+// than a readable one, which is the incentive exactly backwards.
+func TestBoundedLoaderUnreadableConfigStaysBlocking(t *testing.T) {
+	files := map[string]string{
+		"/usr/bin/app":                    "",
+		"/usr/lib/libcrypto.so.3":         "",
+		"/usr/lib/ossl-modules/legacy.so": "",
+		// A directory where the config should be: present, and ReadFile fails
+		// with something that is not fs.ErrNotExist. Standing in for any
+		// unreadable config without depending on the uid the tests run as.
+		"/etc/ssl/openssl.cnf/placeholder": "x",
+	}
+	objs := fakeELF{
+		"/usr/bin/app":                    exe("libcrypto.so.3"),
+		"/usr/lib/libcrypto.so.3":         libcryptoCaller(),
+		"/usr/lib/ossl-modules/legacy.so": lib(),
+	}
+	g := build(t, tree(t, files), objs, Options{Config: target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}}})
+
+	tt := dlopenTaintFor(g, "/usr/lib/libcrypto.so.3")
+	if tt == nil || !tt.Blocking || !tt.Global {
+		t.Fatalf("with an unreadable openssl.cnf, dlopen taint = %+v, want a global blocker", tt)
+	}
+	if len(g.BlockingTaints()) == 0 {
+		t.Error("BlockingTaints() is empty despite a config that could not be checked")
+	}
+}
+
+// TestBoundedLoaderScansEveryConfigPath: OPENSSLDIR differs by distro family, so
+// vexscan does not know which of the candidate paths is the one OpenSSL will
+// read -- it reads all of them. An image can carry a stale /etc/ssl/openssl.cnf
+// from a base layer beside the /etc/pki/tls/openssl.cnf its OpenSSL actually
+// loads, and stopping at the first file found would let the stale clean one
+// shadow the live redirecting one.
+func TestBoundedLoaderScansEveryConfigPath(t *testing.T) {
+	files := map[string]string{
+		"/usr/bin/app":                    "",
+		"/usr/lib/libcrypto.so.3":         "",
+		"/usr/lib/ossl-modules/legacy.so": "",
+		// Scanned first, and entirely innocent.
+		"/etc/ssl/openssl.cnf": "[provider_sect]\nlegacy = legacy_sect\n[legacy_sect]\nactivate = 1\n",
+		// Scanned last, and points a provider outside the rooted dirs.
+		"/etc/pki/tls/openssl.cnf": "[legacy_sect]\nmodule = /opt/legacy.so\n",
+	}
+	objs := fakeELF{
+		"/usr/bin/app":                    exe("libcrypto.so.3"),
+		"/usr/lib/libcrypto.so.3":         libcryptoCaller(),
+		"/usr/lib/ossl-modules/legacy.so": lib(),
+	}
+	g := build(t, tree(t, files), objs, Options{Config: target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}}})
+
+	tt := dlopenTaintFor(g, "/usr/lib/libcrypto.so.3")
+	if tt == nil || !tt.Blocking || !tt.Global {
+		t.Fatalf("a clean config shadowed a redirecting one: dlopen taint = %+v, want a global blocker", tt)
+	}
+}
+
 // libpamCaller is a libpam: it imports dlopen (to load PAM modules) and declares
 // the soname the allowlist matches on.
 func libpamCaller(needed ...string) *Info {
@@ -1223,6 +1283,44 @@ func TestBoundedLoaderPamNoConfigStillDischarges(t *testing.T) {
 	}
 	if tt.Blocking || tt.Global {
 		t.Errorf("an image with no pam config kept libpam blocking: %+v", *tt)
+	}
+}
+
+// TestBoundedLoaderUnreadablePamStaysBlocking: the same fail-closed rule the
+// OpenSSL scan follows, on the other family. Absent PAM configuration is not a
+// redirect -- a libpam with no stanzas loads no module -- but configuration that
+// exists and cannot be read is, because the scan cannot tell the two apart by
+// looking, and only one of them is safe to discharge on.
+func TestBoundedLoaderUnreadablePamStaysBlocking(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		files map[string]string
+	}{
+		// /etc/pam.d is a file, so the directory listing fails with something
+		// that is not fs.ErrNotExist: the stanzas cannot be enumerated.
+		{"pam.d cannot be listed", map[string]string{
+			"/etc/pam.d": "not a directory",
+		}},
+		// /etc/pam.conf is a directory, so reading the file fails. A system with
+		// a perfectly good /etc/pam.d still honours pam.conf, so an unreadable
+		// one leaves a stanza the scan never saw.
+		{"pam.conf cannot be read", map[string]string{
+			"/etc/pam.d/common-auth":    "auth required pam_unix.so\n",
+			"/etc/pam.conf/placeholder": "x",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files, objs := pamImage(tc.files)
+			g := build(t, tree(t, files), objs, Options{Config: target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}}})
+
+			tt := dlopenTaintFor(g, "/usr/lib/libpam.so.0")
+			if tt == nil || !tt.Blocking || !tt.Global {
+				t.Fatalf("with unreadable pam configuration, dlopen taint = %+v, want a global blocker", tt)
+			}
+			if len(g.BlockingTaints()) == 0 {
+				t.Error("BlockingTaints() is empty despite pam configuration that could not be checked")
+			}
+		})
 	}
 }
 
