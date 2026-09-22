@@ -804,6 +804,450 @@ func TestUnreachableDlopenDoesNotTaint(t *testing.T) {
 	}
 }
 
+// dlopenTaintFor returns the dlopen taint raised by a specific caller, since a
+// graph with more than one dlopen caller carries more than one such taint and
+// hasTaint would return whichever came first.
+func dlopenTaintFor(g *Graph, path string) *Taint {
+	for i := range g.Taints() {
+		if t := g.Taints()[i]; t.Kind == TaintDlopen && t.Path == path {
+			return &t
+		}
+	}
+	return nil
+}
+
+// libcryptoCaller is an OpenSSL libcrypto: a dynamic object that imports dlopen
+// (to load providers and engines) and declares the libcrypto soname the
+// allowlist matches on.
+func libcryptoCaller(needed ...string) *Info {
+	i := lib(needed...)
+	i.Dlopen = true
+	i.Soname = "libcrypto.so.3"
+	return i
+}
+
+// TestBoundedLoaderDlopenDischarged: libcrypto calls dlopen, but only to load
+// providers and engines from ossl-modules/engines directories vexscan already
+// roots and walks. Everything it can reach is therefore already in the closure,
+// so its dlopen taint is recorded rather than allowed to block -- without any
+// blanket assume-none over other callers.
+func TestBoundedLoaderDlopenDischarged(t *testing.T) {
+	files := map[string]string{
+		"/usr/bin/app": "",
+		"/usr/lib/x86_64-linux-gnu/libcrypto.so.3":         "",
+		"/usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so": "",
+	}
+	objs := fakeELF{
+		"/usr/bin/app": exe("libcrypto.so.3"),
+		"/usr/lib/x86_64-linux-gnu/libcrypto.so.3":         libcryptoCaller(),
+		"/usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so": lib(),
+	}
+	g := build(t, tree(t, files), objs, Options{Config: target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}}})
+
+	tt := dlopenTaintFor(g, "/usr/lib/x86_64-linux-gnu/libcrypto.so.3")
+	if tt == nil {
+		t.Fatal("libcrypto raised no dlopen taint at all")
+	}
+	if tt.Blocking || tt.Global {
+		t.Errorf("a bounded loader still blocks: %+v", *tt)
+	}
+	// Discharged, not merely non-blocking: it would have blocked globally, and
+	// the analysis answered it. A reader has to see the clean rests on that.
+	if !tt.Discharged {
+		t.Errorf("bounded loader demoted without being marked discharged: %+v", *tt)
+	}
+	if !strings.Contains(tt.Detail, "OpenSSL") || !strings.Contains(tt.Detail, "ossl-modules") {
+		t.Errorf("detail does not name the family and its dirs: %q", tt.Detail)
+	}
+	if len(g.BlockingTaints()) != 0 {
+		t.Errorf("BlockingTaints() = %v, want none", g.BlockingTaints())
+	}
+}
+
+// TestBoundedLoaderRedirectStaysBlocking: the bound holds only while nothing
+// points the loader outside its known dirs. Each of OpenSSL's redirect
+// environment variables, set in the image config, means a provider or engine
+// could come from a directory nothing rooted -- so the closure is a lower bound
+// again and the taint must keep blocking.
+func TestBoundedLoaderRedirectStaysBlocking(t *testing.T) {
+	for _, env := range []string{
+		"OPENSSL_MODULES=/opt/mods",
+		"OPENSSL_ENGINES=/opt/engines",
+		"OPENSSL_CONF=/opt/openssl.cnf",
+	} {
+		t.Run(env, func(t *testing.T) {
+			files := map[string]string{
+				"/usr/bin/app":                    "",
+				"/usr/lib/libcrypto.so.3":         "",
+				"/usr/lib/ossl-modules/legacy.so": "",
+			}
+			objs := fakeELF{
+				"/usr/bin/app":                    exe("libcrypto.so.3"),
+				"/usr/lib/libcrypto.so.3":         libcryptoCaller(),
+				"/usr/lib/ossl-modules/legacy.so": lib(),
+			}
+			g := build(t, tree(t, files), objs, Options{Config: target.ImageConfig{
+				Entrypoint: []string{"/usr/bin/app"},
+				Env:        []string{env},
+			}})
+
+			tt := dlopenTaintFor(g, "/usr/lib/libcrypto.so.3")
+			if tt == nil || !tt.Blocking || !tt.Global {
+				t.Fatalf("with %s set, dlopen taint = %+v, want a global blocker", env, tt)
+			}
+			if len(g.BlockingTaints()) == 0 {
+				t.Errorf("with %s set, BlockingTaints() is empty", env)
+			}
+		})
+	}
+}
+
+// TestUnrecognisedDlopenCallerStaysBlocking: the discharge is keyed to a strict
+// soname allowlist, not to a plugin directory being present. A library that is
+// not a recognised loader keeps the global block even in an image whose
+// ossl-modules dir is fully rooted, because being installed next to plugins
+// says nothing about what a library dlopens.
+func TestUnrecognisedDlopenCallerStaysBlocking(t *testing.T) {
+	other := lib()
+	other.Dlopen = true
+	other.Soname = "libplugthing.so.1"
+	files := map[string]string{
+		"/usr/bin/app":                    "",
+		"/usr/lib/libplugthing.so.1":      "",
+		"/usr/lib/ossl-modules/legacy.so": "",
+	}
+	objs := fakeELF{
+		"/usr/bin/app":                    exe("libplugthing.so.1"),
+		"/usr/lib/libplugthing.so.1":      other,
+		"/usr/lib/ossl-modules/legacy.so": lib(),
+	}
+	g := build(t, tree(t, files), objs, Options{Config: target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}}})
+
+	tt := dlopenTaintFor(g, "/usr/lib/libplugthing.so.1")
+	if tt == nil || !tt.Blocking || !tt.Global {
+		t.Fatalf("unrecognised loader dlopen taint = %+v, want a global blocker", tt)
+	}
+}
+
+// TestBoundedLoaderWithoutPluginDirStaysBlocking: the discharge rests on the
+// plugins actually having been rooted here, not on their being rooted in some
+// canonical image. A libcrypto with no ossl-modules or engines directory on
+// disk roots no providers, so there is nothing to prove the closure is complete
+// and the taint keeps blocking.
+func TestBoundedLoaderWithoutPluginDirStaysBlocking(t *testing.T) {
+	files := map[string]string{
+		"/usr/bin/app":            "",
+		"/usr/lib/libcrypto.so.3": "",
+	}
+	objs := fakeELF{
+		"/usr/bin/app":            exe("libcrypto.so.3"),
+		"/usr/lib/libcrypto.so.3": libcryptoCaller(),
+	}
+	g := build(t, tree(t, files), objs, Options{Config: target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}}})
+
+	tt := dlopenTaintFor(g, "/usr/lib/libcrypto.so.3")
+	if tt == nil || !tt.Blocking || !tt.Global {
+		t.Fatalf("libcrypto with no plugin dir = %+v, want a global blocker", tt)
+	}
+}
+
+// TestBoundedLoaderMixedWithUnrecognisedCaller: the taint is per-caller, so a
+// discharged bounded loader does not clear the image while an unrecognised
+// caller is also reachable. The application binary here dlopens too, and it can
+// load anything, so the global block survives -- exactly the composition that
+// makes discharging individual loaders safe.
+func TestBoundedLoaderMixedWithUnrecognisedCaller(t *testing.T) {
+	app := exe("libcrypto.so.3")
+	app.Dlopen = true // the app itself calls dlopen, and it is not a known loader
+	files := map[string]string{
+		"/usr/bin/app":                    "",
+		"/usr/lib/libcrypto.so.3":         "",
+		"/usr/lib/ossl-modules/legacy.so": "",
+	}
+	objs := fakeELF{
+		"/usr/bin/app":                    app,
+		"/usr/lib/libcrypto.so.3":         libcryptoCaller(),
+		"/usr/lib/ossl-modules/legacy.so": lib(),
+	}
+	g := build(t, tree(t, files), objs, Options{Config: target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}}})
+
+	crypto := dlopenTaintFor(g, "/usr/lib/libcrypto.so.3")
+	if crypto == nil || crypto.Blocking || crypto.Global {
+		t.Errorf("libcrypto was not discharged in the mixed image: %+v", crypto)
+	}
+	appTaint := dlopenTaintFor(g, "/usr/bin/app")
+	if appTaint == nil || !appTaint.Blocking || !appTaint.Global {
+		t.Fatalf("app dlopen taint = %+v, want a global blocker", appTaint)
+	}
+	if len(g.BlockingTaints()) == 0 {
+		t.Error("the global block did not survive an unrecognised caller")
+	}
+}
+
+// TestBoundedLoaderConfigOverrideStaysBlocking: an environment variable is not
+// the only way to point OpenSSL outside its rooted dirs -- openssl.cnf can name
+// a provider or engine by absolute path with no variable set, and the dlopen
+// taint is what guards against exactly that. A config that could do so keeps the
+// caller blocking even when the dirs are rooted and no env is set. The path
+// varies by distribution: Debian/SUSE/Alpine at /etc/ssl, RHEL/UBI at
+// /etc/pki/tls, and the guard must read whichever the image actually ships.
+func TestBoundedLoaderConfigOverrideStaysBlocking(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+		cnf  string
+	}{
+		{"provider module path", "/etc/ssl/openssl.cnf", "[legacy_sect]\nmodule = /opt/legacy.so\nactivate = 1\n"},
+		{"dynamic engine path", "/etc/ssl/openssl.cnf", "[engine_sect]\ndynamic_path = /opt/eng.so\n"},
+		{"modulesdir override", "/etc/ssl/openssl.cnf", "[provider_sect]\nMODULESDIR = /opt/modules\n"},
+		{"include delegates", "/etc/ssl/openssl.cnf", ".include /etc/ssl/extra.cnf\n"},
+		// RHEL/UBI family: OPENSSLDIR=/etc/pki/tls, and no /etc/ssl/openssl.cnf
+		// exists. Reading only the Debian paths would miss this entirely and
+		// discharge on the whole enterprise base-image family.
+		{"rhel openssldir", "/etc/pki/tls/openssl.cnf", "[legacy_sect]\nmodule = /usr/lib64/foo.so\n"},
+		// NCONF joins a line ending in backslash with the next, so a directive
+		// split across two physical lines is one directive at load time and a
+		// per-physical-line scan would match neither half.
+		{"line continuation", "/etc/ssl/openssl.cnf", "[engine_sect]\ndynamic_pa\\\nth = /evil.so\n"},
+		// A dynamic engine can be aimed with SO_PATH instead of dynamic_path.
+		{"engine so_path", "/etc/ssl/openssl.cnf", "[foo_engine]\nSO_PATH = /evil.so\nLOAD\n"},
+		// A vendor ctrl directive under any key still resolves to an absolute
+		// shared object the closure never walked.
+		{"absolute so value", "/etc/ssl/openssl.cnf", "[foo_engine]\nvendor_ctrl = /opt/pkcs11.so.1\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := map[string]string{
+				"/usr/bin/app":                    "",
+				"/usr/lib/libcrypto.so.3":         "",
+				"/usr/lib/ossl-modules/legacy.so": "",
+				tc.path:                           tc.cnf,
+			}
+			objs := fakeELF{
+				"/usr/bin/app":                    exe("libcrypto.so.3"),
+				"/usr/lib/libcrypto.so.3":         libcryptoCaller(),
+				"/usr/lib/ossl-modules/legacy.so": lib(),
+			}
+			g := build(t, tree(t, files), objs, Options{Config: target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}}})
+
+			tt := dlopenTaintFor(g, "/usr/lib/libcrypto.so.3")
+			if tt == nil || !tt.Blocking || !tt.Global {
+				t.Fatalf("with an overriding config, dlopen taint = %+v, want a global blocker", tt)
+			}
+		})
+	}
+}
+
+// TestBoundedLoaderRhelNoConfigStillDischarges: an absent config is not an
+// override -- OpenSSL falls back to name-based loading from the compiled-in
+// modulesdir, which is rooted. A RHEL-layout image that ships no openssl.cnf at
+// any known path must still discharge, or adding the RHEL path would just turn
+// the whole enterprise family into a permanent block.
+func TestBoundedLoaderRhelNoConfigStillDischarges(t *testing.T) {
+	files := map[string]string{
+		"/usr/bin/app":                      "",
+		"/usr/lib64/libcrypto.so.3":         "",
+		"/usr/lib64/ossl-modules/legacy.so": "",
+	}
+	objs := fakeELF{
+		"/usr/bin/app":                      exe("libcrypto.so.3"),
+		"/usr/lib64/libcrypto.so.3":         libcryptoCaller(),
+		"/usr/lib64/ossl-modules/legacy.so": lib(),
+	}
+	g := build(t, tree(t, files), objs, Options{Config: target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}}})
+
+	tt := dlopenTaintFor(g, "/usr/lib64/libcrypto.so.3")
+	if tt == nil {
+		t.Fatal("libcrypto raised no dlopen taint at all")
+	}
+	if tt.Blocking || tt.Global {
+		t.Errorf("a RHEL image with no openssl.cnf kept the loader blocking: %+v", *tt)
+	}
+	if len(g.BlockingTaints()) != 0 {
+		t.Errorf("BlockingTaints() = %v, want none", g.BlockingTaints())
+	}
+}
+
+// TestBoundedLoaderNameOnlyConfigStillDischarges: the guard must not be so blunt
+// that a stock openssl.cnf blocks. The default config activates providers by
+// name, which maps into the rooted dirs -- the assumption vexscan already makes
+// -- so a config with no absolute module path still discharges.
+func TestBoundedLoaderNameOnlyConfigStillDischarges(t *testing.T) {
+	files := map[string]string{
+		"/usr/bin/app":                    "",
+		"/usr/lib/libcrypto.so.3":         "",
+		"/usr/lib/ossl-modules/legacy.so": "",
+		"/etc/ssl/openssl.cnf": "# stock config\n" +
+			"[provider_sect]\ndefault = default_sect\nlegacy = legacy_sect\n" +
+			"[default_sect]\nactivate = 1\n[legacy_sect]\nactivate = 1\n",
+	}
+	objs := fakeELF{
+		"/usr/bin/app":                    exe("libcrypto.so.3"),
+		"/usr/lib/libcrypto.so.3":         libcryptoCaller(),
+		"/usr/lib/ossl-modules/legacy.so": lib(),
+	}
+	g := build(t, tree(t, files), objs, Options{Config: target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}}})
+
+	tt := dlopenTaintFor(g, "/usr/lib/libcrypto.so.3")
+	if tt == nil {
+		t.Fatal("libcrypto raised no dlopen taint at all")
+	}
+	if tt.Blocking || tt.Global {
+		t.Errorf("a name-only config kept the loader blocking: %+v", *tt)
+	}
+	if len(g.BlockingTaints()) != 0 {
+		t.Errorf("BlockingTaints() = %v, want none", g.BlockingTaints())
+	}
+}
+
+// libpamCaller is a libpam: it imports dlopen (to load PAM modules) and declares
+// the soname the allowlist matches on.
+func libpamCaller(needed ...string) *Info {
+	i := lib(needed...)
+	i.Dlopen = true
+	i.Soname = "libpam.so.0"
+	return i
+}
+
+// pamImage is the file and object layout shared by the PAM tests: an app linking
+// libpam, and one module in the rooted security dir. Extra files -- the pam
+// configuration under test -- are merged in.
+func pamImage(extra map[string]string) (map[string]string, fakeELF) {
+	files := map[string]string{
+		"/usr/bin/app":                  "",
+		"/usr/lib/libpam.so.0":          "",
+		"/usr/lib/security/pam_unix.so": "",
+		"/usr/lib/security/pam_deny.so": "",
+	}
+	for k, v := range extra {
+		files[k] = v
+	}
+	return files, fakeELF{
+		"/usr/bin/app":                  exe("libpam.so.0"),
+		"/usr/lib/libpam.so.0":          libpamCaller(),
+		"/usr/lib/security/pam_unix.so": lib(),
+		"/usr/lib/security/pam_deny.so": lib(),
+	}
+}
+
+// TestBoundedLoaderPamDischarged: libpam's module directory is compiled in and
+// no environment variable moves it, so a stock pam.d -- every stanza naming its
+// module bare -- means everything libpam can load is already rooted. This is the
+// second-most common blocker after OpenSSL on any image built on a distro base,
+// because libpam arrives with the base userland whether the workload uses it or
+// not.
+func TestBoundedLoaderPamDischarged(t *testing.T) {
+	files, objs := pamImage(map[string]string{
+		"/etc/pam.d/common-auth": "# stock\nauth\trequired\tpam_unix.so nullok\n" +
+			"auth\t[success=1 default=ignore]\tpam_deny.so\n",
+		"/etc/pam.d/other": "@include common-auth\n",
+	})
+	g := build(t, tree(t, files), objs, Options{Config: target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}}})
+
+	tt := dlopenTaintFor(g, "/usr/lib/libpam.so.0")
+	if tt == nil {
+		t.Fatal("libpam raised no dlopen taint at all")
+	}
+	if tt.Blocking || tt.Global {
+		t.Errorf("a stock pam.d kept libpam blocking: %+v", *tt)
+	}
+	if !tt.Discharged {
+		t.Errorf("libpam demoted without being marked discharged: %+v", *tt)
+	}
+	if !strings.Contains(tt.Detail, "PAM") || !strings.Contains(tt.Detail, "security") {
+		t.Errorf("detail does not name the family and its dir: %q", tt.Detail)
+	}
+	if len(g.BlockingTaints()) != 0 {
+		t.Errorf("BlockingTaints() = %v, want none", g.BlockingTaints())
+	}
+}
+
+// TestBoundedLoaderPamAbsolutePathStaysBlocking: the one way out of PAM's bound
+// is a stanza naming a module by absolute path, which libpam loads verbatim from
+// a directory nothing rooted. Every place such a stanza can hide has to be read
+// -- any file in /etc/pam.d, not just the service the workload happens to use,
+// and the older /etc/pam.conf that a directory-based system still honours.
+func TestBoundedLoaderPamAbsolutePathStaysBlocking(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		files map[string]string
+	}{
+		{"absolute module in a service file", map[string]string{
+			"/etc/pam.d/sshd": "auth optional /opt/vendor/pam_vendor.so\n",
+		}},
+		// The scan must not stop at the first file: a clean common-auth beside a
+		// redirecting one is still a redirecting image.
+		{"absolute module in a second file", map[string]string{
+			"/etc/pam.d/common-auth": "auth required pam_unix.so\n",
+			"/etc/pam.d/sudo":        "session optional /usr/local/lib/pam_extra.so\n",
+		}},
+		{"absolute module in pam.conf", map[string]string{
+			"/etc/pam.conf": "login auth required /opt/pam_vendor.so\n",
+		}},
+		// PAM honours a backslash continuation, so a stanza split across two
+		// physical lines is one stanza at load time.
+		{"line continuation", map[string]string{
+			"/etc/pam.d/sshd": "auth optional /opt/ven\\\ndor.so\n",
+		}},
+		// A versioned soname is just as much an escape as a bare .so.
+		{"versioned absolute module", map[string]string{
+			"/etc/pam.d/sshd": "auth optional /opt/pam_vendor.so.1\n",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files, objs := pamImage(tc.files)
+			g := build(t, tree(t, files), objs, Options{Config: target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}}})
+
+			tt := dlopenTaintFor(g, "/usr/lib/libpam.so.0")
+			if tt == nil || !tt.Blocking || !tt.Global {
+				t.Fatalf("with an absolute module path, dlopen taint = %+v, want a global blocker", tt)
+			}
+			if len(g.BlockingTaints()) == 0 {
+				t.Error("BlockingTaints() is empty despite a redirecting pam config")
+			}
+		})
+	}
+}
+
+// TestBoundedLoaderPamNoConfigStillDischarges: absent configuration is not a
+// redirect. A libpam with no stanzas anywhere loads no module at all, so there
+// is nothing outside the closure for it to reach -- and treating "no pam.d" as
+// an override would block every minimal image that links libpam without
+// configuring it, which is most hardened images.
+func TestBoundedLoaderPamNoConfigStillDischarges(t *testing.T) {
+	files, objs := pamImage(nil)
+	g := build(t, tree(t, files), objs, Options{Config: target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}}})
+
+	tt := dlopenTaintFor(g, "/usr/lib/libpam.so.0")
+	if tt == nil {
+		t.Fatal("libpam raised no dlopen taint at all")
+	}
+	if tt.Blocking || tt.Global {
+		t.Errorf("an image with no pam config kept libpam blocking: %+v", *tt)
+	}
+}
+
+// TestBoundedLoaderPamWithoutModuleDirStaysBlocking: the discharge rests on
+// modules having actually been rooted here. A libpam with no security directory
+// on disk roots none, so nothing demonstrates the closure is a complete account
+// of what it loads, and the taint keeps blocking -- the same rule the OpenSSL
+// family follows.
+func TestBoundedLoaderPamWithoutModuleDirStaysBlocking(t *testing.T) {
+	files := map[string]string{
+		"/usr/bin/app":         "",
+		"/usr/lib/libpam.so.0": "",
+	}
+	objs := fakeELF{
+		"/usr/bin/app":         exe("libpam.so.0"),
+		"/usr/lib/libpam.so.0": libpamCaller(),
+	}
+	g := build(t, tree(t, files), objs, Options{Config: target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}}})
+
+	tt := dlopenTaintFor(g, "/usr/lib/libpam.so.0")
+	if tt == nil || !tt.Blocking || !tt.Global {
+		t.Fatalf("libpam with no security dir = %+v, want a global blocker", tt)
+	}
+}
+
 // TestStaticRootTaintsGlobally: on Alpine and distroless a static binary
 // carries musl and openssl inside itself while the .so files sit unused. The
 // closure would report those packages unreachable, and it would be wrong.
