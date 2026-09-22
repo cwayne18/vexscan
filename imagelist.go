@@ -248,6 +248,9 @@ func parseImageLine(line string, profiles map[string]*scanAssert) (string, *scan
 	a := &scanAssert{}
 	for _, f := range fields[1:] {
 		if name, ok := strings.CutPrefix(f, "profile="); ok {
+			if name == "" {
+				return "", nil, fmt.Errorf("profile= names no profile")
+			}
 			p, known := profiles[name]
 			if !known {
 				return "", nil, fmt.Errorf("unknown profile %q; define it with a [profile %s] line", name, name)
@@ -257,7 +260,7 @@ func parseImageLine(line string, profiles map[string]*scanAssert) (string, *scan
 		}
 	}
 
-	if err := applyAssertFields(a, fields[1:]); err != nil {
+	if err := applyAssertFields(a, fields[1:], false); err != nil {
 		return "", nil, err
 	}
 	return ref, a, nil
@@ -266,7 +269,11 @@ func parseImageLine(line string, profiles map[string]*scanAssert) (string, *scan
 // applyAssertFields reads key=value assertions onto a, overwriting whatever a
 // already carries for the keys it names. Shared by an image line and a [profile]
 // definition so the two can never drift into accepting different grammars.
-func applyAssertFields(a *scanAssert, fields []string) error {
+//
+// inProfile says the fields came from a [profile] definition, where profile= is
+// not a key: only an image line resolves one, so a profile that named another
+// would be read, accepted, and silently ignored.
+func applyAssertFields(a *scanAssert, fields []string, inProfile bool) error {
 	// A line that names its own roots makes a complete statement about what that
 	// image runs, so the first roots= here clears whatever a profile supplied
 	// rather than adding to it -- the same rule that makes a line's roots replace
@@ -280,8 +287,13 @@ func applyAssertFields(a *scanAssert, fields []string) error {
 		}
 		switch k {
 		case "profile":
-			if v == "" {
-				return fmt.Errorf("profile= names no profile")
+			if inProfile {
+				// Profiles are collected in one pass and resolved in another, so
+				// nothing would expand this one. Accepting it would drop an
+				// assertion the author believed they had made -- and drop it
+				// towards concluding less, which is the direction that does not
+				// announce itself in a report.
+				return fmt.Errorf("a profile cannot name another profile; spell the assertions out")
 			}
 			// Resolved by the caller, which needs the name before any other key
 			// is read. Accepted here so it is not an unknown assertion.
@@ -318,7 +330,11 @@ func applyAssertFields(a *scanAssert, fields []string) error {
 			}
 			a.DynamicPolicy = &p
 		default:
-			return fmt.Errorf("unknown assertion %q: want profile, roots, dlopen-policy, exec-policy or dynamic-import-policy", k)
+			want := "profile, roots, dlopen-policy, exec-policy or dynamic-import-policy"
+			if inProfile {
+				want = "roots, dlopen-policy, exec-policy or dynamic-import-policy"
+			}
+			return fmt.Errorf("unknown assertion %q: want %s", k, want)
 		}
 	}
 	return nil
@@ -381,7 +397,7 @@ func parseProfiles(lines []string) (map[string]*scanAssert, error) {
 			return nil, fmt.Errorf("line %d: profile %q is defined twice; say it once", n+1, name)
 		}
 		a := &scanAssert{}
-		if err := applyAssertFields(a, strings.Fields(line[close+1:])); err != nil {
+		if err := applyAssertFields(a, strings.Fields(line[close+1:]), true); err != nil {
 			return nil, fmt.Errorf("line %d: profile %q: %w", n+1, name, err)
 		}
 		if a.Roots == nil && a.DlopenPolicy == nil && a.ExecPolicy == nil && a.DynamicPolicy == nil {

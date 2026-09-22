@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cwayne18/vexscan/internal/analyze"
@@ -304,10 +305,47 @@ func TestParseImageListProfileErrors(t *testing.T) {
 		{"unknown key inside", "[profile a] roots=/x bogus=1\nalpine:3.20 profile=a\n"},
 		{"bad value inside", "[profile a] exec-policy=maybe\nalpine:3.20 profile=a\n"},
 		{"empty profile name on a line", "alpine:3.20 profile=\n"},
+		{"a profile naming another profile", "[profile base] exec-policy=assume-none\n" +
+			"[profile calico] profile=base roots=/usr/bin/calico-node\n" +
+			"alpine:3.20 profile=calico\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := parseImageList(tc.list); err == nil {
 				t.Error("parseImageList accepted it")
+			}
+		})
+	}
+}
+
+// The two ways of misusing profile= are rejected for their own reasons, and the
+// reason has to be the one the author can act on.
+//
+// Nesting is the one that matters. Profiles are collected in one pass and
+// expanded in another, so a profile naming another is read, accepted, and
+// dropped -- and dropped towards asserting less, which surfaces as a scan that
+// quietly withheld conclusions rather than as an error. Checking the message,
+// not just that some error came back, is what keeps the empty-name case from
+// passing on the "unknown profile" path it used to take.
+func TestParseImageListProfileMisuseSaysWhich(t *testing.T) {
+	for _, tc := range []struct {
+		name, list, want string
+	}{
+		{
+			"nested", "[profile base] exec-policy=assume-none\n[profile b] profile=base roots=/x\n",
+			"cannot name another profile",
+		},
+		{
+			"empty name", "[profile a] roots=/x\nalpine:3.20 profile=\n",
+			"profile= names no profile",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseImageList(tc.list)
+			if err == nil {
+				t.Fatal("parseImageList accepted it")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %q, want it to mention %q", err, tc.want)
 			}
 		})
 	}

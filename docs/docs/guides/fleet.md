@@ -108,9 +108,13 @@ expanding it: a reviewer reading the document six months later can look the name
 up and disagree with it. See
 [Conditional conclusions](../output/vex-output.md#conditional-conclusions).
 
-A profile that asserts nothing, a name defined twice, and a name used but never
-defined are all errors, reported with their line number before anything is
-pulled.
+A profile that asserts nothing, a name defined twice, a name used but never
+defined, and a profile that names another profile are all errors, reported with
+their line number before anything is pulled. Profiles do not nest because they
+are collected in one pass and expanded in the next, so a `profile=` inside a
+definition would be accepted and then quietly dropped — and dropped towards
+asserting *less*, which shows up as a scan that withheld conclusions rather than
+as an error.
 
 ### Why one process and not a shell loop
 
