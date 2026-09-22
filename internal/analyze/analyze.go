@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -175,6 +176,10 @@ type Options struct {
 	// plugin's shared libraries and the language plugins' import graphs -- for
 	// an image whose real command comes from outside its config.
 	Roots []string
+	// Profile is an optional label for the assertion Roots and the policies
+	// below make, carried through to the report and the emitted VEX so a fleet
+	// run can name which profile a conclusion rests on. See RuntimeAssertion.
+	Profile string
 	// DlopenPolicy decides whether a reachable dlopen blocks conclusions.
 	DlopenPolicy elfgraph.DlopenPolicy
 	// ExecPolicy decides whether an entrypoint that can start another program
@@ -350,6 +355,97 @@ type Result struct {
 
 	// Descriptor records what produced this report. See its doc comment.
 	Descriptor *Descriptor `json:"descriptor,omitempty"`
+
+	// Runtime is what the user asserted about how this target is run, and is
+	// nil when they asserted nothing. See RuntimeAssertion.
+	Runtime *RuntimeAssertion `json:"runtime_assertion,omitempty"`
+}
+
+// RuntimeAssertion is what the user told the scan about how the target is
+// actually run: --roots, and the policy flags that take their word for a taint.
+//
+// It is recorded because those flags do not change what the image contains,
+// they change what question the scan answers. "No object the closure reaches
+// imports this function" is a fact about the image. "No object the closure
+// reaches imports this function, given that execution starts at
+// /usr/bin/calico-node and nothing else is ever run" is a conditional answer,
+// and the condition is not in the image -- it is a claim about the deployment
+// that the person who wrote the flag is making.
+//
+// Both are legitimate. Only one of them is auditable, and only if the condition
+// travels with the conclusion. Without this, a not_in_execute_path reached
+// under --roots and --exec-policy=assume-none is byte-identical in the report
+// and in the emitted VEX to one the scan derived unaided, and a reader has no
+// way to know there is an assumption to disagree with. That is the difference
+// between a conditional answer and a false one.
+//
+// Nil means the run asserted nothing and every conclusion in it stands on the
+// image alone.
+type RuntimeAssertion struct {
+	// Roots are the paths the user named as where execution starts. Their
+	// presence is the strongest half of the assertion: they replace what the
+	// image config says and, with ExecAssumeNone, stand down the escalation
+	// that would otherwise root every program in the image.
+	Roots []string `json:"roots,omitempty"`
+
+	// Profile is the label a fleet list attached to this assertion, so a report
+	// over sixty images can say which named profile a row rests on rather than
+	// repeating the paths. Empty when the assertion was made with bare flags.
+	Profile string `json:"profile,omitempty"`
+
+	// The policies, recorded only when set to something other than the
+	// blocking default -- a taint left blocking is not an assertion, it is the
+	// scan doing its own work.
+	DlopenAssumeNone  bool `json:"dlopen_assume_none,omitempty"`
+	ExecAssumeNone    bool `json:"exec_assume_none,omitempty"`
+	DynamicAssumeNone bool `json:"dynamic_assume_none,omitempty"`
+}
+
+// Sentence is the assertion as one clause, for the evidence line and the VEX
+// impact statement. It reads as the condition it is -- "under the asserted
+// runtime profile" -- rather than as something the scan discovered.
+func (a *RuntimeAssertion) Sentence() string {
+	if a == nil {
+		return ""
+	}
+	var parts []string
+	if len(a.Roots) > 0 {
+		parts = append(parts, "execution starts at "+strings.Join(a.Roots, ", "))
+	}
+	if a.ExecAssumeNone {
+		parts = append(parts, "the entrypoint is asserted to run nothing else")
+	}
+	if a.DlopenAssumeNone {
+		parts = append(parts, "runtime library loading is asserted to load nothing that matters")
+	}
+	if a.DynamicAssumeNone {
+		parts = append(parts, "computed imports are asserted to import nothing that matters")
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	head := "under the asserted runtime profile"
+	if a.Profile != "" {
+		head += " " + strconv.Quote(a.Profile)
+	}
+	return head + ": " + strings.Join(parts, "; ")
+}
+
+// runtimeAssertion is what this run's options assert, or nil when they assert
+// nothing. The policies count only when they are assume-none: the default is
+// the scan withholding on its own judgement, which is not a user claim.
+func (o Options) runtimeAssertion() *RuntimeAssertion {
+	a := &RuntimeAssertion{
+		Roots:             o.Roots,
+		Profile:           o.Profile,
+		DlopenAssumeNone:  o.DlopenPolicy == elfgraph.DlopenAssumeNone,
+		ExecAssumeNone:    o.ExecPolicy == elfgraph.ExecAssumeNone,
+		DynamicAssumeNone: o.DynamicPolicy == modgraph.DynamicAssumeNone,
+	}
+	if a.Sentence() == "" {
+		return nil
+	}
+	return a
 }
 
 // Corrections is what the advisory database offered and the scan did not
@@ -797,7 +893,8 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	defer cleanup()
 
 	analyzers := ecosystem.ImageAnalyzers(plugins)
-	result := &Result{SchemaVersion: SchemaVersion, Target: img.Ref, Mode: opts.mode(), Module: opts.Module}
+	result := &Result{SchemaVersion: SchemaVersion, Target: img.Ref, Mode: opts.mode(), Module: opts.Module,
+		Runtime: opts.runtimeAssertion()}
 
 	resolver, err := newResolver(opts)
 	if err != nil {
@@ -1157,7 +1254,8 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 	}
 	defer cleanup()
 
-	result := &Result{SchemaVersion: SchemaVersion, Target: opts.Repo, Mode: "repo", Module: opts.Module}
+	result := &Result{SchemaVersion: SchemaVersion, Target: opts.Repo, Mode: "repo", Module: opts.Module,
+		Runtime: opts.runtimeAssertion()}
 
 	applied := 0
 	for _, a := range ecosystem.SourceAnalyzers(plugins) {

@@ -84,6 +84,13 @@ type scanAssert struct {
 	// global root, which is the situation this whole form exists to escape.
 	Roots []string
 
+	// Profile is the name of the [profile] block this line drew its defaults
+	// from, and is empty on a line that spelled its assertions out. It changes
+	// nothing about the scan; it is carried so the report and the emitted VEX can
+	// say which named profile a conditional conclusion rests on. See
+	// analyze.RuntimeAssertion.
+	Profile string
+
 	DlopenPolicy  *elfgraph.DlopenPolicy
 	ExecPolicy    *elfgraph.ExecPolicy
 	DynamicPolicy *modgraph.DynamicPolicy
@@ -96,6 +103,9 @@ func (a *scanAssert) apply(opts *analyze.Options) {
 	}
 	if a.Roots != nil {
 		opts.Roots = a.Roots
+	}
+	if a.Profile != "" {
+		opts.Profile = a.Profile
 	}
 	if a.DlopenPolicy != nil {
 		opts.DlopenPolicy = *a.DlopenPolicy
@@ -170,16 +180,29 @@ func fetchImageList(ctx context.Context, u string) ([]byte, error) {
 // Whitespace after the reference begins the per-image assertions, which an
 // image reference also cannot contain. See scanAssert.
 func parseImageList(s string) ([]imageEntry, error) {
+	lines := strings.Split(s, "\n")
+	// Profiles are collected first so a list can define them at the bottom, or
+	// beside the image that motivated one. A definition that had to precede
+	// every use would make the obvious layout -- a block of profiles at the end,
+	// or one next to the odd image it exists for -- an error for no reason.
+	profiles, err := parseProfiles(lines)
+	if err != nil {
+		return nil, err
+	}
+
 	seen := map[string]int{}
 	var out []imageEntry
-	for n, line := range strings.Split(s, "\n") {
+	for n, line := range lines {
 		if i := strings.IndexByte(line, '#'); i >= 0 {
 			line = line[:i]
 		}
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		ref, assert, err := parseImageLine(line)
+		if isProfileLine(line) {
+			continue // already collected
+		}
+		ref, assert, err := parseImageLine(line, profiles)
 		if err != nil {
 			return nil, fmt.Errorf("line %d: %w", n+1, err)
 		}
@@ -212,53 +235,181 @@ func parseImageList(s string) ([]imageEntry, error) {
 // still be wrong about what they had asked for, which is how a pipeline ends up
 // carrying a typo for a year. A list is read before anything is pulled, so
 // saying so costs nothing.
-func parseImageLine(line string) (string, *scanAssert, error) {
+func parseImageLine(line string, profiles map[string]*scanAssert) (string, *scanAssert, error) {
 	fields := strings.Fields(line)
 	ref := fields[0]
 	if len(fields) == 1 {
 		return ref, nil, nil
 	}
 
+	// The profile is resolved before the line's own keys are read, so a key the
+	// line states wins over the same key in the profile it names. A profile is a
+	// default for a shape of image; the line is what is true about this one.
 	a := &scanAssert{}
 	for _, f := range fields[1:] {
+		if name, ok := strings.CutPrefix(f, "profile="); ok {
+			if name == "" {
+				return "", nil, fmt.Errorf("profile= names no profile")
+			}
+			p, known := profiles[name]
+			if !known {
+				return "", nil, fmt.Errorf("unknown profile %q; define it with a [profile %s] line", name, name)
+			}
+			*a = *p
+			a.Profile = name
+		}
+	}
+
+	if err := applyAssertFields(a, fields[1:], false); err != nil {
+		return "", nil, err
+	}
+	return ref, a, nil
+}
+
+// applyAssertFields reads key=value assertions onto a, overwriting whatever a
+// already carries for the keys it names. Shared by an image line and a [profile]
+// definition so the two can never drift into accepting different grammars.
+//
+// inProfile says the fields came from a [profile] definition, where profile= is
+// not a key: only an image line resolves one, so a profile that named another
+// would be read, accepted, and silently ignored.
+func applyAssertFields(a *scanAssert, fields []string, inProfile bool) error {
+	// A line that names its own roots makes a complete statement about what that
+	// image runs, so the first roots= here clears whatever a profile supplied
+	// rather than adding to it -- the same rule that makes a line's roots replace
+	// the global --roots. Later roots= on the same line still append, so a long
+	// list can be broken up the way the repeatable flag allows.
+	ownRoots := false
+	for _, f := range fields {
 		k, v, ok := strings.Cut(f, "=")
 		if !ok {
-			return "", nil, fmt.Errorf("%q is not key=value; a reference may be followed only by assertions", f)
+			return fmt.Errorf("%q is not key=value; a reference may be followed only by assertions", f)
 		}
 		switch k {
+		case "profile":
+			if inProfile {
+				// Profiles are collected in one pass and resolved in another, so
+				// nothing would expand this one. Accepting it would drop an
+				// assertion the author believed they had made -- and drop it
+				// towards concluding less, which is the direction that does not
+				// announce itself in a report.
+				return fmt.Errorf("a profile cannot name another profile; spell the assertions out")
+			}
+			// Resolved by the caller, which needs the name before any other key
+			// is read. Accepted here so it is not an unknown assertion.
 		case "roots":
+			if !ownRoots {
+				a.Roots, ownRoots = nil, true
+			}
 			// Split on commas, because a root is a path and a path cannot
-			// contain one. Repeating the key appends, so a long list can be
-			// broken up the way the repeatable --roots flag allows.
+			// contain one.
 			for _, r := range strings.Split(v, ",") {
 				if r = strings.TrimSpace(r); r != "" {
 					a.Roots = append(a.Roots, r)
 				}
 			}
 			if a.Roots == nil {
-				return "", nil, fmt.Errorf("roots= names no path")
+				return fmt.Errorf("roots= names no path")
 			}
 		case "dlopen-policy":
 			p, err := elfgraph.ParseDlopenPolicy(v)
 			if err != nil {
-				return "", nil, err
+				return err
 			}
 			a.DlopenPolicy = &p
 		case "exec-policy":
 			p, err := elfgraph.ParseExecPolicy(v)
 			if err != nil {
-				return "", nil, err
+				return err
 			}
 			a.ExecPolicy = &p
 		case "dynamic-import-policy":
 			p, err := modgraph.ParseDynamicPolicy(v)
 			if err != nil {
-				return "", nil, err
+				return err
 			}
 			a.DynamicPolicy = &p
 		default:
-			return "", nil, fmt.Errorf("unknown assertion %q: want roots, dlopen-policy, exec-policy or dynamic-import-policy", k)
+			want := "profile, roots, dlopen-policy, exec-policy or dynamic-import-policy"
+			if inProfile {
+				want = "roots, dlopen-policy, exec-policy or dynamic-import-policy"
+			}
+			return fmt.Errorf("unknown assertion %q: want %s", k, want)
 		}
 	}
-	return ref, a, nil
+	return nil
+}
+
+// profilePrefix opens a profile definition line.
+const profilePrefix = "[profile "
+
+// isProfileLine reports whether a list line defines a profile rather than naming
+// an image. Checked on the comment-stripped line, since a definition may be
+// annotated like anything else in the list.
+func isProfileLine(line string) bool {
+	return strings.HasPrefix(strings.TrimSpace(line), profilePrefix)
+}
+
+// parseProfiles collects the named assertion profiles a list defines.
+//
+// A Rancher fleet is a hundred images whose deployment shapes repeat -- a
+// hardened Go daemon with one entrypoint, a supervisor wrapped in a shell, a CLI
+// that execs nothing. Spelling the same roots= and exec-policy= out on each line
+// makes the list unmaintainable and, worse, makes it drift: half the lines get
+// updated and the other half keep asserting something that stopped being true.
+// A profile is the same assertion said once.
+//
+//	[profile go-daemon] exec-policy=assume-none
+//	[profile calico]    roots=/usr/bin/calico-node exec-policy=assume-none
+//
+//	docker.io/rancher/hardened-calico:v3.32.0-build20260511 profile=calico
+//	docker.io/rancher/hardened-coredns:v1.11.1-build20240910 profile=go-daemon roots=/coredns
+//
+// The name is carried onto the scan and out into the report and the emitted VEX,
+// so a conclusion that rests on a profile says which one. That is the point of
+// naming them rather than expanding them: "under the asserted runtime profile
+// 'calico'" is something a reviewer can look up and disagree with.
+//
+// A profile that defines nothing, a name defined twice, and a name used but
+// never defined are all errors, reported before anything is pulled. The rule is
+// the one the rest of this file already follows: a list is read once, cheaply,
+// and every way of being wrong about what you asked for should surface there
+// rather than as a report that quietly concluded less.
+func parseProfiles(lines []string) (map[string]*scanAssert, error) {
+	var profiles map[string]*scanAssert
+	for n, line := range lines {
+		if i := strings.IndexByte(line, '#'); i >= 0 {
+			line = line[:i]
+		}
+		if !isProfileLine(line) {
+			continue
+		}
+		line = strings.TrimSpace(line)
+		close := strings.IndexByte(line, ']')
+		if close < 0 {
+			return nil, fmt.Errorf("line %d: %s has no closing \"]\"", n+1, profilePrefix)
+		}
+		name := strings.TrimSpace(line[len(profilePrefix):close])
+		if name == "" {
+			return nil, fmt.Errorf("line %d: [profile ] names no profile", n+1)
+		}
+		if _, dup := profiles[name]; dup {
+			return nil, fmt.Errorf("line %d: profile %q is defined twice; say it once", n+1, name)
+		}
+		a := &scanAssert{}
+		if err := applyAssertFields(a, strings.Fields(line[close+1:]), true); err != nil {
+			return nil, fmt.Errorf("line %d: profile %q: %w", n+1, name, err)
+		}
+		if a.Roots == nil && a.DlopenPolicy == nil && a.ExecPolicy == nil && a.DynamicPolicy == nil {
+			// An empty profile is almost certainly a half-written one. Applying
+			// it would be a no-op that reads, on the line that names it, like an
+			// assertion being made.
+			return nil, fmt.Errorf("line %d: profile %q asserts nothing", n+1, name)
+		}
+		if profiles == nil {
+			profiles = map[string]*scanAssert{}
+		}
+		profiles[name] = a
+	}
+	return profiles, nil
 }

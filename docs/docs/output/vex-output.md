@@ -71,6 +71,46 @@ No token is needed: `--vex-out` writes to the filesystem, and every read of the
 hub goes over the same read-only path `--vexhub` already uses, so a local
 directory, a raw base URL and a `github.com` URL all work as the merge base.
 
+#### Conditional conclusions
+
+`--roots`, and the `assume-none` policies, do not reveal anything further about
+an image. They replace a question the scan cannot answer with an answer you
+supplied. "No object the closure reaches imports this function" is a fact about
+the image; "…given that execution starts at `/usr/bin/calico-node` and nothing
+else is ever run" is a conditional answer, and the condition is a claim about
+your deployment rather than anything in the image.
+
+Both are legitimate, and on a single-entrypoint image the second is often the
+only one that gets anywhere. Only one of them is auditable, though, and only if
+the condition travels with the conclusion. So a run that asserted something says
+so twice: a `NOTE` in the report, repeated in the footer, and a clause on the
+`impact_statement` of each statement it bears on.
+
+```
+Ruled out by vexscan (elf-import-absent): no object the closure reaches imports
+EVP_PKEY_get1_RSA. Conditional: under the asserted runtime profile "calico":
+execution starts at /usr/bin/calico-node; the entrypoint is asserted to run
+nothing else
+```
+
+When the assertion came from a [fleet list](../guides/fleet.md#named-profiles),
+the profile's name is quoted in that sentence. That is the point of naming a
+profile rather than expanding it onto sixty lines: a reviewer reading the
+document six months later can look the name up and disagree with it.
+
+**It is attached to execute-path claims and no others.** Whether a package is
+installed, and whether its own objects define the advisory's function, are read
+out of the image and out of the package's symbol tables — no assertion about the
+entrypoint moves either. So `component_not_present` and
+`vulnerable_code_not_present` are never conditioned, and
+`vulnerable_code_not_in_execute_path` always is. Attaching the caveat to all
+three would be easier, inaccurate, and self-defeating: a reader who sees the
+same sentence on every statement learns to skip it.
+
+**A default policy is not an assertion.** A taint left blocking is the scan
+doing its own work, not a claim you made, so only `assume-none` is recorded —
+and a run that asserted nothing emits exactly the bytes it did before.
+
 #### Merged "master" reports (`--vex-merge-into`)
 
 Some hubs publish, alongside the per-product tree, one document with *every*

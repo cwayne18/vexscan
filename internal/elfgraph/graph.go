@@ -905,16 +905,39 @@ func (g *Graph) collectTaints(opts Options) {
 		if n.Info.Dlopen {
 			assumed := opts.DlopenPolicy == DlopenAssumeNone
 			detail := fmt.Sprintf("%s calls dlopen, so what it loads is decided at runtime", p)
-			if assumed {
-				detail += ", and --dlopen-policy=assume-none says to take that as loading nothing that matters here"
+
+			// Before the blanket policy, try the narrower discharge: a known
+			// loader family whose plugins live only in directories this graph
+			// already roots and walked. When it applies, the closure is not a
+			// lower bound for this caller -- everything it can dlopen is already
+			// in it -- so the taint is recorded rather than allowed to block,
+			// without asserting anything about any other caller. See loaders.go
+			// for why each condition is load-bearing.
+			bounded := ""
+			if !assumed {
+				bounded = g.boundedDlopenReason(n.Info.Soname, opts.Config)
 			}
+
+			switch {
+			case assumed:
+				detail += ", and --dlopen-policy=assume-none says to take that as loading nothing that matters here"
+			case bounded != "":
+				detail += ", but " + bounded
+			}
+
+			// A bounded discharge is a discharge in the same sense as the
+			// pure-Go and assume-none ones: the taint would have blocked
+			// globally, and something answered it. Recording it as such keeps
+			// the clean verdict auditable -- a reader sees the closure rests on
+			// the loader being confined, not on nothing ever having threatened.
+			discharged := assumed || bounded != ""
 			g.taints = append(g.taints, Taint{
 				Kind:       TaintDlopen,
 				Detail:     detail,
 				Path:       p,
-				Blocking:   !assumed,
-				Global:     !assumed,
-				Discharged: assumed,
+				Blocking:   !discharged,
+				Global:     !discharged,
+				Discharged: discharged,
 			})
 		}
 		if n.Kind >= RootEscalated && n.Info.Static() {
@@ -1043,6 +1066,70 @@ func (g *Graph) Nodes() []*Node {
 
 // Roots returns the paths the closure started from, in path order.
 func (g *Graph) Roots() []string { return append([]string{}, g.roots...) }
+
+// boundedDlopenReason decides whether a reachable dlopen caller can be
+// discharged because it is a recognised loader family confined to plugin
+// directories this graph already roots. It returns the evidence clause naming
+// why when it can, and "" when it cannot -- in which case the caller keeps the
+// global blocking dlopen taint.
+//
+// All three conditions from loaders.go are enforced here, and the order is
+// cheapest-first. The soname allowlist is the identity check; a redirect env
+// set in the config voids the bound; a config file that can name a module by
+// absolute path voids it too; and the plugin dir must be present and rooted in
+// THIS image, so the discharge rests on alwaysRoot having actually pulled the
+// plugins into the closure rather than on the assumption that it would have.
+func (g *Graph) boundedDlopenReason(soname string, cfg target.ImageConfig) string {
+	fam, ok := boundedLoader(soname)
+	if !ok {
+		return ""
+	}
+	if fam.redirected(cfg) {
+		// The image points the loader somewhere the closure did not follow, so
+		// what it loads is no longer bounded to the rooted dirs. Stay blocking.
+		return ""
+	}
+	if fam.configRedirect != nil && fam.configRedirect(g.fsys) {
+		// An environment variable is not the only way to redirect this loader:
+		// its config file can name a plugin by absolute path with no variable
+		// set. When the config could do that -- or cannot be read to rule it
+		// out -- the closure is a lower bound again, so stay blocking.
+		return ""
+	}
+	rooted := g.rootedPluginDirs(fam.pluginDirs)
+	if len(rooted) == 0 {
+		return ""
+	}
+	return fam.reason(rooted)
+}
+
+// rootedPluginDirs returns the given plugin directories that hold at least one
+// rooted plugin node in this graph. It is the proof that the loader family's
+// plugins were actually rooted and walked here, not merely that they would be
+// in some canonical image -- an OpenSSL build with no providers on disk roots
+// nothing in ossl-modules, and its libcrypto stays blocking because the
+// discharge has nothing to stand on.
+//
+// Only the dirs that really matched are returned, so the evidence line names
+// the directories the bound rests on rather than the ones the family could have
+// used. An image with engines and no providers should not be described as
+// bounded by a directory it does not have.
+func (g *Graph) rootedPluginDirs(dirs []string) []string {
+	var out []string
+	for _, d := range dirs {
+		for _, p := range g.order {
+			n := g.nodes[p]
+			if !n.Root || n.Kind != RootPlugin {
+				continue
+			}
+			if strings.Contains(p, d) {
+				out = append(out, strings.Trim(d, "/"))
+				break
+			}
+		}
+	}
+	return out
+}
 
 // Taints returns everything the closure could not account for.
 func (g *Graph) Taints() []Taint { return append([]Taint{}, g.taints...) }

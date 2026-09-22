@@ -48,7 +48,7 @@ func TestSubcomponentIDKeepsNamespaceSlashesLiteral(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c, ok := claimFor(ruledOutFinding(product, tt.purl, "CVE-2026-56855", tt.method), "2026-09-16T00:00:00Z")
+			c, ok := claimFor(ruledOutFinding(product, tt.purl, "CVE-2026-56855", tt.method), "2026-09-16T00:00:00Z", nil)
 			if !ok {
 				t.Fatal("claimFor declined a ruled-out finding")
 			}

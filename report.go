@@ -220,6 +220,7 @@ func writeCaveats(dst *strings.Builder, res *analyze.Result, pal palette) {
 		fmt.Fprintf(b, "      %s\n", unfixedSpread(w))
 		writeUnfixedAffected(b, w, "      ")
 	}
+	writeRuntimeAssertion(b, res)
 	writeCorrectionsCaveat(b, res)
 	for _, h := range res.VEXHubs {
 		if h.Error == "" {
@@ -367,6 +368,28 @@ func writeUncomparableCaveat(b *strings.Builder, res *analyze.Result) {
 	fmt.Fprintf(b, "      Affected module(s): %s\n", strings.Join(modules, ", "))
 	b.WriteString("      These are neither confirmed nor cleared. To decide them, check the\n")
 	b.WriteString("      module's real version in the source the image was built from.\n")
+}
+
+// writeRuntimeAssertion names what the user told this scan about how the target
+// is run, when they told it anything.
+//
+// It belongs with the caveats rather than with the provenance line because it is
+// not a fact about the run, it is a condition on the rows. --roots and
+// --exec-policy=assume-none do not reveal anything further about the image; they
+// replace a question the scan cannot answer with an answer the user supplied, and
+// every RULED OUT row that rests on reachability is true relative to it.
+//
+// A count of the rows it carried would be better than a bare statement, and is
+// not available here -- the report does not know which conclusions would have
+// been withheld without it. The statement alone is still worth printing: a reader
+// who disagrees with the profile now knows there is a profile to disagree with,
+// which is the whole difference between a conditional answer and a false one.
+func writeRuntimeAssertion(b *strings.Builder, res *analyze.Result) {
+	s := res.Runtime.Sentence()
+	if s == "" {
+		return
+	}
+	fmt.Fprintf(b, "NOTE: ruled-out reachability rows are conditional - %s\n", s)
 }
 
 // writeCorrectionsCaveat names the advisories the database matched and this

@@ -544,6 +544,17 @@ func TestAPureGoEntrypointDischargesTheStaticTaint(t *testing.T) {
 // image runs PAM.
 func pamImage(t *testing.T, needs ...string) map[string]ecosystem.Finding {
 	t.Helper()
+	return pamImageWithFiles(t, nil, needs...)
+}
+
+// pamImageWithFiles is pamImage with extra files written into the tree, which is
+// how a test supplies the PAM configuration the bounded-loader discharge reads.
+func pamImageWithFiles(t *testing.T, extra map[string]string, needs ...string) map[string]ecosystem.Finding {
+	t.Helper()
+	files := map[string]string{"/usr/bin/app": ""}
+	for k, v := range extra {
+		files[k] = v
+	}
 	img := debianImage(t,
 		target.ImageConfig{Entrypoint: []string{"/usr/bin/app"}},
 		[]debPkg{
@@ -552,7 +563,7 @@ func pamImage(t *testing.T, needs ...string) map[string]ecosystem.Finding {
 			}},
 			{name: "libcurl4", version: "7.88.1-10", source: "curl", files: []string{"/usr/lib/libcurl.so.4"}},
 		},
-		map[string]string{"/usr/bin/app": ""})
+		files)
 
 	libpam := lib("libpam.so.0")
 	libpam.Dlopen = true
@@ -609,15 +620,51 @@ func TestPluginsWithNoLoaderDoNotHoldAnImageHostage(t *testing.T) {
 }
 
 // The other direction, which is what keeps the test above from being satisfied
-// by dropping plugins altogether: an image that does run PAM reaches libpam,
-// libpam opens the module, and the dlopen taint is back.
+// by dropping plugins altogether: an image that does run PAM reaches libpam, and
+// libpam's module is admitted to the closure along with it.
+//
+// What that admission no longer costs is every other package in the image. PAM's
+// module directory is compiled in, nothing in the environment moves it, and this
+// image's configuration names no module outside it -- so everything libpam can
+// dlopen is already rooted, and curl, which nothing reaches, can still be ruled
+// out. The taint is recorded and discharged rather than absent: the reader has
+// to be able to see that the clean verdict rests on the loader being confined.
+// TestAReachableRedirectedLoaderStillBlocks is the guard on the other side.
 func TestAReachableLoaderStillAdmitsItsPlugins(t *testing.T) {
 	got := pamImage(t, "libpam.so.0")
 
-	for _, name := range []string{"pam", "curl"} {
-		if f := got[name]; f.Status != ecosystem.StatusLinked {
-			t.Errorf("%s: status = %s, want linked", name, f.Status)
+	if f := got["pam"]; f.Status != ecosystem.StatusLinked {
+		t.Errorf("pam: status = %s, want linked -- the module was not admitted", f.Status)
+	}
+	if f := got["curl"]; f.Status != ecosystem.StatusNotInPath {
+		t.Errorf("curl: status = %s, want not_in_execute_path", f.Status)
+	}
+	var discharged bool
+	for _, e := range got["curl"].Evidence {
+		if e.Blocking {
+			t.Errorf("curl: blocking evidence from a loader that cannot escape its dir: %q", e.Detail)
 		}
+		if strings.Contains(e.Detail, "dlopen") && strings.Contains(e.Detail, "PAM") {
+			discharged = true
+		}
+	}
+	if !discharged {
+		t.Errorf("the discharged dlopen taint left no trace in the evidence: %+v", got["curl"].Evidence)
+	}
+}
+
+// A PAM stanza may name its module by absolute path, and libpam will load it
+// from wherever it says -- a directory nothing rooted and the closure never
+// walked. That is the case the global dlopen taint has always existed to cover,
+// and discharging the bounded loader must not swallow it: with such a config in
+// the image, curl goes back to linked.
+func TestAReachableRedirectedLoaderStillBlocks(t *testing.T) {
+	got := pamImageWithFiles(t,
+		map[string]string{"/etc/pam.d/sshd": "auth optional /opt/vendor/pam_vendor.so\n"},
+		"libpam.so.0")
+
+	if f := got["curl"]; f.Status != ecosystem.StatusLinked {
+		t.Errorf("curl: status = %s, want linked", f.Status)
 	}
 	var blocking bool
 	for _, e := range got["curl"].Evidence {
@@ -626,7 +673,7 @@ func TestAReachableLoaderStillAdmitsItsPlugins(t *testing.T) {
 		}
 	}
 	if !blocking {
-		t.Errorf("libpam is in the closure and its dlopen did not block: %+v", got["curl"].Evidence)
+		t.Errorf("a pam config naming a module by absolute path did not block: %+v", got["curl"].Evidence)
 	}
 }
 
