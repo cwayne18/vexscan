@@ -136,7 +136,20 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 	// with the structural discharge. A cleared taint is dropped from this
 	// finding's blockers, so the discharge unlocks a conclusion rather than
 	// merely annotating a blocked one.
+	//
+	// Two discharges, and the structural one needs no advisory: see
+	// staticProgramOnlyDischarges. Where both answer for the same entrypoint the
+	// symbol proof wins, because it is the more specific statement.
+	structural := e.staticProgramOnlyDischarges(pkg.Name, pkg.Files, files)
 	cleared := e.staticSymbolDischarges(sym)
+	for p, d := range structural {
+		if cleared == nil {
+			cleared = map[string]string{}
+		}
+		if cleared[p] == "" {
+			cleared[p] = d
+		}
+	}
 	if len(cleared) > 0 {
 		blockers = e.blockersExcept(files.ELF, cleared)
 	}
@@ -153,7 +166,11 @@ func (e evaluator) evaluate(c ecosystem.Component, req ecosystem.Request) ecosys
 	// footnote to it.
 	f.Evidence = append(f.Evidence, e.discharged()...)
 	for _, p := range sortedUnique(mapKeys(cleared)) {
-		f.Evidence = append(f.Evidence, ecosystem.Evidence{Origin: MethodStaticSymbolAbsent, Detail: cleared[p]})
+		origin := MethodStaticSymbolAbsent
+		if structural[p] != "" && structural[p] == cleared[p] {
+			origin = MethodStaticProgramOnly
+		}
+		f.Evidence = append(f.Evidence, ecosystem.Evidence{Origin: origin, Detail: cleared[p]})
 	}
 
 	// The mined-symbol layer runs before the closure is consulted, because it
@@ -519,6 +536,69 @@ func (e evaluator) taintsWhere(elfFiles []string, blocking bool, cleared map[str
 			Detail:   t.Detail,
 			Blocking: t.Blocking,
 		})
+	}
+	return out
+}
+
+// staticProgramOnlyDischarges clears the static-elf taint for a package whose
+// ELF objects are all programs.
+//
+// The taint says a statically linked entrypoint may carry a copy of a library
+// that is not on disk, so the closure is not a complete account of what code is
+// present. That is a claim about linkable code. A package that installs only
+// programs -- cpio installs /usr/bin/cpio and nothing else -- ships none of it.
+// An executable is not linked into another executable, so no amount of static
+// linking in the entrypoint can hide this package's code, and the closure's
+// finding that nothing reaches these objects stands on its own.
+//
+// Unlike the symbol discharge below, it needs no advisory and no mined symbol.
+// That is also why it is safe without one: it removes a blocker that was never
+// about this package, rather than asserting anything about the vulnerability.
+// The advisories this unblocks tend to agree -- they describe a bug in mount, in
+// gzexe, in bzip2recover -- but this does not read them, because a discharge
+// that depended on advisory prose would be the thing it is trying not to be.
+//
+// Two conditions keep it honest:
+//
+//   - Every ELF object must be a program and must declare no SONAME. A package
+//     shipping one library beside ten tools keeps the taint, because the library
+//     is exactly what could have been linked in. The SONAME half of that is not
+//     redundant: glibc's libc.so.6 carries its own PT_INTERP so that running it
+//     prints the version banner, which makes it a program by header alone. What
+//     actually distinguishes a library is that it declares a name to be linked
+//     against, so that is what gets asked.
+//   - The package must install no static archive or loose object file. A .a is
+//     precisely the linkable form a static entrypoint consumes, and it is not an
+//     ELF object the graph indexes, so its absence from files.ELF must not be
+//     read as its absence from the package.
+func (e evaluator) staticProgramOnlyDischarges(name string, allFiles []string, files elfgraph.FileSet) map[string]string {
+	if len(files.ELF) == 0 {
+		return nil
+	}
+	for _, f := range files.ELF {
+		n, ok := e.g.Node(f)
+		if !ok || !n.Info.IsProgram() || n.Info.Soname != "" {
+			return nil
+		}
+	}
+	for _, f := range allFiles {
+		switch strings.ToLower(path.Ext(f)) {
+		case ".a", ".o":
+			return nil
+		}
+	}
+
+	var out map[string]string
+	for _, t := range e.g.Taints() {
+		if t.Kind != elfgraph.TaintStaticELF || !t.Blocking || t.Path == "" {
+			continue
+		}
+		if out == nil {
+			out = map[string]string{}
+		}
+		out[t.Path] = fmt.Sprintf(
+			"%s installs only programs (%s), and a program is not linked into another program, so %s being statically linked cannot be hiding its code",
+			name, objects(files.ELF), t.Path)
 	}
 	return out
 }

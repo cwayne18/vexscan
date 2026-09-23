@@ -9,8 +9,11 @@ import (
 	"github.com/cwayne18/vexscan/internal/osv"
 )
 
-// Methods for the mined-symbol layer. Both only ever appear under
-// --mine-advisories.
+// Methods for the mined-symbol layer, which only appear under
+// --mine-advisories, and the one structural method that sits beside them.
+// MethodStaticProgramOnly is the exception: it discharges the same taint the
+// two static methods here do, but from the shape of the package rather than
+// from a mined symbol, so it needs no advisory and no model.
 const (
 	// MethodDynsymAbsent: the vulnerable function the advisory names is not in
 	// the export table of anything this package installed.
@@ -31,6 +34,11 @@ const (
 	// under --mine-advisories, because it needs a validated vulnerable symbol to
 	// look for.
 	MethodStaticSymbolAbsent = "elf-static-symbol-absent"
+	// MethodStaticProgramOnly clears the static-elf taint for a package that
+	// installs no linkable code at all -- only programs. It needs no advisory
+	// and no symbol, because the question it answers is about the package
+	// rather than the vulnerability. See staticProgramOnlyDischarges.
+	MethodStaticProgramOnly = "elf-static-program-only"
 	// MethodMined marks an observation from the mining layer that changed no
 	// status -- including every case where validation rejected a hint.
 	MethodMined = "llm-mined"
