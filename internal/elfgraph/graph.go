@@ -50,6 +50,23 @@ type Options struct {
 	// DlopenPolicy decides whether a reachable dlopen blocks conclusions.
 	DlopenPolicy DlopenPolicy
 
+	// DlopenAssumeNoneFor names individual dlopen callers the user asserts load
+	// nothing that matters, by tree-absolute path or by SONAME.
+	//
+	// It is the narrow form of DlopenAssumeNone, and exists because the blanket
+	// one is usually far more than the user means. An image whose only
+	// unanswered loader is /usr/bin/bash needs one claim about bash; saying
+	// assume-none instead also waves off every library in the image that was
+	// never examined, including any added to it later. The narrow claim is the
+	// one a reviewer can check, so it is the one worth making easy to write.
+	//
+	// Naming a caller that does not exist, or one that calls no dlopen, is not
+	// an error: it discharges nothing, which leaves the run more conservative
+	// rather than less. See TaintInertAssertion for why it is still reported.
+	//
+	// Setting this together with DlopenPolicy=assume-none is refused by Build.
+	DlopenAssumeNoneFor []string
+
 	// ExecPolicy decides whether an entrypoint that can start another program
 	// blocks conclusions.
 	ExecPolicy ExecPolicy
@@ -224,6 +241,16 @@ func Build(fsys target.RootFS, opts Options) (*Graph, error) {
 	}
 	if opts.ExecPolicy == "" {
 		opts.ExecPolicy = ExecTaint
+	}
+	// Refused rather than resolved, because there is no reading of the pair
+	// that is not a mistake. The blanket policy subsumes every name, so the
+	// names would change nothing and the report would carry a precise-looking
+	// list of callers beside an assertion that covered all of them -- the
+	// narrow claim's audit trail attached to the broad claim's conclusions.
+	if opts.DlopenPolicy == DlopenAssumeNone && len(opts.DlopenAssumeNoneFor) > 0 {
+		return nil, fmt.Errorf("--dlopen-policy=assume-none waves off every dlopen caller, "+
+			"so naming %s with --dlopen-assume-none asserts both less and more than you mean: use one or the other",
+			strings.Join(opts.DlopenAssumeNoneFor, ", "))
 	}
 
 	g := &Graph{fsys: fsys, config: opts.Config, nodes: map[string]*Node{}}
@@ -918,11 +945,25 @@ func (g *Graph) collectTaints(opts Options) {
 				bounded = g.boundedDlopenReason(n.Info.Soname, opts.Config)
 			}
 
+			named := matchDlopenAssertion(opts.DlopenAssumeNoneFor, p, n.Info.Soname)
+
+			// The order of these cases is what decides which reason a reader
+			// is given when more than one applies, and it puts the named
+			// assertion last deliberately: it is the only one of the three
+			// that is a claim rather than a finding. The bounded discharge is
+			// something the graph worked out; this is something a human
+			// promised. Reporting the promise over the proof would tell a
+			// reviewer a clean row rests on an assertion when it does not,
+			// which is a report being wrong about its own strength in the
+			// direction that gets sound evidence discounted.
 			switch {
 			case assumed:
 				detail += ", and --dlopen-policy=assume-none says to take that as loading nothing that matters here"
 			case bounded != "":
 				detail += ", but " + bounded
+			case named != "":
+				detail += ", and --dlopen-assume-none names " + named +
+					", so the user asserts this caller loads nothing that matters here"
 			}
 
 			// A bounded discharge is a discharge in the same sense as the
@@ -930,7 +971,7 @@ func (g *Graph) collectTaints(opts Options) {
 			// globally, and something answered it. Recording it as such keeps
 			// the clean verdict auditable -- a reader sees the closure rests on
 			// the loader being confined, not on nothing ever having threatened.
-			discharged := assumed || bounded != ""
+			discharged := assumed || bounded != "" || named != ""
 			g.taints = append(g.taints, Taint{
 				Kind:       TaintDlopen,
 				Detail:     detail,
@@ -991,6 +1032,49 @@ func (g *Graph) collectTaints(opts Options) {
 				Discharged: explicit && !blocking,
 			})
 		}
+	}
+	g.collectInertAssertions(opts)
+}
+
+// collectInertAssertions records every --dlopen-assume-none name that answered
+// no caller.
+//
+// The match is recomputed here over all dlopen callers rather than being
+// collected as the taints were built, because a name is not inert merely
+// because it lost. A caller the bounded-loader discharge already answered
+// reports that answer instead of the assertion, which is right -- the graph's
+// own finding is the better evidence -- but the user's name did find its
+// caller, and telling them it matched nothing would send them looking for a
+// typo that is not there.
+func (g *Graph) collectInertAssertions(opts Options) {
+	matched := map[string]bool{}
+	for _, p := range g.order {
+		n := g.nodes[p]
+		if !n.Reachable || !n.Info.Dlopen {
+			continue
+		}
+		if m := matchDlopenAssertion(opts.DlopenAssumeNoneFor, p, n.Info.Soname); m != "" {
+			matched[m] = true
+		}
+	}
+
+	for _, name := range opts.DlopenAssumeNoneFor {
+		if matched[name] {
+			continue
+		}
+		why := "is not a reachable object in this image"
+		if _, ok := g.Node(name); ok {
+			why = "is in this image but calls no dlopen the closure reached"
+		}
+		g.taints = append(g.taints, Taint{
+			Kind: TaintInertAssertion,
+			Detail: fmt.Sprintf("--dlopen-assume-none names %s, which %s, so the assertion discharged nothing",
+				name, why),
+			Path: name,
+			// Never blocking, and never a discharge: nothing was answered and
+			// nothing was waved away. See TaintInertAssertion.
+			Blocking: false,
+		})
 	}
 }
 
@@ -1406,5 +1490,22 @@ func sortedNeeded(m map[string]string) []string {
 		out = append(out, k)
 	}
 	sort.Strings(out)
+	return out
+}
+
+// InertAssertions are the --dlopen-assume-none names this image gave nothing to
+// discharge, in the order the user gave them.
+//
+// It reads back the taints rather than being returned from Build because the
+// caller that needs it is not the caller that builds the graph: the report
+// states the assertion, and the assertion is only honest if it also says which
+// parts of it did no work.
+func (g *Graph) InertAssertions() []string {
+	var out []string
+	for _, t := range g.taints {
+		if t.Kind == TaintInertAssertion {
+			out = append(out, t.Path)
+		}
+	}
 	return out
 }

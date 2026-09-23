@@ -94,6 +94,13 @@ type scanAssert struct {
 	DlopenPolicy  *elfgraph.DlopenPolicy
 	ExecPolicy    *elfgraph.ExecPolicy
 	DynamicPolicy *modgraph.DynamicPolicy
+
+	// DlopenAssumeNoneFor are the callers this line waves off by name. Unlike
+	// the policies it is a list, so it follows the roots= rule rather than the
+	// policy one: a line naming its own callers replaces the profile's list
+	// instead of extending it, because a line that knows which loaders its
+	// image has is making a complete statement about them.
+	DlopenAssumeNoneFor []string
 }
 
 // apply overlays the assertions onto a copy of the run's options.
@@ -109,6 +116,9 @@ func (a *scanAssert) apply(opts *analyze.Options) {
 	}
 	if a.DlopenPolicy != nil {
 		opts.DlopenPolicy = *a.DlopenPolicy
+	}
+	if a.DlopenAssumeNoneFor != nil {
+		opts.DlopenAssumeNoneFor = a.DlopenAssumeNoneFor
 	}
 	if a.ExecPolicy != nil {
 		opts.ExecPolicy = *a.ExecPolicy
@@ -279,7 +289,7 @@ func applyAssertFields(a *scanAssert, fields []string, inProfile bool) error {
 	// rather than adding to it -- the same rule that makes a line's roots replace
 	// the global --roots. Later roots= on the same line still append, so a long
 	// list can be broken up the way the repeatable flag allows.
-	ownRoots := false
+	ownRoots, ownDlopen := false, false
 	for _, f := range fields {
 		k, v, ok := strings.Cut(f, "=")
 		if !ok {
@@ -311,6 +321,21 @@ func applyAssertFields(a *scanAssert, fields []string, inProfile bool) error {
 			if a.Roots == nil {
 				return fmt.Errorf("roots= names no path")
 			}
+		case "dlopen-assume-none":
+			// Same clear-then-append rule as roots=, for the same reason, and
+			// with the same comma split: these are paths and SONAMEs, neither
+			// of which can contain a comma.
+			if !ownDlopen {
+				a.DlopenAssumeNoneFor, ownDlopen = nil, true
+			}
+			for _, c := range strings.Split(v, ",") {
+				if c = strings.TrimSpace(c); c != "" {
+					a.DlopenAssumeNoneFor = append(a.DlopenAssumeNoneFor, c)
+				}
+			}
+			if a.DlopenAssumeNoneFor == nil {
+				return fmt.Errorf("dlopen-assume-none= names no caller")
+			}
 		case "dlopen-policy":
 			p, err := elfgraph.ParseDlopenPolicy(v)
 			if err != nil {
@@ -330,9 +355,9 @@ func applyAssertFields(a *scanAssert, fields []string, inProfile bool) error {
 			}
 			a.DynamicPolicy = &p
 		default:
-			want := "profile, roots, dlopen-policy, exec-policy or dynamic-import-policy"
+			want := "profile, roots, dlopen-policy, dlopen-assume-none, exec-policy or dynamic-import-policy"
 			if inProfile {
-				want = "roots, dlopen-policy, exec-policy or dynamic-import-policy"
+				want = "roots, dlopen-policy, dlopen-assume-none, exec-policy or dynamic-import-policy"
 			}
 			return fmt.Errorf("unknown assertion %q: want %s", k, want)
 		}
@@ -400,7 +425,8 @@ func parseProfiles(lines []string) (map[string]*scanAssert, error) {
 		if err := applyAssertFields(a, strings.Fields(line[close+1:]), true); err != nil {
 			return nil, fmt.Errorf("line %d: profile %q: %w", n+1, name, err)
 		}
-		if a.Roots == nil && a.DlopenPolicy == nil && a.ExecPolicy == nil && a.DynamicPolicy == nil {
+		if a.Roots == nil && a.DlopenPolicy == nil && a.ExecPolicy == nil &&
+			a.DynamicPolicy == nil && a.DlopenAssumeNoneFor == nil {
 			// An empty profile is almost certainly a half-written one. Applying
 			// it would be a no-op that reads, on the line that names it, like an
 			// assertion being made.

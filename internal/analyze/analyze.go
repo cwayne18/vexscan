@@ -182,6 +182,10 @@ type Options struct {
 	Profile string
 	// DlopenPolicy decides whether a reachable dlopen blocks conclusions.
 	DlopenPolicy elfgraph.DlopenPolicy
+	// DlopenAssumeNoneFor names individual dlopen callers the user asserts
+	// load nothing that matters, as the narrow form of DlopenPolicy
+	// assume-none. See elfgraph.Options.
+	DlopenAssumeNoneFor []string
 	// ExecPolicy decides whether an entrypoint that can start another program
 	// blocks conclusions.
 	ExecPolicy elfgraph.ExecPolicy
@@ -396,7 +400,30 @@ type RuntimeAssertion struct {
 	// The policies, recorded only when set to something other than the
 	// blocking default -- a taint left blocking is not an assertion, it is the
 	// scan doing its own work.
-	DlopenAssumeNone  bool `json:"dlopen_assume_none,omitempty"`
+	DlopenAssumeNone bool `json:"dlopen_assume_none,omitempty"`
+
+	// DlopenAssumeNoneFor are the individual dlopen callers the user waved
+	// off by name. It is kept separate from the blanket bool above, and both
+	// are spelled out by Sentence, because the two claims are not close to the
+	// same size: one says a named library loads nothing that matters, the
+	// other says that of every loader in the image including the ones nobody
+	// has looked at. A report that rendered them identically would let the
+	// broad claim borrow the narrow one's credibility.
+	DlopenAssumeNoneFor []string `json:"dlopen_assume_none_for,omitempty"`
+
+	// DlopenInert is the subset of DlopenAssumeNoneFor that matched no dlopen
+	// caller in this image, so that naming it discharged nothing.
+	//
+	// It is filled in after the closure is built, and it is the reason this
+	// struct is not purely a copy of the options. An assertion that matched
+	// nothing cannot make a conclusion wrong -- it removes no taint, so the run
+	// is strictly more conservative than the user asked for -- which is exactly
+	// why it has to be said. The consequence of a typo here is invisible: rows
+	// stay blocked by a dlopen the user believes they already answered, and
+	// nothing in a report that merely echoed the flag would connect the two.
+	// See elfgraph.TaintInertAssertion.
+	DlopenInert []string `json:"dlopen_inert,omitempty"`
+
 	ExecAssumeNone    bool `json:"exec_assume_none,omitempty"`
 	DynamicAssumeNone bool `json:"dynamic_assume_none,omitempty"`
 }
@@ -418,6 +445,26 @@ func (a *RuntimeAssertion) Sentence() string {
 	if a.DlopenAssumeNone {
 		parts = append(parts, "runtime library loading is asserted to load nothing that matters")
 	}
+	// The inert names are held out of the clause above rather than listed in
+	// both. "X is asserted to dlopen nothing that matters" describes a claim the
+	// scan acted on, and a name no caller answers to is not one of those; saying
+	// it anyway would report the user's intent as though it were the run's
+	// premise. They get their own clause instead, so the sentence states what
+	// was assumed and what was merely typed.
+	asserted, inert := partition(a.DlopenAssumeNoneFor, a.DlopenInert)
+	if len(asserted) > 0 {
+		parts = append(parts, strings.Join(asserted, ", ")+
+			" "+verb(len(asserted))+" asserted to dlopen nothing that matters")
+	}
+	if len(inert) > 0 {
+		was, match := "were", "match"
+		if len(inert) == 1 {
+			was, match = "was", "matches"
+		}
+		parts = append(parts, strings.Join(inert, ", ")+" "+was+
+			" named by --dlopen-assume-none and "+match+" no dlopen caller here, "+
+			"so the assertion discharged nothing")
+	}
 	if a.DynamicAssumeNone {
 		parts = append(parts, "computed imports are asserted to import nothing that matters")
 	}
@@ -431,16 +478,75 @@ func (a *RuntimeAssertion) Sentence() string {
 	return head + ": " + strings.Join(parts, "; ")
 }
 
+// verb agrees the assertion clause with however many callers were named.
+func verb(n int) string {
+	if n == 1 {
+		return "is"
+	}
+	return "are"
+}
+
+// partition splits names into the ones not in out and the ones that are,
+// keeping the caller's order in both.
+//
+// Order matters more than it looks: these names are what the user typed, and a
+// sentence that reordered them makes the reader hunt for the one they are
+// checking. Membership is tested against out rather than the other way round
+// so a name that appears twice reports twice, which is what the user wrote.
+func partition(names, out []string) (in, held []string) {
+	drop := make(map[string]bool, len(out))
+	for _, n := range out {
+		drop[n] = true
+	}
+	for _, n := range names {
+		if drop[n] {
+			held = append(held, n)
+		} else {
+			in = append(in, n)
+		}
+	}
+	return in, held
+}
+
+// inertReporter is a plugin that can say which of the run's assertions its
+// closure gave nothing to discharge. Only the OS plugin implements it today;
+// it is an interface so that recording the answer does not have to know that.
+type inertReporter interface {
+	InertAssertions() []string
+}
+
+// recordInertAssertions copies the closure's finding about which
+// --dlopen-assume-none names answered nothing onto the reported assertion.
+//
+// It takes the plugin set rather than the graph because the closure belongs to
+// the plugin that built it, and it tolerates finding no reporter: a scan with
+// no OS packages never built a closure, and "nobody looked" is not the same
+// claim as "every name matched". Reporting the second from the first is the
+// mistake this whole field exists to prevent -- it would tell a user their
+// spelling was fine on the strength of nothing having checked it.
+func recordInertAssertions(result *Result, plugins []ecosystem.Plugin) {
+	if result.Runtime == nil || len(result.Runtime.DlopenAssumeNoneFor) == 0 {
+		return
+	}
+	for _, pl := range plugins {
+		if r, ok := pl.(inertReporter); ok {
+			result.Runtime.DlopenInert = r.InertAssertions()
+			return
+		}
+	}
+}
+
 // runtimeAssertion is what this run's options assert, or nil when they assert
 // nothing. The policies count only when they are assume-none: the default is
 // the scan withholding on its own judgement, which is not a user claim.
 func (o Options) runtimeAssertion() *RuntimeAssertion {
 	a := &RuntimeAssertion{
-		Roots:             o.Roots,
-		Profile:           o.Profile,
-		DlopenAssumeNone:  o.DlopenPolicy == elfgraph.DlopenAssumeNone,
-		ExecAssumeNone:    o.ExecPolicy == elfgraph.ExecAssumeNone,
-		DynamicAssumeNone: o.DynamicPolicy == modgraph.DynamicAssumeNone,
+		Roots:               o.Roots,
+		Profile:             o.Profile,
+		DlopenAssumeNone:    o.DlopenPolicy == elfgraph.DlopenAssumeNone,
+		DlopenAssumeNoneFor: o.DlopenAssumeNoneFor,
+		ExecAssumeNone:      o.ExecPolicy == elfgraph.ExecAssumeNone,
+		DynamicAssumeNone:   o.DynamicPolicy == modgraph.DynamicAssumeNone,
 	}
 	if a.Sentence() == "" {
 		return nil
@@ -588,14 +694,15 @@ func registryFor(opts Options) *ecosystem.Registry {
 			Logf:            opts.Logf,
 		}),
 		ospkg.New(ospkg.Options{
-			Roots:              opts.Roots,
-			DlopenPolicy:       opts.DlopenPolicy,
-			ExecPolicy:         opts.ExecPolicy,
-			Ecosystem:          opts.OSVEcosystem,
-			Packages:           append(opts.rpmPackages, opts.sbomOS...),
-			Mine:               opts.MineAdvisories && opts.UseLLM,
-			TrustImportAbsence: opts.TrustImportAbsence,
-			Logf:               opts.Logf,
+			Roots:               opts.Roots,
+			DlopenPolicy:        opts.DlopenPolicy,
+			DlopenAssumeNoneFor: opts.DlopenAssumeNoneFor,
+			ExecPolicy:          opts.ExecPolicy,
+			Ecosystem:           opts.OSVEcosystem,
+			Packages:            append(opts.rpmPackages, opts.sbomOS...),
+			Mine:                opts.MineAdvisories && opts.UseLLM,
+			TrustImportAbsence:  opts.TrustImportAbsence,
+			Logf:                opts.Logf,
 		}),
 		pypi.New(pypi.Options{
 			Roots:              opts.Roots,
@@ -1000,6 +1107,9 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 		// advisory in OSV names its CVEs only in upstream. See distroOverlay.
 		result.DistroFeeds = distroOverlay(ctx, opts.DistroFeeds, distroOS, result.Findings, sets.All, logf)
 	}
+	// After the plugins have run, because whether a --dlopen-assume-none name
+	// found a caller is a fact about the closure and not about the flags.
+	recordInertAssertions(result, plugins)
 	result.Triage = triageOverlay(ctx, opts.Triage, result.Findings, sets.All, logf)
 	llmOverlay(ctx, llmClient, result.Findings, "", logf)
 	sortFindings(result.Findings)

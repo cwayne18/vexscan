@@ -32,10 +32,10 @@ in with `-`.
 
 ### Per-image assertions
 
-`--roots`, `--exec-policy`, `--dlopen-policy` and `--dynamic-import-policy` are
-process-global. What they *assert* is not. "This entrypoint execs `iptables`,
-and `iptables` is the whole list" is true of one image in a fleet of sixty;
-applied to the other fifty-nine it is meaningless at best. And since an
+`--roots`, `--exec-policy`, `--dlopen-policy`, `--dlopen-assume-none` and
+`--dynamic-import-policy` are process-global. What they *assert* is not.
+"This entrypoint execs `iptables`, and `iptables` is the whole list" is true of
+one image in a fleet of sixty; applied to the other fifty-nine it is meaningless at best. And since an
 unresolvable `--roots` path is a blocking `missing-root` taint (see
 [Taints](../how-the-tests-work.md#taints)), a global `--roots` aimed at one image withholds every
 conclusion about the rest.
@@ -57,6 +57,7 @@ rancher/nginx-ingress-controller:v1.10.4-hardened3 roots=/nginx-ingress-controll
 | `roots=` | comma-separated paths; repeatable on the line. **Replaces** the global `--roots` for this image rather than adding to it — a line that names its own roots is a complete statement about what that image runs |
 | `exec-policy=` | `taint` or `assume-none` |
 | `dlopen-policy=` | `taint` or `assume-none` |
+| `dlopen-assume-none=` | comma-separated caller paths or SONAMEs; repeatable on the line. The narrow form of `dlopen-policy=assume-none` — it waves off only the callers named. **Replaces** the inherited list rather than adding to it, on the same rule as `roots=` |
 | `dynamic-import-policy=` | `taint` or `assume-none` |
 | `profile=` | the name of a `[profile ...]` block to take these keys from; see [Named profiles](#named-profiles) |
 
@@ -99,7 +100,15 @@ A key stated on the image line wins over the same key in the profile it names,
 so `profile=go-daemon roots=/coredns` is the daemon policy with this image's own
 root. The `roots=` rule is unchanged: the first `roots=` on a line clears
 whatever the profile supplied rather than adding to it, and later `roots=` on
-that same line append.
+that same line append. `dlopen-assume-none=` works the same way, so a line can
+correct a profile's caller list rather than only extend it.
+
+A name in `dlopen-assume-none=` that matches no `dlopen` caller in the image is
+not an error — it discharges nothing, so the scan stays more conservative than
+you asked for, not less. It is reported, though, in the same condition line the
+assertion appears in: `/usr/bin/bsah was named by --dlopen-assume-none and
+matches no dlopen caller here`. A profile aimed at the wrong image, or a typo,
+otherwise produces a report identical to the one you meant.
 
 The name is carried onto the scan, into the report, and into the emitted VEX, so
 a conclusion that rests on a profile says which one — `under the asserted
