@@ -30,9 +30,18 @@ import (
 // Plugin analyzes the packages a distribution's package manager installed.
 type Plugin struct {
 	// Roots are extra entrypoints for the closure, from --roots. An image whose
-	// real command comes from outside its config -- a Kubernetes override, an
-	// init system -- has no entrypoint this plugin could otherwise find.
+	// real command comes from outside its config -- an init system, a wrapper
+	// the config does not name -- has no entrypoint this plugin could otherwise
+	// find. They add to the config's entrypoint rather than replacing it.
 	Roots []string
+
+	// Entrypoint and Cmd replace the config's, and EntrypointFrom says where
+	// they came from. This is the Kubernetes `command:`/`args:` case, where the
+	// image's declared entrypoint is genuinely not the process that runs. See
+	// elfgraph.Options.
+	Entrypoint     []string
+	Cmd            []string
+	EntrypointFrom string
 
 	// DlopenPolicy decides whether a reachable dlopen blocks conclusions.
 	DlopenPolicy elfgraph.DlopenPolicy
@@ -113,6 +122,9 @@ func (p *Plugin) InertAssertions() []string {
 // Options configure a Plugin.
 type Options struct {
 	Roots               []string
+	Entrypoint          []string
+	Cmd                 []string
+	EntrypointFrom      string
 	DlopenPolicy        elfgraph.DlopenPolicy
 	DlopenAssumeNoneFor []string
 	ExecPolicy          elfgraph.ExecPolicy
@@ -134,6 +146,9 @@ func New(opts Options) *Plugin {
 	}
 	return &Plugin{
 		Roots:               opts.Roots,
+		Entrypoint:          opts.Entrypoint,
+		Cmd:                 opts.Cmd,
+		EntrypointFrom:      opts.EntrypointFrom,
 		DlopenPolicy:        opts.DlopenPolicy,
 		DlopenAssumeNoneFor: opts.DlopenAssumeNoneFor,
 		ExecPolicy:          opts.ExecPolicy,
@@ -494,6 +509,9 @@ func (p *Plugin) graph(pr *prepared) (*elfgraph.Graph, error) {
 		pr.graph, pr.graphErr = elfgraph.Build(pr.img.FS, elfgraph.Options{
 			Config:              pr.img.Config,
 			Roots:               p.Roots,
+			Entrypoint:          p.Entrypoint,
+			Cmd:                 p.Cmd,
+			EntrypointSource:    p.EntrypointFrom,
 			DlopenPolicy:        p.DlopenPolicy,
 			DlopenAssumeNoneFor: p.DlopenAssumeNoneFor,
 			ExecPolicy:          p.ExecPolicy,

@@ -5,7 +5,9 @@ title: "Scanning a fleet (--images-from)"
 
 
 `--image` is repeatable, and `--images-from` reads a list: a file with one
-reference per line, a URL, or `-` for stdin.
+reference per line, a URL, or `-` for stdin — or a
+[Kubernetes manifest](#kubernetes-manifests-as-a-list), which carries what each
+image is started with as well as which images there are.
 
 ```sh
 vexscan --images-from fleet.txt --format summary
@@ -71,6 +73,74 @@ quietly skipped: skipping fails closed, but it leaves you believing you asked
 for something you did not. And an image named twice where either line carries
 assertions is an error too — that is not a repeat, it is the list saying the
 image runs two different things, and there is no safe way to pick one.
+
+### Kubernetes manifests as a list
+
+A cluster already records what it runs, and it records the one thing the images
+themselves cannot: a container's `command:` **replaces** the image's ENTRYPOINT,
+so the declared entrypoint is never executed and neither is anything only it
+would have loaded.
+
+Point `--images-from` at the manifest and it is read as one — no new flag, the
+same way a [hauler manifest](./haul.md#hauler-manifests-as-a-list---images-from)
+is:
+
+```sh
+vexscan --images-from deploy.yaml --all --exec-policy assume-none
+kubectl get daemonset,deployment -A -o yaml | \
+  vexscan --images-from - --all --exec-policy assume-none
+```
+
+Pod, Deployment, DaemonSet, StatefulSet, ReplicaSet, ReplicationController,
+Job, CronJob, PodTemplate and List documents are read, `initContainers`
+included; Services, ConfigMaps and RBAC alongside them are skipped because they
+hold no containers. A file is treated as a manifest only if an unindented
+`kind:` names one of those, so a plain reference list keeps the meaning it has
+always had.
+
+Why it is worth reading rather than transcribing into `roots=`: `--roots`
+*adds* a root and leaves the image's own entrypoint rooted beside it. On
+`rancher/hardened-calico:v3.32.0-build20260511` the declared entrypoint is
+`/bin/bash`, and bash, `libnss_systemd` and `libselinux` each call `dlopen`, so
+even with `--roots /usr/bin/calico-node --exec-policy=assume-none` all 45 OS
+findings come back `linked`. Reading the DaemonSet's
+`command: ["/usr/bin/calico-node"]` drops bash from the closure entirely — 1
+root instead of 14, and **7 findings become `not_in_execute_path`**.
+
+That is an assertion and it is recorded as one, at the front of the condition
+line, because everything else in the sentence depends on it:
+
+```
+NOTE: ruled-out reachability rows are conditional - under the asserted runtime
+profile: the image runs /usr/bin/calico-node -felix per deploy.yaml, not the
+entrypoint its config declares; the entrypoint is asserted to run nothing else
+```
+
+Three things it deliberately does not do:
+
+- **It does not imply `--exec-policy=assume-none`.** A manifest saying which
+  program starts is not a manifest saying that program starts nothing. Without
+  it the exec taint still blocks, and the seven rows above stay `linked`.
+- **It does not flatter a shell.** `command: ["/bin/sh", "-c", "..."]` goes
+  through the same shell detection and escalation as a `/bin/sh` ENTRYPOINT,
+  and a command naming nothing in the image raises the same blocking
+  `no-entrypoint` taint.
+- **It does not go quiet on the images it left alone.** A container that sets
+  no `command:` still records that a manifest was read for it — `deploy.yaml
+  says nothing about how this image is started, so the entrypoint its config
+  declares is what runs`. A manifest aimed at the wrong images would otherwise
+  produce a report identical to the one you meant.
+
+One image started two different ways — two containers with different
+`command:`, or one overriding and one not — is an error naming both, on the same
+rule as a list that names an image twice: that is not a repeat, it is two
+closures, and no single scan answers for both. Containers that agree collapse,
+so the same image in a Deployment and a DaemonSet is scanned once.
+
+A container that sets its own `PATH` **and** a relative `command:` is also an
+error. Nothing here reads the container environment, so resolving that command
+against the image's `PATH` could name a different program with nothing in the
+report to show for it. Give it as an absolute path.
 
 ### Named profiles
 
