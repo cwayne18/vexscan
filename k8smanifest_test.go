@@ -161,3 +161,57 @@ func TestManifestSourceSurvivesAnImageItLeftAlone(t *testing.T) {
 		t.Errorf("an override was invented: %v %v", opts.Entrypoint, opts.Cmd)
 	}
 }
+
+// TestK8sCommandWithoutArgsDropsTheImageCmd pins the Kubernetes rule that a
+// container giving a command and no args runs only that command: the image's
+// CMD is ignored, not appended. vexscan keeps an unset Cmd and an empty one
+// apart, and reading "no args:" as "unset" would compose an argv -- the
+// command followed by the image's CMD -- that the cluster never runs.
+func TestK8sCommandWithoutArgsDropsTheImageCmd(t *testing.T) {
+	got, err := k8sEntries(`
+kind: DaemonSet
+metadata: {name: canal}
+spec:
+  template:
+    spec:
+      containers:
+        - name: kube-flannel
+          image: rancher/hardened-flannel:v0.28.9
+          command: [/opt/bin/flanneld, --ip-masq]
+`, "canal.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := got[0].assert
+	if a == nil || a.Cmd == nil {
+		t.Fatalf("Cmd = %+v, want an empty non-nil slice so the image's CMD is dropped", a)
+	}
+	if len(a.Cmd) != 0 {
+		t.Errorf("Cmd = %v, want empty", a.Cmd)
+	}
+}
+
+// TestK8sArgsWithoutCommandLeavesTheEntrypointAlone is the other half: a
+// container that sets only args is still running the image's own ENTRYPOINT,
+// and inventing an empty one for it would drop the program that actually runs.
+func TestK8sArgsWithoutCommandLeavesTheEntrypointAlone(t *testing.T) {
+	got, err := k8sEntries(`
+kind: Pod
+metadata: {name: p}
+spec:
+  containers:
+    - name: c
+      image: rancher/hardened-coredns:v1.14.7
+      args: [-conf, /etc/coredns/Corefile]
+`, "pod.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := got[0].assert
+	if a == nil || a.Entrypoint != nil {
+		t.Fatalf("Entrypoint = %+v, want nil so the image's own entrypoint still runs", a)
+	}
+	if !equalStrings(a.Cmd, []string{"-conf", "/etc/coredns/Corefile"}) {
+		t.Errorf("Cmd = %v", a.Cmd)
+	}
+}

@@ -80,11 +80,24 @@ func k8sEntries(s, from string) ([]imageEntry, error) {
 	}
 	out := make([]imageEntry, 0, len(cs))
 	for _, c := range cs {
+		args := c.Args
+
+		// Kubernetes drops the image's CMD when a container gives a command and
+		// no args: only the supplied command runs. An unset Cmd here means the
+		// opposite -- leave the image's CMD in the argv -- so a container that
+		// named a command has to say the empty one, or the scan composes an
+		// argv the cluster never runs. Canal's kube-flannel is the case: it
+		// gives a command and no args over an image whose CMD is ["/bin/sh"],
+		// and without this the report describes flanneld as ending in /bin/sh.
+		if c.Command != nil && args == nil {
+			args = []string{}
+		}
+
 		out = append(out, imageEntry{
 			ref: c.Image,
 			assert: &scanAssert{
 				Entrypoint:     c.Command,
-				Cmd:            c.Args,
+				Cmd:            args,
 				EntrypointFrom: from,
 			},
 		})
