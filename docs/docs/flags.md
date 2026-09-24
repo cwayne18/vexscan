@@ -7,7 +7,7 @@ title: "Flags"
 | Flag | Default | Description |
 |---|---|---|
 | `--image` | | Container image to inspect; repeatable |
-| `--images-from` | | Scan every image named in this list — a file with one reference per line, a [hauler manifest](./guides/haul.md#hauler-manifests-as-a-list---images-from), a URL, or `-` for stdin. `#` comments allowed, repeats scanned once — see [Scanning a fleet](./guides/fleet.md) |
+| `--images-from` | | Scan every image named in this list — a file with one reference per line, a [hauler manifest](./guides/haul.md#hauler-manifests-as-a-list---images-from), a [Kubernetes manifest](./guides/fleet.md#kubernetes-manifests-as-a-list), a URL, or `-` for stdin. `#` comments allowed, repeats scanned once — see [Scanning a fleet](./guides/fleet.md) |
 | `--haul` | | Scan every image inside a [hauler haul](./guides/haul.md) without a registry — a `.tar.zst`, a tar, or an unpacked store directory. Charts and files in the haul are counted and named on stderr, never dropped silently |
 | `--rootfs` | | Filesystem tree already on disk to inspect — see [`--rootfs`](./guides/rootfs.md) |
 | `--repo` | | Git source repo to analyze: govulncheck source mode for Go, lock file inventory for Python and npm |

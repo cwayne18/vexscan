@@ -95,6 +95,18 @@ type scanAssert struct {
 	ExecPolicy    *elfgraph.ExecPolicy
 	DynamicPolicy *modgraph.DynamicPolicy
 
+	// Entrypoint, Cmd and EntrypointFrom are what a deployment source says this
+	// image is started with, replacing the entrypoint its config declares. They
+	// have no key= spelling: a fleet list line cannot set them, because the
+	// only thing that produces them is a manifest read by this program, and a
+	// hand-written line that could claim "this image does not run its own
+	// entrypoint" would be the easiest way in the whole file to make a report
+	// wrong. --roots is the hand-written form, and it adds rather than
+	// replaces. See k8sEntries.
+	Entrypoint     []string
+	Cmd            []string
+	EntrypointFrom string
+
 	// DlopenAssumeNoneFor are the callers this line waves off by name. Unlike
 	// the policies it is a list, so it follows the roots= rule rather than the
 	// policy one: a line naming its own callers replaces the profile's list
@@ -110,6 +122,9 @@ func (a *scanAssert) apply(opts *analyze.Options) {
 	}
 	if a.Roots != nil {
 		opts.Roots = a.Roots
+	}
+	if a.EntrypointFrom != "" {
+		opts.Entrypoint, opts.Cmd, opts.EntrypointFrom = a.Entrypoint, a.Cmd, a.EntrypointFrom
 	}
 	if a.Profile != "" {
 		opts.Profile = a.Profile
@@ -150,6 +165,13 @@ func readImageList(ctx context.Context, spec string) ([]imageEntry, error) {
 	// written out, and it is the file a team that builds hauls already keeps
 	// beside the pipeline. Recognised by its API group so that nothing else
 	// changes shape underneath an existing list; see haulmanifest.go.
+	// A Kubernetes manifest is a list of images too, and the only list that
+	// also says how each one is started. Recognised the same way the hauler
+	// manifest is, by what the document declares itself to be, so nothing that
+	// is already a plain list changes shape. See k8smanifest.go.
+	if s := string(data); looksLikeK8sManifest(s) {
+		return k8sEntries(s, spec)
+	}
 	if s := string(data); looksLikeHaulerManifest(s) {
 		refs, err := parseHaulerManifest(s)
 		if err != nil {

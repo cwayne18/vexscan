@@ -208,3 +208,68 @@ func TestRecordInertAssertionsLeavesAnUnassertedRunAlone(t *testing.T) {
 		t.Errorf("Runtime = %+v on a run that asserted nothing", res.Runtime)
 	}
 }
+
+// TestManifestEntrypointLeadsTheSentence. The override is the claim every other
+// clause sits on top of -- it decides which program the roots and the policies
+// are talking about -- so a reader who disagrees with it can stop there.
+func TestManifestEntrypointLeadsTheSentence(t *testing.T) {
+	a := &RuntimeAssertion{
+		Entrypoint:     []string{"/usr/bin/calico-node"},
+		Cmd:            []string{"-felix"},
+		EntrypointFrom: "deploy.yaml",
+		ExecAssumeNone: true,
+	}
+	got := a.Sentence()
+	for _, want := range []string{"/usr/bin/calico-node -felix", "deploy.yaml", "not the entrypoint its config declares"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("sentence does not contain %q: %q", want, got)
+		}
+	}
+	if i, j := strings.Index(got, "deploy.yaml"), strings.Index(got, "asserted to run nothing else"); i > j {
+		t.Errorf("the override is stated after the assertions that depend on it: %q", got)
+	}
+}
+
+// TestManifestThatOverrodeNothingStillSaysSo is the same asymmetry the inert
+// dlopen name has. A manifest aimed at the wrong images, or one whose
+// containers all inherit their entrypoints, cannot make a conclusion wrong --
+// but it produces a report identical to one where no manifest was read, and the
+// user believes they narrowed something they did not.
+func TestManifestThatOverrodeNothingStillSaysSo(t *testing.T) {
+	a := &RuntimeAssertion{EntrypointFrom: "deploy.yaml"}
+	got := a.Sentence()
+	if got == "" {
+		t.Fatal("a manifest that overrode nothing produced no sentence, so the report cannot be told from one where no manifest was read")
+	}
+	if !strings.Contains(got, "says nothing about how this image is started") {
+		t.Errorf("sentence does not say the manifest left this image alone: %q", got)
+	}
+	if !strings.Contains(got, "config declares is what runs") {
+		t.Errorf("sentence does not say what runs instead: %q", got)
+	}
+}
+
+// TestManifestThatClearsTheEntrypointIsNotTheSameAsOneThatSaysNothing keeps
+// nil and empty apart in the sentence, where collapsing them would report a
+// container that deliberately runs no command as one the manifest never
+// mentioned.
+func TestManifestThatClearsTheEntrypointIsNotTheSameAsOneThatSaysNothing(t *testing.T) {
+	cleared := (&RuntimeAssertion{Entrypoint: []string{}, EntrypointFrom: "deploy.yaml"}).Sentence()
+	silent := (&RuntimeAssertion{EntrypointFrom: "deploy.yaml"}).Sentence()
+	if cleared == silent {
+		t.Fatalf("both render as %q", cleared)
+	}
+	if !strings.Contains(cleared, "no command at all") {
+		t.Errorf("a cleared entrypoint does not say so: %q", cleared)
+	}
+}
+
+// TestNoManifestLeavesTheSentenceAlone: the clause must not appear on a run
+// that read no deployment source, or every existing report grows a sentence
+// about a file nobody named.
+func TestNoManifestLeavesTheSentenceAlone(t *testing.T) {
+	a := &RuntimeAssertion{Roots: []string{"/usr/bin/app"}, ExecAssumeNone: true}
+	if got := a.Sentence(); strings.Contains(got, "config declares") || strings.Contains(got, "per ") {
+		t.Errorf("a run with no deployment source rendered a clause about one: %q", got)
+	}
+}

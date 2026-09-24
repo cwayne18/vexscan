@@ -44,8 +44,44 @@ type Options struct {
 
 	// Roots are extra tree-absolute paths to treat as executed, from --roots.
 	// This is the escape hatch for an image whose real entrypoint comes from
-	// outside the config -- a Kubernetes command override, an init system.
+	// outside the config -- an init system, a wrapper the config does not name.
+	//
+	// Roots *add*. The config entrypoint is still rooted alongside them, which
+	// is the right default -- naming a program that also runs is not a claim
+	// that the declared one does not. When the declared one genuinely does not
+	// run, that is Entrypoint below, and the difference is the whole closure:
+	// on a hardened image whose config entrypoint is /bin/bash, --roots leaves
+	// bash rooted, and bash's dlopen is what blocks conclusions about every
+	// package in the image.
 	Roots []string
+
+	// Entrypoint and Cmd replace the config's own, rather than adding to them,
+	// and EntrypointSource says where they came from -- "deploy.yaml". A nil
+	// field leaves the config's in place; an empty non-nil one is an override
+	// that deliberately names nothing.
+	//
+	// They are two fields and not one argv because Kubernetes overrides them
+	// separately: `command:` replaces ENTRYPOINT and `args:` replaces CMD, and
+	// a container that sets only `args:` still runs the image's ENTRYPOINT.
+	// Flattening them would have to guess which half a single list meant.
+	//
+	// This exists because a Kubernetes `command:` does not supplement the image
+	// ENTRYPOINT, it replaces it: the ENTRYPOINT process is never executed, and
+	// neither is anything it would have loaded. Modelling that as an extra root
+	// gets the wrong answer in the direction that matters, leaving a shell
+	// rooted -- and every library only that shell reaches -- in a deployment
+	// where the shell is never run.
+	//
+	// It is an assertion, not a finding. The closure loses roots because of it,
+	// so a wrong one can under-report, and it is recorded in the report's
+	// conditional-conclusions note for the same reason --roots is. What it is
+	// not is a licence to assume anything further: the override is fed through
+	// the same wrapper peeling, shell detection and escalation as a config
+	// argv, so a `command: ["/bin/sh", "-c", ...]` escalates exactly as a
+	// /bin/sh ENTRYPOINT would.
+	Entrypoint       []string
+	Cmd              []string
+	EntrypointSource string
 
 	// DlopenPolicy decides whether a reachable dlopen blocks conclusions.
 	DlopenPolicy DlopenPolicy
@@ -102,6 +138,29 @@ type Options struct {
 	ExecProber ExecProber
 
 	Logf func(string, ...any)
+}
+
+// overridden reports whether the run replaced the image's declared command.
+func (o Options) overridden() bool { return o.Entrypoint != nil || o.Cmd != nil }
+
+// argv is the command line the image will actually be started with: the
+// config's, with either half replaced by an override that named one.
+//
+// Nil and empty are kept apart on purpose. A container that sets `args: []`
+// says the image's CMD is dropped; one that sets no args at all says nothing
+// about it. Reading both as "empty" would silently discard a CMD the deployment
+// still runs, and the argv is what roots the closure.
+func (o Options) argv() []string {
+	entrypoint, cmd := o.Config.Entrypoint, o.Config.Cmd
+	if o.Entrypoint != nil {
+		entrypoint = o.Entrypoint
+	}
+	if o.Cmd != nil {
+		cmd = o.Cmd
+	}
+	argv := make([]string, 0, len(entrypoint)+len(cmd))
+	argv = append(argv, entrypoint...)
+	return append(argv, cmd...)
 }
 
 // ExecProbe is what an ExecProber concluded about one entrypoint.
@@ -360,10 +419,17 @@ func (g *Graph) markRoots(opts Options) {
 		rooted++
 	}
 
-	argv := opts.Config.Argv()
+	// The override is taken instead of the config's argv, not before it and not
+	// after it. Everything past this line is the same code either way, which is
+	// the point: an overridden entrypoint gets no weaker a reading than a
+	// declared one, so a shell named by a manifest still escalates.
+	argv, declared := opts.argv(), "no image config, or one that sets neither Entrypoint nor Cmd"
+	if opts.overridden() {
+		declared = opts.EntrypointSource + " names no command"
+	}
 	if len(argv) == 0 {
 		if g.unknownEntrypoint(opts, rooted, TaintNoEntrypoint,
-			"nothing declares an entrypoint -- no image config, or one that sets neither Entrypoint nor Cmd",
+			"nothing declares an entrypoint -- "+declared,
 			"", "no entrypoint") {
 			return
 		}
@@ -389,15 +455,29 @@ func (g *Graph) markRoots(opts Options) {
 		return
 	}
 
+	// What the entrypoint is called in every message below. An overridden one
+	// has to say so wherever it is named, not only in the report's condition
+	// line: a reviewer reading "entrypoint \"/bin/bash\" runs something other
+	// than itself" against an image whose ENTRYPOINT is bash has no way to tell
+	// that sentence apart from the one about an entrypoint that is not running.
+	// Entrypoint and not overridden: a container that set only `args:` is still
+	// running the image's own entrypoint, and calling that one "the entrypoint
+	// deploy.yaml gives, which replaces the image's own" would be the report
+	// claiming the deployment answered a question it did not.
+	noun := "entrypoint"
+	if opts.Entrypoint != nil {
+		noun = "the entrypoint " + opts.EntrypointSource + " gives, which replaces the image's own"
+	}
+
 	argv0 := argv[0]
 	base := path.Base(argv0)
 	if shells[base] || strings.HasSuffix(base, ".sh") {
 		escalated := g.unknownEntrypoint(opts, rooted, TaintShellEntrypoint,
-			fmt.Sprintf("entrypoint %q runs something other than itself", strings.Join(argv, " ")),
+			fmt.Sprintf("%s, %q, runs something other than itself", noun, strings.Join(argv, " ")),
 			argv0, "shell entrypoint")
 		// The shim itself is still executed.
 		if p, ok := g.lookupCommand(opts, argv0); ok {
-			g.addRoot(p, "entrypoint", RootExplicit)
+			g.addRoot(p, noun, RootExplicit)
 		}
 		if !escalated {
 			g.probeExec(opts)
@@ -408,14 +488,14 @@ func (g *Graph) markRoots(opts Options) {
 	p, ok := g.lookupCommand(opts, argv0)
 	if !ok {
 		if g.unknownEntrypoint(opts, rooted, TaintNoEntrypoint,
-			fmt.Sprintf("entrypoint %q is not an ELF object in this image", argv0),
+			fmt.Sprintf("%s, %q, is not an ELF object in this image", noun, argv0),
 			argv0, "unresolvable entrypoint") {
 			return
 		}
 		g.probeExec(opts)
 		return
 	}
-	g.addRoot(p, "entrypoint", RootExplicit)
+	g.addRoot(p, noun, RootExplicit)
 
 	// Later argv elements are arguments, not programs -- except for the common
 	// wrapper shapes, which the shell check above already caught.

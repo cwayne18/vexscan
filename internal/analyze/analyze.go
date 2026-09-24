@@ -176,6 +176,18 @@ type Options struct {
 	// plugin's shared libraries and the language plugins' import graphs -- for
 	// an image whose real command comes from outside its config.
 	Roots []string
+	// Entrypoint and Cmd replace what the image config declares, rather than
+	// adding to it the way Roots does, and EntrypointFrom names where they came
+	// from. A Kubernetes `command:` does not run alongside the image ENTRYPOINT,
+	// it runs instead of it; see elfgraph.Options.
+	//
+	// EntrypointFrom is set whenever a deployment source was consulted, even
+	// when that source overrode nothing, because "no manifest was read" and "a
+	// manifest was read and it leaves this image's own entrypoint running" are
+	// different facts about the same report.
+	Entrypoint     []string
+	Cmd            []string
+	EntrypointFrom string
 	// Profile is an optional label for the assertion Roots and the policies
 	// below make, carried through to the report and the emitted VEX so a fleet
 	// run can name which profile a conclusion rests on. See RuntimeAssertion.
@@ -424,6 +436,21 @@ type RuntimeAssertion struct {
 	// See elfgraph.TaintInertAssertion.
 	DlopenInert []string `json:"dlopen_inert,omitempty"`
 
+	// Entrypoint is the command a deployment source said this image is started
+	// with, replacing the one its config declares, and EntrypointFrom names the
+	// source. Cmd is the arguments half, kept apart because Kubernetes
+	// overrides the two separately.
+	//
+	// This is the assertion with the most reach in the struct. Roots add a
+	// starting point; this one takes one away, and the roots it takes away are
+	// usually the shell an image declares and everything only that shell loads.
+	// It is recorded whenever the source was read, override or not, so that a
+	// report can never be read as resting on a manifest that in fact said
+	// nothing about this image.
+	Entrypoint     []string `json:"entrypoint,omitempty"`
+	Cmd            []string `json:"cmd,omitempty"`
+	EntrypointFrom string   `json:"entrypoint_from,omitempty"`
+
 	ExecAssumeNone    bool `json:"exec_assume_none,omitempty"`
 	DynamicAssumeNone bool `json:"dynamic_assume_none,omitempty"`
 }
@@ -436,6 +463,22 @@ func (a *RuntimeAssertion) Sentence() string {
 		return ""
 	}
 	var parts []string
+	// First, because it is the claim the rest sit on top of: where the roots
+	// came from at all. A reader who disagrees with this clause has no reason to
+	// read the others.
+	if a.EntrypointFrom != "" {
+		argv := append(append([]string{}, a.Entrypoint...), a.Cmd...)
+		switch {
+		case len(argv) > 0:
+			parts = append(parts, "the image runs "+strings.Join(argv, " ")+
+				" per "+a.EntrypointFrom+", not the entrypoint its config declares")
+		case a.Entrypoint != nil || a.Cmd != nil:
+			parts = append(parts, a.EntrypointFrom+" replaces this image's entrypoint with no command at all")
+		default:
+			parts = append(parts, a.EntrypointFrom+" says nothing about how this image is started, "+
+				"so the entrypoint its config declares is what runs")
+		}
+	}
 	if len(a.Roots) > 0 {
 		parts = append(parts, "execution starts at "+strings.Join(a.Roots, ", "))
 	}
@@ -542,6 +585,9 @@ func recordInertAssertions(result *Result, plugins []ecosystem.Plugin) {
 func (o Options) runtimeAssertion() *RuntimeAssertion {
 	a := &RuntimeAssertion{
 		Roots:               o.Roots,
+		Entrypoint:          o.Entrypoint,
+		Cmd:                 o.Cmd,
+		EntrypointFrom:      o.EntrypointFrom,
 		Profile:             o.Profile,
 		DlopenAssumeNone:    o.DlopenPolicy == elfgraph.DlopenAssumeNone,
 		DlopenAssumeNoneFor: o.DlopenAssumeNoneFor,
@@ -695,6 +741,9 @@ func registryFor(opts Options) *ecosystem.Registry {
 		}),
 		ospkg.New(ospkg.Options{
 			Roots:               opts.Roots,
+			Entrypoint:          opts.Entrypoint,
+			Cmd:                 opts.Cmd,
+			EntrypointFrom:      opts.EntrypointFrom,
 			DlopenPolicy:        opts.DlopenPolicy,
 			DlopenAssumeNoneFor: opts.DlopenAssumeNoneFor,
 			ExecPolicy:          opts.ExecPolicy,

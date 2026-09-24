@@ -190,6 +190,31 @@ so a typo escalates *and* raises `missing-root`. The taint itself is never
 dropped either way: escalating it is a note, and standing on your roots it
 becomes a **discharged** taint naming the assertion it was spent on.
 
+**What `--roots` cannot do.** It *adds* a root. The entrypoint the image config
+declares is still rooted beside it, because naming a program that also runs is
+not a claim that the declared one does not. On a hardened image that is the
+remaining cost: `--roots /usr/bin/calico-node --exec-policy=assume-none` stands
+down the escalation, but `/bin/bash` is still a root, and `bash`,
+`libnss_systemd` and `libselinux` each call `dlopen`, so three blocking `dlopen`
+taints survive and every OS finding stays `linked`.
+
+In the cluster, bash is never executed — the DaemonSet says
+`command: ["/usr/bin/calico-node"]`, and a Kubernetes `command:` *replaces* the
+ENTRYPOINT rather than adding to it. Nothing in the image records that, which is
+why [pointing `--images-from` at the
+manifest](./guides/fleet.md#kubernetes-manifests-as-a-list) is a different
+assertion from `--roots` and not a more convenient spelling of it. On
+`rancher/hardened-calico:v3.32.0-build20260511` it is the difference between 45
+findings `linked` and 38 `linked` with **7 `not_in_execute_path`** — the three
+`dlopen` taints go with the shell that reached them.
+
+The override is fed through the same wrapper peeling, shell detection and
+escalation as a config entrypoint, so a `command: ["/bin/sh", "-c", ...]`
+escalates exactly as a `/bin/sh` ENTRYPOINT would, and a command naming nothing
+in the image raises the same blocking `no-entrypoint` taint. It licenses nothing
+else: `--exec-policy=assume-none` is still yours to make, because a manifest
+saying which program starts is not a manifest saying that program starts nothing.
+
 **The pure-Go discharge.** `static-elf` blocks because a statically linked
 entrypoint may hold a copy of the vulnerable library inside it, where
 `DT_NEEDED` cannot see it — so an unreferenced `.so` on disk proves nothing. A
@@ -382,8 +407,9 @@ maximizing the removals a scan can make with certainty, and making no other
 kind.
 
 `--roots /path/to/bin` adds entrypoints for an image whose real command comes
-from outside its own config — a Kubernetes `command:`, a sidecar, an operator —
-and for a `--rootfs` tree, which has no config to read.
+from outside its own config — a sidecar, an operator — and for a `--rootfs`
+tree, which has no config to read. For a Kubernetes `command:`, which replaces
+the config entrypoint rather than adding to it, read the manifest instead.
 Supplying them is usually the difference between a useful answer and
 `shell-entrypoint` tainting everything.
 
