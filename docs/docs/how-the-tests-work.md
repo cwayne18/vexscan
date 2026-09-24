@@ -135,12 +135,13 @@ you tell them apart.
 | Taint | Trigger | Effect |
 |---|---|---|
 | `unresolved-needed` | a `DT_NEEDED` that resolved to nothing | scoped to that soname |
-| `dlopen` | a reachable ELF references `dlopen`/`dlmopen` | global, unless `--dlopen-policy=assume-none` |
+| `dlopen` | a reachable ELF references `dlopen`/`dlmopen` | global, unless the caller is a bounded loader, is named by `--dlopen-assume-none`, or `--dlopen-policy=assume-none` is set |
 | `static-elf` | a reachable ELF has no `PT_INTERP`/`.dynamic` | blocks all C-library conclusions, unless the entrypoint is a pure-Go build or its symbol table clears the advisory |
 | `shell-entrypoint` | argv[0] is a shell or init shim (`sh`, `busybox`, `s6-*`), or a transparent wrapper (`tini`, `gosu`, `env`) used in a form its parser cannot read | every ELF in the standard bin dirs becomes a root — unless you assert past it, see below |
 | `no-entrypoint` | the image config has neither Entrypoint nor Cmd — or there is no config at all, as in `--rootfs` mode | same escalation |
 | `exec` | the entrypoint is a Go binary that links a process-spawning call | global, unless `--exec-policy=assume-none`; recorded as a discharged note when the binary provably links none |
 | `missing-root` | a `--roots` path that names no ELF object in the image | global, always — see below |
+| `inert-assertion` | a `--dlopen-assume-none` name that matched no `dlopen` caller | never blocks; reported so a typo is not invisible — see below |
 
 **`missing-root`.** The one taint raised by what you said rather than by what
 the image holds, and the one that most needs raising. `--roots` is how you
@@ -209,6 +210,68 @@ Only the entrypoint is probed, and only a Go binary whose build info records
 cannot be read leaves the taint blocking. What this discharges is *linked-in* C
 code, and only that — whether the binary goes on to `exec` something else is a
 separate question, asked separately below.
+
+#### Waving off one caller (`--dlopen-assume-none`)
+
+`--dlopen-policy=assume-none` is usually far more than you mean. On
+`rancher/hardened-calico:v3.32.0-build20260511` exactly three reachable objects
+call `dlopen` — `/usr/bin/bash`, `libnss_systemd.so.2` and `libselinux.so.1` —
+but the flag does not say "those three". It says *nothing in this image loads
+anything that matters*, including every library nobody has looked at and every
+one added by a later rebuild.
+
+`--dlopen-assume-none` makes the claim you actually have evidence for, one
+caller at a time, by tree-absolute path or by SONAME:
+
+```
+vexscan --image rancher/hardened-calico:v3.32.0-build20260511 --all \
+  --roots /usr/bin/calico-node --exec-policy assume-none \
+  --dlopen-assume-none /usr/bin/bash \
+  --dlopen-assume-none /usr/lib64/libnss_systemd.so.2 \
+  --dlopen-assume-none /usr/lib64/libselinux.so.1
+```
+
+Naming all three clears exactly what the blanket flag clears — the same seven
+`not_in_execute_path` rows — while the recorded assertion shrinks from one
+unfalsifiable sentence to three a reviewer can check. Each discharged caller
+says which name answered it, and the condition line on the report names them:
+
+```
+NOTE: ruled-out reachability rows are conditional - under the asserted runtime
+      profile: execution starts at /usr/bin/calico-node; the entrypoint is
+      asserted to run nothing else; /usr/bin/bash, /usr/lib64/libnss_systemd.so.2,
+      /usr/lib64/libselinux.so.1 are asserted to dlopen nothing that matters
+```
+
+The match is against the path or the SONAME and nothing else. A bare filename is
+refused deliberately: a multiarch image carries `/usr/lib/libfoo.so.1` and
+`/usr/lib32/libfoo.so.1`, and an assertion about the one you opened must not
+quietly cover the one you did not. Where the graph has already worked out that a
+caller is bounded — an OpenSSL provider directory it roots and walks — that
+finding is what gets reported rather than your assertion, so a clean row never
+reads as resting on a promise when it rests on a proof. Setting the flag
+alongside `--dlopen-policy=assume-none` is an error: the two assert
+different-sized things and there is no way to tell which you meant.
+
+**`inert-assertion`.** A name that matches no `dlopen` caller does not fail the
+scan. It removes no taint, so the run is strictly *more* conservative than you
+asked for and no conclusion in it can be wrong — the asymmetry with
+`missing-root`, which shrinks the closure and therefore has to block.
+
+It is still reported, because it is still a mistake, and one whose consequences
+are invisible: you see rows blocked by a `dlopen` you believe you answered, with
+nothing connecting the two. The condition line says so, and distinguishes the
+two cases, because they send you to different places:
+
+```
+/usr/bin/bsah was named by --dlopen-assume-none and matches no dlopen caller
+here, so the assertion discharged nothing
+```
+
+— for a name that is not in the image at all, versus *is in this image but calls
+no dlopen the closure reached* for one that is there and silent. The first is a
+typo; the second means your profile is aimed at the wrong image, or that the
+caller you were worried about is not reachable in the first place.
 
 #### The exec probe (`--exec-policy`)
 

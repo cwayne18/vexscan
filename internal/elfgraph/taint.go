@@ -64,6 +64,24 @@ const (
 	// ThreatensPresence: the program nobody could find may be exactly the static
 	// binary carrying a copy of the vulnerable code.
 	TaintMissingRoot TaintKind = "missing-root"
+
+	// TaintInertAssertion is a --dlopen-assume-none name that matched no dlopen
+	// caller in this image, so the assertion discharged nothing.
+	//
+	// Unlike TaintMissingRoot this never blocks, and the asymmetry is the whole
+	// point of recording it. A --roots path that goes missing shrinks the
+	// closure, so it makes conclusions wider than the evidence supports and has
+	// to stop the scan. An assume-none name that matches nothing removes no
+	// taint, so the run is strictly more conservative than the user asked for
+	// and no conclusion in it can be wrong.
+	//
+	// It is reported because it is still a mistake -- a typo, or a profile
+	// pointed at the wrong image -- and one that is invisible in its
+	// consequences. The user sees rows still blocked by a dlopen they thought
+	// they had answered, with nothing in the report connecting the two. Saying
+	// so costs nothing and is the difference between "this image loads more
+	// than you think" and "you spelled bash wrong".
+	TaintInertAssertion TaintKind = "inert-assertion"
 )
 
 // ThreatensPresence says whether this kind of taint can put a copy of the
@@ -167,6 +185,24 @@ func ParseDlopenPolicy(s string) (DlopenPolicy, error) {
 		return DlopenAssumeNone, nil
 	}
 	return "", fmt.Errorf("unknown dlopen policy %q: want %q or %q", s, DlopenTaint, DlopenAssumeNone)
+}
+
+// matchDlopenAssertion returns the --dlopen-assume-none name that answers this
+// caller, or "" when the user named none of them.
+//
+// A name matches the caller's tree-absolute path or its SONAME and nothing
+// else. Matching a bare basename was considered and rejected: a multiarch image
+// carries /usr/lib/libcrypto.so.3 and /usr/lib32/libcrypto.so.3, and an
+// assertion about the one the user looked at would silently discharge the other
+// too. The point of this flag over --dlopen-policy=assume-none is that it says
+// exactly which caller was waved off, and a loose match gives that back.
+func matchDlopenAssertion(names []string, path, soname string) string {
+	for _, n := range names {
+		if n == path || (soname != "" && n == soname) {
+			return n
+		}
+	}
+	return ""
 }
 
 // ExecPolicy decides what an entrypoint that can start another program does to

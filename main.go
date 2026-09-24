@@ -36,10 +36,12 @@ func main() {
 	flag.Var(&versionArg, "version", "print version and exit (deprecated: =VERSION overrides a module version; use --module-version)")
 
 	var packages, ecosystems, roots, vexhubs, severities, rpms, preferVendors, images, vexMergeInto stringList
+	var dlopenAssume stringList // the narrow dlopen assertion; see --dlopen-assume-none below
 	flag.Var(&images, "image", "container image reference to inspect; repeatable")
 	flag.Var(&packages, "package", "package to check: a purl, an ecosystem:name shorthand (deb:openssl), or a bare name; repeatable")
 	flag.Var(&ecosystems, "ecosystem", "restrict to these ecosystems (golang, os, pypi, npm, maven, or a distro like debian); repeatable")
 	flag.Var(&roots, "roots", "extra entrypoints for the reachability closures; a path that names no ELF object in the image blocks conclusions rather than being skipped; repeatable")
+	flag.Var(&dlopenAssume, "dlopen-assume-none", "assert that one named dlopen caller loads nothing that matters, by path or SONAME; the narrow form of --dlopen-policy=assume-none, and repeatable; a name matching no caller discharges nothing and is reported")
 	flag.Var(&rpms, "rpm", "rpm file to scan without installing: a path, a directory, or a URL; repeatable (reads only the header)")
 	flag.Var(&vexhubs, "vexhub", "VEX Hub repo, raw URL, or local dir to check findings against; repeatable, earliest wins")
 	flag.Var(&vexMergeInto, "vex-merge-into", "with --vex-out, also add every statement to this merged \"master\" document in the hub, "+
@@ -367,44 +369,45 @@ func main() {
 	}
 
 	opts := analyze.Options{
-		Image:              firstImage,
-		ImageLayout:        haulDir,
-		RootFS:             *rootfs,
-		Repo:               *repo,
-		RPM:                rpms,
-		RPMDeep:            *rpmDeep,
-		SBOM:               *sbom,
-		Ref:                *ref,
-		Path:               *repoPath,
-		Packages:           packages,
-		Module:             *module,
-		All:                *all,
-		Ecosystems:         ecosystems,
-		Severities:         keep,
-		FixedOnly:          *fixedOnly,
-		CVEs:               cves,
-		Version:            *modVersion,
-		OS:                 *goos,
-		Arch:               *arch,
-		OSVEcosystem:       *osvEco,
-		OSVBaseURL:         advisoryURL,
-		OSVDir:             advisoryDir,
-		Roots:              roots,
-		VEXHubs:            vexhubs,
-		Triage:             triageLoader(*triageOn),
-		DistroFeeds:        distroFeedProviders,
-		VendorScorers:      vendorScorers,
-		DlopenPolicy:       dlopenPolicy,
-		ExecPolicy:         execPolicy,
-		DynamicPolicy:      dynamicPolicy,
-		GoVersion:          *goVersion,
-		UseLLM:             *useLLM,
-		LLMEndpoint:        *llmURL,
-		LLMModel:           *llmModel,
-		LLMCommand:         *llmCommand,
-		MineAdvisories:     *mine,
-		TrustImportAbsence: *trustAbs,
-		Logf:               logf,
+		Image:               firstImage,
+		ImageLayout:         haulDir,
+		RootFS:              *rootfs,
+		Repo:                *repo,
+		RPM:                 rpms,
+		RPMDeep:             *rpmDeep,
+		SBOM:                *sbom,
+		Ref:                 *ref,
+		Path:                *repoPath,
+		Packages:            packages,
+		Module:              *module,
+		All:                 *all,
+		Ecosystems:          ecosystems,
+		Severities:          keep,
+		FixedOnly:           *fixedOnly,
+		CVEs:                cves,
+		Version:             *modVersion,
+		OS:                  *goos,
+		Arch:                *arch,
+		OSVEcosystem:        *osvEco,
+		OSVBaseURL:          advisoryURL,
+		OSVDir:              advisoryDir,
+		Roots:               roots,
+		VEXHubs:             vexhubs,
+		Triage:              triageLoader(*triageOn),
+		DistroFeeds:         distroFeedProviders,
+		VendorScorers:       vendorScorers,
+		DlopenPolicy:        dlopenPolicy,
+		DlopenAssumeNoneFor: dlopenAssume,
+		ExecPolicy:          execPolicy,
+		DynamicPolicy:       dynamicPolicy,
+		GoVersion:           *goVersion,
+		UseLLM:              *useLLM,
+		LLMEndpoint:         *llmURL,
+		LLMModel:            *llmModel,
+		LLMCommand:          *llmCommand,
+		MineAdvisories:      *mine,
+		TrustImportAbsence:  *trustAbs,
+		Logf:                logf,
 	}
 	// A misspelled selector is a command-line error, so it exits 2 and it says
 	// so before the pull rather than after it.
@@ -917,7 +920,7 @@ var flagGroups = []struct {
 	{"What to check", []string{"package", "cves", "cves-file", "all", "ecosystem", "severity", "fixed-only", "module"}},
 	{"Source repo (--repo)", []string{"ref", "repo-path", "go-version"}},
 	{"Container image", []string{"os", "arch", "module-version"}},
-	{"Reachability", []string{"roots", "dlopen-policy", "exec-policy", "dynamic-import-policy", "trust-import-absence"}},
+	{"Reachability", []string{"roots", "dlopen-policy", "dlopen-assume-none", "exec-policy", "dynamic-import-policy", "trust-import-absence"}},
 	{"Advisory sources", []string{"osv-url", "osv-dir", "osv-ecosystem", "prefer-vendor", "distro-feeds"}},
 	{"VEX", []string{"vexhub", "vex-out", "vex-author", "vex-format", "vex-merge-into",
 		"vex-publisher-namespace", "vex-publisher-category"}},

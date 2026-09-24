@@ -362,3 +362,71 @@ func TestParseImageListProfileDefinedLater(t *testing.T) {
 		t.Errorf("parseImageList = %+v", got)
 	}
 }
+
+// dlopen-assume-none= is the fleet form of the narrow dlopen assertion. It is a
+// list, so it follows the roots= rule rather than the policy one: the first
+// occurrence on a line clears whatever the profile supplied, and later ones
+// append. A line that knows which loaders its image has is making a complete
+// statement about them, and a fleet list that could only ever add to a
+// profile's list could never correct one.
+func TestParseImageListNamedDlopenCallers(t *testing.T) {
+	got, err := parseImageList(`
+[profile hardened] dlopen-assume-none=/usr/bin/bash exec-policy=assume-none
+calico:v3.32 profile=hardened dlopen-assume-none=libnss_systemd.so.2,libselinux.so.1 dlopen-assume-none=/usr/bin/bash
+coredns:v1.11 profile=hardened
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("parseImageList returned %d entries: %v", len(got), entryRefs(got))
+	}
+
+	want := []string{"libnss_systemd.so.2", "libselinux.so.1", "/usr/bin/bash"}
+	if a := got[0].assert; !equalStrings(a.DlopenAssumeNoneFor, want) {
+		t.Errorf("dlopen-assume-none = %v, want the profile's list replaced then appended to: %v",
+			a.DlopenAssumeNoneFor, want)
+	}
+	// The line that said nothing keeps the profile's list, so the clear above
+	// is the line's own doing rather than the profile having been emptied.
+	if a := got[1].assert; !equalStrings(a.DlopenAssumeNoneFor, []string{"/usr/bin/bash"}) {
+		t.Errorf("a line that named no callers = %v, want the profile's list", a.DlopenAssumeNoneFor)
+	}
+
+	// And it reaches the options, replacing rather than extending a global
+	// --dlopen-assume-none, for the same reason roots does.
+	opts := analyze.Options{DlopenAssumeNoneFor: []string{"/global"}}
+	got[0].assert.apply(&opts)
+	if !equalStrings(opts.DlopenAssumeNoneFor, want) {
+		t.Errorf("after apply = %v, want %v", opts.DlopenAssumeNoneFor, want)
+	}
+}
+
+// A key with no value is a half-written assertion, and the flag it stands for
+// refuses one too. Accepting it would leave the user believing they waved off a
+// caller they never named.
+func TestParseImageListRejectsEmptyDlopenCaller(t *testing.T) {
+	for _, line := range []string{
+		"alpine:3.20 dlopen-assume-none=",
+		"alpine:3.20 dlopen-assume-none=,",
+		"[profile a] dlopen-assume-none=\nalpine:3.20 profile=a\n",
+	} {
+		if _, err := parseImageList(line); err == nil {
+			t.Errorf("parseImageList(%q) was accepted", line)
+		}
+	}
+}
+
+// A profile that names only callers is a real profile. Before this key existed
+// the emptiness check listed every field; missing one here would reject a
+// profile that asserts something, which is the opposite of what that check is
+// for.
+func TestParseImageListProfileOfOnlyDlopenCallers(t *testing.T) {
+	got, err := parseImageList("[profile p] dlopen-assume-none=/usr/bin/bash\nalpine:3.20 profile=p\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := got[0].assert; a == nil || !equalStrings(a.DlopenAssumeNoneFor, []string{"/usr/bin/bash"}) {
+		t.Errorf("profile of only named callers produced %+v", got[0].assert)
+	}
+}

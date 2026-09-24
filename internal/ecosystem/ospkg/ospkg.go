@@ -37,6 +37,10 @@ type Plugin struct {
 	// DlopenPolicy decides whether a reachable dlopen blocks conclusions.
 	DlopenPolicy elfgraph.DlopenPolicy
 
+	// DlopenAssumeNoneFor names individual dlopen callers the user asserts
+	// load nothing that matters. See elfgraph.Options.
+	DlopenAssumeNoneFor []string
+
 	// ExecPolicy decides whether an entrypoint that can start another program
 	// blocks conclusions.
 	ExecPolicy elfgraph.ExecPolicy
@@ -87,23 +91,39 @@ type Plugin struct {
 	// Logf receives progress messages. Never nil after New.
 	Logf func(format string, args ...any)
 
-	mu   sync.Mutex
-	prep *prepared
+	mu    sync.Mutex
+	prep  *prepared
+	inert []string
+}
+
+// InertAssertions are the --dlopen-assume-none names the image gave nothing to
+// discharge, or nil when every name found its caller -- or when no closure was
+// built at all, which is the same answer for reporting purposes: a run that
+// never opened the tree has not established that anything was inert.
+//
+// It is recorded at graph-build time rather than read out of the graph on
+// demand so that the read needs no synchronisation with the analysis, which
+// runs the closure from whichever goroutine reaches it first.
+func (p *Plugin) InertAssertions() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.inert
 }
 
 // Options configure a Plugin.
 type Options struct {
-	Roots              []string
-	DlopenPolicy       elfgraph.DlopenPolicy
-	ExecPolicy         elfgraph.ExecPolicy
-	Ecosystem          string
-	Packages           []Supplied
-	Mine               bool
-	TrustImportAbsence bool
-	ReadELF            elfgraph.Reader
-	ReadSymbols        elfgraph.SymbolReader
-	readStatic         staticReader
-	Logf               func(format string, args ...any)
+	Roots               []string
+	DlopenPolicy        elfgraph.DlopenPolicy
+	DlopenAssumeNoneFor []string
+	ExecPolicy          elfgraph.ExecPolicy
+	Ecosystem           string
+	Packages            []Supplied
+	Mine                bool
+	TrustImportAbsence  bool
+	ReadELF             elfgraph.Reader
+	ReadSymbols         elfgraph.SymbolReader
+	readStatic          staticReader
+	Logf                func(format string, args ...any)
 }
 
 // New returns a configured OS plugin.
@@ -113,17 +133,18 @@ func New(opts Options) *Plugin {
 		logf = func(string, ...any) {}
 	}
 	return &Plugin{
-		Roots:              opts.Roots,
-		DlopenPolicy:       opts.DlopenPolicy,
-		ExecPolicy:         opts.ExecPolicy,
-		Ecosystem:          opts.Ecosystem,
-		Packages:           opts.Packages,
-		Mine:               opts.Mine,
-		TrustImportAbsence: opts.TrustImportAbsence,
-		ReadELF:            opts.ReadELF,
-		ReadSymbols:        opts.ReadSymbols,
-		readStatic:         opts.readStatic,
-		Logf:               logf,
+		Roots:               opts.Roots,
+		DlopenPolicy:        opts.DlopenPolicy,
+		DlopenAssumeNoneFor: opts.DlopenAssumeNoneFor,
+		ExecPolicy:          opts.ExecPolicy,
+		Ecosystem:           opts.Ecosystem,
+		Packages:            opts.Packages,
+		Mine:                opts.Mine,
+		TrustImportAbsence:  opts.TrustImportAbsence,
+		ReadELF:             opts.ReadELF,
+		ReadSymbols:         opts.ReadSymbols,
+		readStatic:          opts.readStatic,
+		Logf:                logf,
 	}
 }
 
@@ -471,15 +492,28 @@ func (p *Plugin) graph(pr *prepared) (*elfgraph.Graph, error) {
 	pr.once.Do(func() {
 		p.Logf("Building the shared-library closure...")
 		pr.graph, pr.graphErr = elfgraph.Build(pr.img.FS, elfgraph.Options{
-			Config:       pr.img.Config,
-			Roots:        p.Roots,
-			DlopenPolicy: p.DlopenPolicy,
-			ExecPolicy:   p.ExecPolicy,
-			ReadELF:      p.ReadELF,
-			StaticProber: cgoStaticProbe,
-			ExecProber:   goExecProbe,
-			Logf:         p.Logf,
+			Config:              pr.img.Config,
+			Roots:               p.Roots,
+			DlopenPolicy:        p.DlopenPolicy,
+			DlopenAssumeNoneFor: p.DlopenAssumeNoneFor,
+			ExecPolicy:          p.ExecPolicy,
+			ReadELF:             p.ReadELF,
+			StaticProber:        cgoStaticProbe,
+			ExecProber:          goExecProbe,
+			Logf:                p.Logf,
 		})
+		if pr.graph == nil {
+			return
+		}
+		inert := pr.graph.InertAssertions()
+		p.mu.Lock()
+		p.inert = inert
+		p.mu.Unlock()
+		for _, t := range pr.graph.Taints() {
+			if t.Kind == elfgraph.TaintInertAssertion {
+				p.Logf("  ! %s", t.Detail)
+			}
+		}
 	})
 	return pr.graph, pr.graphErr
 }
