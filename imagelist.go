@@ -506,8 +506,11 @@ func parseProfiles(from string, lines []string) (map[string]*scanAssert, error) 
 		if err := applyAssertFields(from, a, strings.Fields(line[close+1:]), true); err != nil {
 			return nil, fmt.Errorf("line %d: profile %q: %w", n+1, name, err)
 		}
+		// EntrypointFrom stands in for entrypoint= and cmd= together: it is
+		// written by both, and it is the field that distinguishes "said, as
+		// nothing" from "not said" for either of them.
 		if a.Roots == nil && a.DlopenPolicy == nil && a.ExecPolicy == nil &&
-			a.DynamicPolicy == nil && a.DlopenAssumeNoneFor == nil {
+			a.DynamicPolicy == nil && a.DlopenAssumeNoneFor == nil && a.EntrypointFrom == "" {
 			// An empty profile is almost certainly a half-written one. Applying
 			// it would be a no-op that reads, on the line that names it, like an
 			// assertion being made.

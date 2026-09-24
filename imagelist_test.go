@@ -596,3 +596,55 @@ func TestListSourceNamesStandardInput(t *testing.T) {
 		t.Errorf("listSource(\"deploy.yaml\") = %q", got)
 	}
 }
+
+// A profile whose only assertion is the entrypoint asserts something.
+//
+// The emptiness check is a list of every field a profile can carry, which is
+// the kind of list that goes stale the moment a field is added to scanAssert --
+// as entrypoint= and cmd= were. Left out, the most useful profile a fleet can
+// define is the one refused: "these forty images are all started with their own
+// binary" is an entrypoint and nothing else, and adding an exec-policy to get
+// past the check would be asserting more than the author meant to.
+func TestProfileAssertingOnlyAnEntrypointIsNotEmpty(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		list string
+		want []string
+	}{
+		{"entrypoint alone", "[profile p] entrypoint=/usr/bin/calico-node\nalpine:3.20 profile=p\n",
+			[]string{"/usr/bin/calico-node"}},
+		{"entrypoint with arguments", "[profile p] entrypoint=/usr/bin/tini entrypoint=--\nalpine:3.20 profile=p\n",
+			[]string{"/usr/bin/tini", "--"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseImageList("fleet.txt", tc.list)
+			if err != nil {
+				t.Fatalf("parseImageList: %v", err)
+			}
+			if a := got[0].assert; a == nil || !equalStrings(a.Entrypoint, tc.want) {
+				t.Fatalf("Entrypoint = %v, want %v", got[0].assert, tc.want)
+			}
+			if got[0].assert.EntrypointFrom != "fleet.txt" {
+				t.Errorf("EntrypointFrom = %q, want the list", got[0].assert.EntrypointFrom)
+			}
+		})
+	}
+}
+
+// cmd= alone is the same, and is its own case because it is the one that can
+// carry no tokens at all: `[profile p] cmd=` says the image's declared
+// entrypoint runs with no arguments, which is an assertion with an empty slice
+// behind it and nothing a nil check would see.
+func TestProfileAssertingOnlyClearedArgumentsIsNotEmpty(t *testing.T) {
+	got, err := parseImageList("fleet.txt", "[profile p] cmd=\nalpine:3.20 profile=p\n")
+	if err != nil {
+		t.Fatalf("parseImageList: %v", err)
+	}
+	a := got[0].assert
+	if a == nil || a.Cmd == nil || len(a.Cmd) != 0 {
+		t.Fatalf("Cmd = %#v, want an empty non-nil slice", a)
+	}
+	if a.Entrypoint != nil {
+		t.Errorf("Entrypoint = %v, want the image's own left alone", a.Entrypoint)
+	}
+}
