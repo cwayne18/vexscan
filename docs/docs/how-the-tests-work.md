@@ -215,6 +215,33 @@ in the image raises the same blocking `no-entrypoint` taint. It licenses nothing
 else: `--exec-policy=assume-none` is still yours to make, because a manifest
 saying which program starts is not a manifest saying that program starts nothing.
 
+**Saying it without a manifest.** Kubernetes is not the only thing that replaces
+an entrypoint — `docker run --entrypoint`, a compose service's `entrypoint:`, a
+Nomad task's `command`, a systemd unit's `ExecStart` — and none of those ship a
+file vexscan can read. `--entrypoint` and `--cmd` are the same assertion typed
+out, one argv token per use:
+
+```sh
+vexscan --image rancher/hardened-calico:v3.32.0-build20260511 \
+  --all --ecosystem os --exec-policy assume-none \
+  --entrypoint /usr/bin/calico-node --cmd=-felix
+```
+
+which produces the same 38 `linked` and **7 `not_in_execute_path`** the manifest
+does, and records `--entrypoint and --cmd` as the source instead of a filename.
+A fleet list line says it per image as `entrypoint=` and `cmd=`, which is the
+form to reach for when a fleet's images are started differently from each other.
+
+Two things to know about the spelling. `--cmd` given alone leaves the image's
+declared ENTRYPOINT running and replaces only its arguments, exactly as
+Kubernetes `args:` and `docker run IMAGE ...` do — and the report says so rather
+than claiming the entrypoint was replaced. And `--cmd=` with nothing after it
+means *started with no arguments*, which is a different claim from not passing
+the flag at all; `--entrypoint=` is refused, because "started with no program"
+is not a thing that runs. Since a Kubernetes manifest already answers this per
+container, passing `--entrypoint` beside one is an error rather than a flag that
+silently does nothing.
+
 **The pure-Go discharge.** `static-elf` blocks because a statically linked
 entrypoint may hold a copy of the vulnerable library inside it, where
 `DT_NEEDED` cannot see it — so an unreferenced `.so` on disk proves nothing. A

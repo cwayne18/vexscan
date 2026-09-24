@@ -467,16 +467,28 @@ func (a *RuntimeAssertion) Sentence() string {
 	// came from at all. A reader who disagrees with this clause has no reason to
 	// read the others.
 	if a.EntrypointFrom != "" {
-		argv := append(append([]string{}, a.Entrypoint...), a.Cmd...)
 		switch {
-		case len(argv) > 0:
-			parts = append(parts, "the image runs "+strings.Join(argv, " ")+
-				" per "+a.EntrypointFrom+", not the entrypoint its config declares")
-		case a.Entrypoint != nil || a.Cmd != nil:
-			parts = append(parts, a.EntrypointFrom+" replaces this image's entrypoint with no command at all")
-		default:
+		case a.Entrypoint == nil && a.Cmd == nil:
 			parts = append(parts, a.EntrypointFrom+" says nothing about how this image is started, "+
 				"so the entrypoint its config declares is what runs")
+		case a.Entrypoint == nil:
+			// Arguments replaced and the entrypoint left alone. The image's own
+			// entrypoint is still what runs, and a clause saying otherwise --
+			// which is what folding this into the case below would say -- would
+			// describe an assertion nobody made. The graph already keeps the two
+			// apart; see elfgraph.Options.argv.
+			if len(a.Cmd) == 0 {
+				parts = append(parts, "the entrypoint this image's config declares is run with no arguments, per "+a.EntrypointFrom)
+				break
+			}
+			parts = append(parts, "the entrypoint this image's config declares is run with the arguments "+
+				strings.Join(a.Cmd, " ")+", per "+a.EntrypointFrom)
+		case len(a.Entrypoint) == 0:
+			parts = append(parts, "the entrypoint is replaced, per "+a.EntrypointFrom+", with no command at all")
+		default:
+			argv := append(append([]string{}, a.Entrypoint...), a.Cmd...)
+			parts = append(parts, "the image runs "+strings.Join(argv, " ")+
+				" per "+a.EntrypointFrom+", not the entrypoint its config declares")
 		}
 	}
 	if len(a.Roots) > 0 {

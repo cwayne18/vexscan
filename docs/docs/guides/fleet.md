@@ -57,6 +57,8 @@ rancher/nginx-ingress-controller:v1.10.4-hardened3 roots=/nginx-ingress-controll
 | key | value |
 |---|---|
 | `roots=` | comma-separated paths; repeatable on the line. **Replaces** the global `--roots` for this image rather than adding to it — a line that names its own roots is a complete statement about what that image runs |
+| `entrypoint=` | one argv token; repeatable and ordered, so `entrypoint=/usr/bin/tini entrypoint=--` is a two-word command line. **Replaces** the ENTRYPOINT the image config declares rather than adding to it, which is what `roots=` does. No comma split — an argument may contain one. Empty is an error |
+| `cmd=` | the same, for the CMD. Given without `entrypoint=` it leaves the image's declared entrypoint running and changes only its arguments, as Kubernetes `args:` does. `cmd=` with nothing after it says the image is started with **no** arguments, which is not what saying nothing says |
 | `exec-policy=` | `taint` or `assume-none` |
 | `dlopen-policy=` | `taint` or `assume-none` |
 | `dlopen-assume-none=` | comma-separated caller paths or SONAMEs; repeatable on the line. The narrow form of `dlopen-policy=assume-none` — it waves off only the callers named. **Replaces** the inherited list rather than adding to it, on the same rule as `roots=` |
@@ -141,6 +143,32 @@ A container that sets its own `PATH` **and** a relative `command:` is also an
 error. Nothing here reads the container environment, so resolving that command
 against the image's `PATH` could name a different program with nothing in the
 report to show for it. Give it as an absolute path.
+
+### When there is no manifest
+
+Kubernetes is not the only thing that replaces an entrypoint. `docker run
+--entrypoint`, a compose service's `entrypoint:`, a Nomad task's `command`, a
+systemd unit's `ExecStart` — all of them do, and none of them ship a file
+vexscan can read. `--entrypoint` and `--cmd` are the same assertion typed out:
+
+```sh
+vexscan --image rancher/hardened-calico:v3.32.0-build20260511 \
+  --all --ecosystem os --exec-policy assume-none \
+  --entrypoint /usr/bin/calico-node --cmd=-felix
+```
+
+That produces the same seven `not_in_execute_path` rows the DaemonSet does, and
+records `--entrypoint and --cmd` as the source in place of a filename. Per image
+in a fleet, the `entrypoint=` and `cmd=` keys above say it on the line, which is
+what to reach for when a fleet's images are started differently from each other.
+
+The same three refusals apply — a shell is still a shell, a command the image
+does not contain still blocks, and `--exec-policy=assume-none` is still yours to
+make separately. Two more belong to the flags. `--entrypoint=` with nothing after
+it is an error, because "started with no program" does not run; say
+`--cmd=` if you mean it starts with no *arguments*. And because a Kubernetes
+manifest already answers this for every container in it, `--entrypoint` passed
+beside one is an error rather than a flag that quietly does nothing.
 
 ### Named profiles
 

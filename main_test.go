@@ -118,3 +118,55 @@ func TestRenderInventoryWithNothingFound(t *testing.T) {
 		t.Errorf("an image with no package database is not reported plainly:\n%s", got)
 	}
 }
+
+// TestEveryEntrySaysHow guards --entrypoint against being accepted where it can
+// reach nothing. A Kubernetes manifest answers the same question per container,
+// so a global flag beside one is overridden for every image and does nothing --
+// which fails closed, but fails closed silently, leaving the user believing
+// they asserted something.
+func TestEveryEntrySaysHow(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		entries []imageEntry
+		want    bool
+	}{
+		{
+			"a manifest, which answers for every image it names",
+			[]imageEntry{
+				{ref: "a:1", assert: &scanAssert{Entrypoint: []string{"/x"}, EntrypointFrom: "deploy.yaml"}},
+				{ref: "b:1", assert: &scanAssert{EntrypointFrom: "deploy.yaml"}},
+			},
+			true,
+		},
+		{
+			// The per-line form working as designed: one image states its own
+			// command line and the rest inherit the flag, exactly as a line's
+			// roots= sits beside a global --roots. Stopping here would make the
+			// two forms unusable together.
+			"a list that overrides one image and leaves the rest",
+			[]imageEntry{
+				{ref: "a:1", assert: &scanAssert{Entrypoint: []string{"/x"}, EntrypointFrom: "fleet.txt"}},
+				{ref: "b:1"},
+			},
+			false,
+		},
+		{
+			"bare references, which the flag is for",
+			[]imageEntry{{ref: "a:1"}, {ref: "b:1"}},
+			false,
+		},
+		{
+			// An assertion that carries policies but no source says nothing
+			// about how the image starts, so the flag still has work to do.
+			"a list asserting only policies",
+			[]imageEntry{{ref: "a:1", assert: &scanAssert{Roots: []string{"/x"}}}},
+			false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := everyEntrySaysHow(tc.entries); got != tc.want {
+				t.Errorf("everyEntrySaysHow = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

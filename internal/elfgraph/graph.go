@@ -464,9 +464,13 @@ func (g *Graph) markRoots(opts Options) {
 	// running the image's own entrypoint, and calling that one "the entrypoint
 	// deploy.yaml gives, which replaces the image's own" would be the report
 	// claiming the deployment answered a question it did not.
+	//
+	// "from X" rather than "X gives", because X is not always a filename: the
+	// same override arrives from the command line, where the source reads
+	// "--entrypoint and --cmd" and a verb would have to agree with it.
 	noun := "entrypoint"
 	if opts.Entrypoint != nil {
-		noun = "the entrypoint " + opts.EntrypointSource + " gives, which replaces the image's own"
+		noun = "the entrypoint from " + opts.EntrypointSource + ", which replaces the image's own"
 	}
 
 	argv0 := argv[0]
