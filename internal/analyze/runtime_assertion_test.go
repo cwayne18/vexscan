@@ -273,3 +273,55 @@ func TestNoManifestLeavesTheSentenceAlone(t *testing.T) {
 		t.Errorf("a run with no deployment source rendered a clause about one: %q", got)
 	}
 }
+
+// TestArgsOnlyOverrideDoesNotClaimToReplaceTheEntrypoint is the sentence half of
+// the distinction elfgraph already keeps: a source that replaced the arguments
+// and not the program has not replaced the entrypoint, and the image's own is
+// still what runs. Reported as a replacement, the clause describes an assertion
+// nobody made and points a reviewer at the wrong binary.
+func TestArgsOnlyOverrideDoesNotClaimToReplaceTheEntrypoint(t *testing.T) {
+	got := (&RuntimeAssertion{Cmd: []string{"--serve"}, EntrypointFrom: "deploy.yaml"}).Sentence()
+	if strings.Contains(got, "not the entrypoint its config declares") {
+		t.Errorf("replacing only the arguments is reported as replacing the entrypoint: %q", got)
+	}
+	if !strings.Contains(got, "--serve") {
+		t.Errorf("the arguments that were asserted are not in the sentence: %q", got)
+	}
+	if !strings.Contains(got, "deploy.yaml") {
+		t.Errorf("the sentence does not say where the claim came from: %q", got)
+	}
+}
+
+// TestClearedArgsAreNotTheSameAsAClearedEntrypoint. `cmd=` and `--cmd=` say the
+// image starts with no arguments; its entrypoint still runs. "Replaced with no
+// command at all" says nothing runs, which would have the reader looking for a
+// conclusion the closure never drew.
+func TestClearedArgsAreNotTheSameAsAClearedEntrypoint(t *testing.T) {
+	args := (&RuntimeAssertion{Cmd: []string{}, EntrypointFrom: "--cmd"}).Sentence()
+	entry := (&RuntimeAssertion{Entrypoint: []string{}, EntrypointFrom: "--entrypoint"}).Sentence()
+	if strings.Contains(args, "no command at all") {
+		t.Errorf("dropping the arguments is reported as running nothing: %q", args)
+	}
+	if !strings.Contains(args, "no arguments") {
+		t.Errorf("dropping the arguments is not said: %q", args)
+	}
+	if !strings.Contains(entry, "no command at all") {
+		t.Errorf("a cleared entrypoint is not said: %q", entry)
+	}
+}
+
+// TestFlagOverrideReadsAsASentence. The source is not always a filename -- the
+// same override arrives from the command line -- and the clause has to survive
+// that, since it is the one the reader is meant to disagree with.
+func TestFlagOverrideReadsAsASentence(t *testing.T) {
+	got := (&RuntimeAssertion{
+		Entrypoint:     []string{"/usr/bin/server"},
+		Cmd:            []string{"--serve"},
+		EntrypointFrom: "--entrypoint and --cmd",
+		ExecAssumeNone: true,
+	}).Sentence()
+	want := "the image runs /usr/bin/server --serve per --entrypoint and --cmd, not the entrypoint its config declares"
+	if !strings.Contains(got, want) {
+		t.Errorf("sentence = %q, want it to contain %q", got, want)
+	}
+}

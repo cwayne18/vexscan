@@ -42,6 +42,11 @@ func main() {
 	flag.Var(&ecosystems, "ecosystem", "restrict to these ecosystems (golang, os, pypi, npm, maven, or a distro like debian); repeatable")
 	flag.Var(&roots, "roots", "extra entrypoints for the reachability closures; a path that names no ELF object in the image blocks conclusions rather than being skipped; repeatable")
 	flag.Var(&dlopenAssume, "dlopen-assume-none", "assert that one named dlopen caller loads nothing that matters, by path or SONAME; the narrow form of --dlopen-policy=assume-none, and repeatable; a name matching no caller discharges nothing and is reported")
+	// The entrypoint override. Unlike --roots, which adds a starting point,
+	// this one takes the image's own away -- see analyze.RuntimeAssertion.
+	var entrypoint, command argvFlag
+	flag.Var(&entrypoint, "entrypoint", "the program this image is actually started with, replacing the ENTRYPOINT its config declares (docker run --entrypoint, a compose `entrypoint:`, a unit's ExecStart); one argv token per use, repeatable")
+	flag.Var(&command, "cmd", "the arguments this image is actually started with, replacing the CMD its config declares; one argv token per use, repeatable, and `--cmd=` means it is started with none")
 	flag.Var(&rpms, "rpm", "rpm file to scan without installing: a path, a directory, or a URL; repeatable (reads only the header)")
 	flag.Var(&vexhubs, "vexhub", "VEX Hub repo, raw URL, or local dir to check findings against; repeatable, earliest wins")
 	flag.Var(&vexMergeInto, "vex-merge-into", "with --vex-out, also add every statement to this merged \"master\" document in the hub, "+
@@ -316,6 +321,22 @@ func main() {
 	// is minutes nobody asked for.
 	entries = dedupeEntries(entries)
 
+	// An entrypoint the flag names but nothing runs under is a command-line
+	// error, said before the pull.
+	if entrypoint.set && len(entrypoint.tokens) == 0 {
+		fail("--entrypoint names no program; to say this image is started with no arguments, use --cmd=")
+	}
+	// A Kubernetes manifest answers this question per container, so a global
+	// --entrypoint beside one is overridden for every image in the run and does
+	// nothing at all. That fails closed -- the manifest is the better answer --
+	// but it fails closed silently, and the user is left believing they asserted
+	// something. Same rule as an unknown key= on a list line: say so, because a
+	// list is read before anything is pulled and saying so costs nothing.
+	if src := flagSource(entrypoint.set, command.set); src != "" && len(entries) > 0 && everyEntrySaysHow(entries) {
+		fail("%s was given, but %s says how every image in this run is started, so the flag would be ignored; drop one",
+			src, listSource(*imagesFrom))
+	}
+
 	// The haul is opened here for the same reason: a haul that is not one, or
 	// one with nothing scannable in it, is an error reported before any work
 	// rather than after a multi-gigabyte unpack.
@@ -392,6 +413,9 @@ func main() {
 		OSVBaseURL:          advisoryURL,
 		OSVDir:              advisoryDir,
 		Roots:               roots,
+		Entrypoint:          entrypoint.value(),
+		Cmd:                 command.value(),
+		EntrypointFrom:      flagSource(entrypoint.set, command.set),
 		VEXHubs:             vexhubs,
 		Triage:              triageLoader(*triageOn),
 		DistroFeeds:         distroFeedProviders,
@@ -818,6 +842,24 @@ func gistDescription(res *analyze.Result) string {
 	return desc
 }
 
+// everyEntrySaysHow reports whether the list already answers, for every image
+// in it, the question --entrypoint and --cmd answer.
+//
+// Every, and not any: a text list that overrides one image's entrypoint and
+// leaves the other fifty-nine to a global flag is the per-line form working as
+// designed, exactly as a line's roots= sits beside a global --roots. Only when
+// no image in the run can reach the flag is the flag a mistake worth stopping
+// for, and that is the Kubernetes-manifest case, where every entry carries its
+// own source whether the manifest overrode it or not.
+func everyEntrySaysHow(entries []imageEntry) bool {
+	for _, e := range entries {
+		if e.assert == nil || e.assert.EntrypointFrom == "" {
+			return false
+		}
+	}
+	return true
+}
+
 // dedupeEntries is dedupe over fleet-list entries, keyed on the reference.
 //
 // A repeat keeps the first occurrence's position but takes the assertions from
@@ -920,7 +962,7 @@ var flagGroups = []struct {
 	{"What to check", []string{"package", "cves", "cves-file", "all", "ecosystem", "severity", "fixed-only", "module"}},
 	{"Source repo (--repo)", []string{"ref", "repo-path", "go-version"}},
 	{"Container image", []string{"os", "arch", "module-version"}},
-	{"Reachability", []string{"roots", "dlopen-policy", "dlopen-assume-none", "exec-policy", "dynamic-import-policy", "trust-import-absence"}},
+	{"Reachability", []string{"roots", "entrypoint", "cmd", "dlopen-policy", "dlopen-assume-none", "exec-policy", "dynamic-import-policy", "trust-import-absence"}},
 	{"Advisory sources", []string{"osv-url", "osv-dir", "osv-ecosystem", "prefer-vendor", "distro-feeds"}},
 	{"VEX", []string{"vexhub", "vex-out", "vex-author", "vex-format", "vex-merge-into",
 		"vex-publisher-namespace", "vex-publisher-category"}},
@@ -970,6 +1012,15 @@ Examples:
   #   rancher/mirrored-kube-vip-kube-vip-iptables:v0.6.0 \
   #     roots=/usr/sbin/xtables-nft-multi exec-policy=assume-none
   #   rancher/hardened-coredns:v1.11.1-build20240910
+
+  # An image whose declared ENTRYPOINT is not what runs it. Unlike --roots,
+  # which adds a starting point, this replaces the one the config declares --
+  # so the shell an image declares stops dragging its libraries in.
+  vexscan --image rancher/hardened-calico:v3.32.0 --all --ecosystem os \
+    --entrypoint /usr/bin/calico-node --cmd=-felix --exec-policy assume-none
+
+  # The same assertion read out of the cluster instead of typed
+  kubectl get ds -A -o yaml | vexscan --images-from - --all --format summary
 
   # A hauler haul, scanned in the airgap it was carried into -- no registry
   vexscan --haul rke2-airgap.tar.zst --all --format summary

@@ -25,7 +25,7 @@ func entryRefs(entries []imageEntry) []string {
 }
 
 func TestParseImageList(t *testing.T) {
-	got, err := parseImageList(`
+	got, err := parseImageList("fleet.txt", `
 # the fleet
 alpine:3.20
 
@@ -45,7 +45,7 @@ ghcr.io/org/app@sha256:abc123
 
 // A list written on Windows is still a list.
 func TestParseImageListHandlesCRLF(t *testing.T) {
-	got, err := parseImageList("alpine:3.20\r\ndebian:12\r\n")
+	got, err := parseImageList("fleet.txt", "alpine:3.20\r\ndebian:12\r\n")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestDedupeKeepsFirstPosition(t *testing.T) {
 // conclusion about the rest, so the per-line form is the only way to make the
 // assertion at fleet scale at all.
 func TestParseImageListAssertions(t *testing.T) {
-	got, err := parseImageList(`
+	got, err := parseImageList("fleet.txt", `
 alpine:3.20
 kube-vip:v0.6.0 roots=/usr/sbin/xtables-nft-multi exec-policy=assume-none
 nginx:1.27 roots=/a,/b roots=/c dlopen-policy=assume-none  # two keys, one repeated
@@ -171,7 +171,7 @@ func TestParseImageListRejectsBadAssertions(t *testing.T) {
 		"alpine:3.20 roots=",                      // names no path
 		"alpine:3.20\nalpine:3.20 roots=/bin/sh",  // one image, two statements
 	} {
-		if _, err := parseImageList(line); err == nil {
+		if _, err := parseImageList("fleet.txt", line); err == nil {
 			t.Errorf("parseImageList(%q) was accepted", line)
 		}
 	}
@@ -235,7 +235,7 @@ func TestDedupeEntriesKeepsAssertions(t *testing.T) {
 // about its own image; the name rides along so a conclusion can say which
 // profile it rests on.
 func TestParseImageListProfiles(t *testing.T) {
-	got, err := parseImageList(`
+	got, err := parseImageList("fleet.txt", `
 [profile go-daemon] exec-policy=assume-none
 [profile calico]    roots=/usr/bin/calico-node exec-policy=assume-none   # the one with a CNI plugin dir
 
@@ -310,7 +310,7 @@ func TestParseImageListProfileErrors(t *testing.T) {
 			"alpine:3.20 profile=calico\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := parseImageList(tc.list); err == nil {
+			if _, err := parseImageList("fleet.txt", tc.list); err == nil {
 				t.Error("parseImageList accepted it")
 			}
 		})
@@ -340,7 +340,7 @@ func TestParseImageListProfileMisuseSaysWhich(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := parseImageList(tc.list)
+			_, err := parseImageList("fleet.txt", tc.list)
 			if err == nil {
 				t.Fatal("parseImageList accepted it")
 			}
@@ -354,7 +354,7 @@ func TestParseImageListProfileMisuseSaysWhich(t *testing.T) {
 // A profile defined after the images that use it is the natural layout for a
 // list that grew one odd image at a time, and there is no reason to reject it.
 func TestParseImageListProfileDefinedLater(t *testing.T) {
-	got, err := parseImageList("alpine:3.20 profile=late\n[profile late] roots=/bin/busybox\n")
+	got, err := parseImageList("fleet.txt", "alpine:3.20 profile=late\n[profile late] roots=/bin/busybox\n")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,7 +370,7 @@ func TestParseImageListProfileDefinedLater(t *testing.T) {
 // statement about them, and a fleet list that could only ever add to a
 // profile's list could never correct one.
 func TestParseImageListNamedDlopenCallers(t *testing.T) {
-	got, err := parseImageList(`
+	got, err := parseImageList("fleet.txt", `
 [profile hardened] dlopen-assume-none=/usr/bin/bash exec-policy=assume-none
 calico:v3.32 profile=hardened dlopen-assume-none=libnss_systemd.so.2,libselinux.so.1 dlopen-assume-none=/usr/bin/bash
 coredns:v1.11 profile=hardened
@@ -411,7 +411,7 @@ func TestParseImageListRejectsEmptyDlopenCaller(t *testing.T) {
 		"alpine:3.20 dlopen-assume-none=,",
 		"[profile a] dlopen-assume-none=\nalpine:3.20 profile=a\n",
 	} {
-		if _, err := parseImageList(line); err == nil {
+		if _, err := parseImageList("fleet.txt", line); err == nil {
 			t.Errorf("parseImageList(%q) was accepted", line)
 		}
 	}
@@ -422,11 +422,229 @@ func TestParseImageListRejectsEmptyDlopenCaller(t *testing.T) {
 // profile that asserts something, which is the opposite of what that check is
 // for.
 func TestParseImageListProfileOfOnlyDlopenCallers(t *testing.T) {
-	got, err := parseImageList("[profile p] dlopen-assume-none=/usr/bin/bash\nalpine:3.20 profile=p\n")
+	got, err := parseImageList("fleet.txt", "[profile p] dlopen-assume-none=/usr/bin/bash\nalpine:3.20 profile=p\n")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if a := got[0].assert; a == nil || !equalStrings(a.DlopenAssumeNoneFor, []string{"/usr/bin/bash"}) {
 		t.Errorf("profile of only named callers produced %+v", got[0].assert)
+	}
+}
+
+// entrypoint= and cmd=, the hand-written form of what a Kubernetes manifest
+// carries. Kubernetes is not the only thing that replaces an entrypoint --
+// docker run --entrypoint, a compose service, a Nomad task and a systemd unit
+// all do, and none of them ship a manifest this program can read.
+
+// TestEntrypointKeyReplacesRatherThanRoots is the guard that makes the key
+// worth having at all. Written to Roots it would add a starting point and leave
+// the shell the image declares rooted beside it, which is the situation the
+// override exists to escape, and a report produced that way looks exactly like
+// one produced correctly.
+func TestEntrypointKeyReplacesRatherThanRoots(t *testing.T) {
+	got, err := parseImageList("fleet.txt", "hardened-calico:v3.32.0 entrypoint=/usr/bin/calico-node cmd=-felix\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := got[0].assert
+	if a == nil {
+		t.Fatal("the line carried no assertion")
+	}
+	if !equalStrings(a.Entrypoint, []string{"/usr/bin/calico-node"}) {
+		t.Errorf("Entrypoint = %v", a.Entrypoint)
+	}
+	if !equalStrings(a.Cmd, []string{"-felix"}) {
+		t.Errorf("Cmd = %v", a.Cmd)
+	}
+	if len(a.Roots) != 0 {
+		t.Errorf("the entrypoint was written to Roots, which adds to the config entrypoint rather than replacing it: %v", a.Roots)
+	}
+
+	// And it has to survive apply, which is where the override either reaches
+	// the scan or is dropped on the floor.
+	var opts analyze.Options
+	a.apply(&opts)
+	if !equalStrings(opts.Entrypoint, []string{"/usr/bin/calico-node"}) || !equalStrings(opts.Cmd, []string{"-felix"}) {
+		t.Errorf("the override did not reach the scan: %v %v", opts.Entrypoint, opts.Cmd)
+	}
+}
+
+// TestEntrypointKeyRecordsTheListAsItsSource. apply drops an override with no
+// source, so a missing source is a silently narrower scan; and the source is
+// the only part of the clause a reviewer can go and check.
+func TestEntrypointKeyRecordsTheListAsItsSource(t *testing.T) {
+	got, err := parseImageList("fleet.txt", "alpine:3.20 entrypoint=/bin/app\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].assert.EntrypointFrom != "fleet.txt" {
+		t.Errorf("EntrypointFrom = %q, want the list that made the claim", got[0].assert.EntrypointFrom)
+	}
+}
+
+// TestCmdKeyAloneLeavesTheEntrypointAlone. Replacing the arguments is not
+// replacing the program: an image whose config entrypoint is a wrapper still
+// runs that wrapper. Setting Entrypoint here would unroot it and conclude about
+// a process that never starts.
+func TestCmdKeyAloneLeavesTheEntrypointAlone(t *testing.T) {
+	got, err := parseImageList("fleet.txt", "alpine:3.20 cmd=--serve\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := got[0].assert
+	if a.Entrypoint != nil {
+		t.Errorf("cmd= alone invented an entrypoint override: %v", a.Entrypoint)
+	}
+	if !equalStrings(a.Cmd, []string{"--serve"}) {
+		t.Errorf("Cmd = %v", a.Cmd)
+	}
+	if a.EntrypointFrom != "fleet.txt" {
+		t.Errorf("EntrypointFrom = %q; without it apply drops the override", a.EntrypointFrom)
+	}
+}
+
+// TestEmptyCmdKeyIsNotAnAbsentOne keeps nil and empty apart at the list, where
+// `cmd=` says the image's arguments are dropped and saying nothing says they
+// still run. Collapsing them keeps running a command the user said was gone.
+func TestEmptyCmdKeyIsNotAnAbsentOne(t *testing.T) {
+	got, err := parseImageList("fleet.txt", "alpine:3.20 cmd= exec-policy=assume-none\nbusybox:1.36 exec-policy=assume-none\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleared, silent := got[0].assert, got[1].assert
+	if cleared.Cmd == nil {
+		t.Error("cmd= was read as though it had not been said, so the image's own arguments still run")
+	}
+	if len(cleared.Cmd) != 0 {
+		t.Errorf("cmd= produced %v, want an empty command line", cleared.Cmd)
+	}
+	if silent.Cmd != nil {
+		t.Errorf("a line that said nothing about cmd produced %#v", silent.Cmd)
+	}
+	if silent.EntrypointFrom != "" {
+		t.Errorf("a line that made no override recorded a source: %q", silent.EntrypointFrom)
+	}
+}
+
+// TestEntrypointKeyDoesNotSplitOnCommas. roots= splits on commas because a path
+// cannot contain one; an argument can, and cutting it in two changes what runs.
+func TestEntrypointKeyDoesNotSplitOnCommas(t *testing.T) {
+	got, err := parseImageList("fleet.txt", "alpine:3.20 entrypoint=/bin/app cmd=--listen=1.2.3.4,5.6.7.8\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equalStrings(got[0].assert.Cmd, []string{"--listen=1.2.3.4,5.6.7.8"}) {
+		t.Errorf("Cmd = %v, want one argument", got[0].assert.Cmd)
+	}
+}
+
+// TestRepeatedEntrypointKeysAreOneArgvInOrder. A command line is ordered, and
+// the order decides which token a wrapper forwards to.
+func TestRepeatedEntrypointKeysAreOneArgvInOrder(t *testing.T) {
+	got, err := parseImageList("fleet.txt", "alpine:3.20 entrypoint=/usr/bin/tini entrypoint=-- entrypoint=/usr/bin/server\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equalStrings(got[0].assert.Entrypoint, []string{"/usr/bin/tini", "--", "/usr/bin/server"}) {
+		t.Errorf("Entrypoint = %v", got[0].assert.Entrypoint)
+	}
+}
+
+// TestEmptyEntrypointKeyIsRefused. "Started with no program at all" is not a
+// runnable claim, and read as an override it would unroot the image's own
+// entrypoint and root nothing in its place.
+func TestEmptyEntrypointKeyIsRefused(t *testing.T) {
+	if _, err := parseImageList("fleet.txt", "alpine:3.20 entrypoint=\n"); err == nil {
+		t.Fatal("entrypoint= with no program was accepted")
+	}
+}
+
+// TestLineEntrypointReplacesTheProfilesRatherThanExtending, the same rule
+// roots= follows: a line that states its own command line is a complete
+// statement about that image, and appending to a profile's would produce an
+// argv nobody wrote.
+func TestLineEntrypointReplacesTheProfilesRatherThanExtending(t *testing.T) {
+	got, err := parseImageList("fleet.txt", `
+[profile wrapped] entrypoint=/usr/bin/tini entrypoint=-- exec-policy=assume-none
+a:1 profile=wrapped
+b:1 profile=wrapped entrypoint=/usr/bin/server
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The profile's own argv reaches the image that asked for it.
+	if !equalStrings(got[0].assert.Entrypoint, []string{"/usr/bin/tini", "--"}) {
+		t.Errorf("profile entrypoint = %v", got[0].assert.Entrypoint)
+	}
+	if got[0].assert.EntrypointFrom != "fleet.txt" {
+		t.Errorf("a profile's entrypoint recorded no source: %q", got[0].assert.EntrypointFrom)
+	}
+	// And the line's replaces it rather than appending to it.
+	if !equalStrings(got[1].assert.Entrypoint, []string{"/usr/bin/server"}) {
+		t.Errorf("line entrypoint = %v, want the line's own alone", got[1].assert.Entrypoint)
+	}
+}
+
+// TestListSourceNamesStandardInput. The documented way to scan a cluster pipes
+// a manifest in, and "the image runs /usr/bin/calico-node per -" names nothing
+// a reviewer can check.
+func TestListSourceNamesStandardInput(t *testing.T) {
+	if got := listSource("-"); got != "standard input" {
+		t.Errorf("listSource(\"-\") = %q", got)
+	}
+	if got := listSource("deploy.yaml"); got != "deploy.yaml" {
+		t.Errorf("listSource(\"deploy.yaml\") = %q", got)
+	}
+}
+
+// A profile whose only assertion is the entrypoint asserts something.
+//
+// The emptiness check is a list of every field a profile can carry, which is
+// the kind of list that goes stale the moment a field is added to scanAssert --
+// as entrypoint= and cmd= were. Left out, the most useful profile a fleet can
+// define is the one refused: "these forty images are all started with their own
+// binary" is an entrypoint and nothing else, and adding an exec-policy to get
+// past the check would be asserting more than the author meant to.
+func TestProfileAssertingOnlyAnEntrypointIsNotEmpty(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		list string
+		want []string
+	}{
+		{"entrypoint alone", "[profile p] entrypoint=/usr/bin/calico-node\nalpine:3.20 profile=p\n",
+			[]string{"/usr/bin/calico-node"}},
+		{"entrypoint with arguments", "[profile p] entrypoint=/usr/bin/tini entrypoint=--\nalpine:3.20 profile=p\n",
+			[]string{"/usr/bin/tini", "--"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseImageList("fleet.txt", tc.list)
+			if err != nil {
+				t.Fatalf("parseImageList: %v", err)
+			}
+			if a := got[0].assert; a == nil || !equalStrings(a.Entrypoint, tc.want) {
+				t.Fatalf("Entrypoint = %v, want %v", got[0].assert, tc.want)
+			}
+			if got[0].assert.EntrypointFrom != "fleet.txt" {
+				t.Errorf("EntrypointFrom = %q, want the list", got[0].assert.EntrypointFrom)
+			}
+		})
+	}
+}
+
+// cmd= alone is the same, and is its own case because it is the one that can
+// carry no tokens at all: `[profile p] cmd=` says the image's declared
+// entrypoint runs with no arguments, which is an assertion with an empty slice
+// behind it and nothing a nil check would see.
+func TestProfileAssertingOnlyClearedArgumentsIsNotEmpty(t *testing.T) {
+	got, err := parseImageList("fleet.txt", "[profile p] cmd=\nalpine:3.20 profile=p\n")
+	if err != nil {
+		t.Fatalf("parseImageList: %v", err)
+	}
+	a := got[0].assert
+	if a == nil || a.Cmd == nil || len(a.Cmd) != 0 {
+		t.Fatalf("Cmd = %#v, want an empty non-nil slice", a)
+	}
+	if a.Entrypoint != nil {
+		t.Errorf("Entrypoint = %v, want the image's own left alone", a.Entrypoint)
 	}
 }
