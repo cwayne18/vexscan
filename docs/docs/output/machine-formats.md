@@ -111,6 +111,15 @@ contrib/vexscan-dashboard.py fleet.json -o site/
 
 The mode is read from the JSON, not from a flag.
 
+When a target's `runtime_assertion` is set — a fleet-list line's `roots=`,
+`entrypoint=`, `profile=` or a policy flag from [`--images-from`](../guides/fleet.md)
+or the CLI — the dashboard says so: the fleet index gets an `Assertion` column
+with a pill naming which one, and its target page gets a line near the top
+spelling out the literal `roots=`/`entrypoint=`/`cmd=` values that were applied,
+or "No runtime assertion" when none was. Without it, a `RULED OUT` result that
+rests on a user-supplied roots= reads identically on the page to one the scan
+derived unaided.
+
 **It is a renderer, not a second opinion.** Every number on the page is read out
 of the report; nothing is re-derived. The four sections, their order, which
 columns each one shows and how the rows within it sort are all the same rules
