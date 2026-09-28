@@ -137,6 +137,7 @@ h1 {
   word-break: break-all;
 }
 .page-sub { color: var(--muted); font-size: 13px; margin: 0 0 24px; }
+.assertion-note { font-size: 13px; margin: -18px 0 24px; }
 h2 { font-size: 16px; font-weight: 600; margin: 32px 0 10px; }
 h3 { font-size: 14px; font-weight: 600; margin: 22px 0 8px; }
 .anchored { display: flex; align-items: baseline; gap: 8px; }
@@ -1456,6 +1457,71 @@ def render_cards(counts, link=True, extra=""):
     return '<div class="cards">%s%s</div>' % ("".join(cards), extra)
 
 
+def runtime_assertion_tokens(rt):
+    """The runtime_assertion object as the roots=/entrypoint=/*-policy= tokens
+    --images-from and the CLI flags spell it with, so a reader can go find the
+    fleet-list line or command that produced them instead of trusting a prose
+    paraphrase.
+
+    Returns [] when rt is falsy (the scan asserted nothing about how the
+    target runs, and every RULED OUT row on the page rests on the image alone).
+    """
+    if not rt:
+        return []
+    tokens = []
+    if rt.get("profile"):
+        tokens.append("profile=%s" % rt["profile"])
+    if rt.get("entrypoint_from"):
+        entrypoint, cmd = rt.get("entrypoint"), rt.get("cmd")
+        if entrypoint:
+            tokens.append("entrypoint=%s" % " ".join(entrypoint))
+        if cmd:
+            tokens.append("cmd=%s" % " ".join(cmd))
+        tokens.append("(from %s)" % rt["entrypoint_from"])
+    if rt.get("roots"):
+        tokens.append("roots=%s" % ",".join(rt["roots"]))
+    if rt.get("exec_assume_none"):
+        tokens.append("exec-policy=assume-none")
+    if rt.get("dlopen_assume_none"):
+        tokens.append("dlopen-policy=assume-none")
+    if rt.get("dlopen_assume_none_for"):
+        tokens.append("dlopen-assume-none=%s" % ",".join(rt["dlopen_assume_none_for"]))
+        if rt.get("dlopen_inert"):
+            tokens.append("(%s matched no dlopen caller here)" % ", ".join(rt["dlopen_inert"]))
+    if rt.get("dynamic_assume_none"):
+        tokens.append("dynamic-import-policy=assume-none")
+    return tokens
+
+
+def render_assertion_badge(rt):
+    """The fleet index's compact stand-in for render_runtime_assertion: one
+    column saying whether this row's RULED OUT counts can be taken at face
+    value, or rest on a roots=/entrypoint= this row alone would not show.
+    """
+    tokens = runtime_assertion_tokens(rt)
+    if not tokens:
+        return '<span class="muted">&mdash;</span>'
+    return '<span class="pill" title="%s">asserted</span>' % esc(" ".join(tokens))
+
+
+def render_runtime_assertion(res):
+    """The line near the top of a target page saying whether --images-from or
+    the CLI carried a roots=/entrypoint=/profile= assertion for this target,
+    and what it literally was.
+
+    Without this, a RULED OUT verdict that rests on a user-supplied roots= is
+    indistinguishable in the report from one the scan derived unaided, and a
+    reader has no way to know there is an assumption here to agree or disagree
+    with. See analyze.RuntimeAssertion.
+    """
+    tokens = runtime_assertion_tokens(res.get("runtime_assertion"))
+    if not tokens:
+        return ('<p class="assertion-note muted">No runtime assertion for this target '
+                "&mdash; findings rest on the image's own config.</p>")
+    return ('<p class="assertion-note">Runtime assertion: <code>%s</code></p>'
+            % esc(" ".join(tokens)))
+
+
 def render_headline(res, counts):
     """One sentence at the top saying whether anybody has to do anything."""
     affected = counts.get(BUCKET_AFFECTED, 0)
@@ -1707,6 +1773,7 @@ def render_report(res, source_name, nav_href=None):
     body = [
         "<h1>%s</h1>" % esc(target),
         '<p class="page-sub">%s</p>' % esc(sub),
+        render_runtime_assertion(res),
         render_headline(res, counts),
         render_cards(counts, extra=remediation_card(res)),
         render_remediation(res),
@@ -1777,6 +1844,7 @@ def render_index(batch, source_name, pages):
             SEVERITY_RANK.get(worst, 9),
             [
                 '<a href="%s">%s</a>' % (esc(filename), esc(res.get("target", ""))),
+                render_assertion_badge(res.get("runtime_assertion")),
                 state,
                 esc(components),
                 esc(counts[BUCKET_AFFECTED]),
@@ -1826,7 +1894,7 @@ def render_index(batch, source_name, pages):
         '<span class="hits" id="hits"></span></div>'
     )
 
-    headers = ["Target", "Worst", ("Components",), ("Affected",), ("Vexed",),
+    headers = ["Target", "Assertion", "Worst", ("Components",), ("Affected",), ("Vexed",),
                ("Undetermined",), ("Ruled out",)]
     out = ['<div id="fleet" class="table-wrap"><table class="report-table"><thead><tr>']
     for h in headers:
