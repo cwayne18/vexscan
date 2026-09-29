@@ -48,6 +48,23 @@ func TestModulePresent(t *testing.T) {
 	}
 }
 
+// An empty module name is degenerate but reachable: golang.group iterates the
+// --module values without a non-empty guard, and --module-version skips the
+// ModuleVersion check that otherwise drops it. It must answer, not panic.
+func TestModulePresentEmpty(t *testing.T) {
+	// No byte in [./] anywhere, so the scan walks off the end of the blob.
+	if (&Symbols{blob: []byte("abcdef")}).ModulePresent("") {
+		t.Errorf("empty module must not match a blob with no separator")
+	}
+	// Matches any separator, which is what the regexp this replaced did.
+	if !(&Symbols{blob: []byte("ab/cdef")}).ModulePresent("") {
+		t.Errorf("empty module should match a blob containing a separator")
+	}
+	if (&Symbols{}).ModulePresent("") {
+		t.Errorf("empty module must not match an empty blob")
+	}
+}
+
 func TestNormalizeGoVersion(t *testing.T) {
 	cases := map[string]string{
 		"go1.24.0":                "1.24.0",
