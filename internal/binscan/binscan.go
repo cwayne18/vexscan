@@ -22,7 +22,6 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -174,16 +173,50 @@ func LoadSymbols(path string) (*Symbols, error) {
 // It matches `pkg.<ident>` exactly so a parent package match does not leak from
 // a child (e.g. .../ssh vs .../ssh/agent).
 func (s *Symbols) PackagePresent(pkg string) bool {
-	re := regexp.MustCompile(regexp.QuoteMeta(pkg) + `\.[A-Za-z(]`)
-	return re.Match(s.blob)
+	return hasIdentAfter(s.blob, pkg+".", isIdentStart)
 }
 
 // ModulePresent reports whether any part of module (root or a sub-package)
 // appears in the binary. Used as a coarse fallback when OSV lists no
 // package-level import paths.
 func (s *Symbols) ModulePresent(module string) bool {
-	re := regexp.MustCompile(regexp.QuoteMeta(module) + `[./]`)
-	return re.Match(s.blob)
+	return hasIdentAfter(s.blob, module, isPathSep)
+}
+
+// hasIdentAfter reports whether blob contains literal followed immediately by
+// a byte that class accepts.
+//
+// This used to be regexp.MustCompile(QuoteMeta(literal)+class).Match(blob),
+// recompiled fresh on every call. evaluate (golang/evaluate.go) drives that at
+// one call per (binary, advisory, package) triple -- every CVE known against a
+// module, times every package it names, times every binary in the image. The
+// regexp compile alone costs ~29 allocations and a few KB per call regardless
+// of how big the binary is, so a scan checking a few hundred advisories was
+// paying that tax a few hundred times for no benefit: the pattern is a literal
+// plus a one-byte class, which bytes.Index answers directly with zero
+// allocations and no compile step.
+func hasIdentAfter(blob []byte, literal string, class func(byte) bool) bool {
+	needle := []byte(literal)
+	for start := 0; ; {
+		i := bytes.Index(blob[start:], needle)
+		if i < 0 {
+			return false
+		}
+		pos := start + i
+		next := pos + len(needle)
+		if next < len(blob) && class(blob[next]) {
+			return true
+		}
+		start = pos + 1
+	}
+}
+
+func isIdentStart(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '('
+}
+
+func isPathSep(b byte) bool {
+	return b == '.' || b == '/'
 }
 
 // IsStripped reports whether an ELF Go binary carries no symbol table. Non-ELF
