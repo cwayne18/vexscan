@@ -195,9 +195,15 @@ func (s *Symbols) ModulePresent(module string) bool {
 // paying that tax a few hundred times for no benefit: the pattern is a literal
 // plus a one-byte class, which bytes.Index answers directly with zero
 // allocations and no compile step.
+//
+// start is bounded rather than left open: an empty literal makes bytes.Index
+// return 0 forever, so the scan walks one byte at a time (which is what the
+// regexp did -- an empty literal left just the one-byte class) and runs start
+// off the end of blob on the last step. Unbounded, that indexed out of range
+// instead of reporting no match.
 func hasIdentAfter(blob []byte, literal string, class func(byte) bool) bool {
 	needle := []byte(literal)
-	for start := 0; ; {
+	for start := 0; start <= len(blob); {
 		i := bytes.Index(blob[start:], needle)
 		if i < 0 {
 			return false
@@ -209,8 +215,14 @@ func hasIdentAfter(blob []byte, literal string, class func(byte) bool) bool {
 		}
 		start = pos + 1
 	}
+	return false
 }
 
+// isIdentStart is the byte class the old regexp spelled [A-Za-z(]. It is
+// deliberately not Go's identifier rule: `(` is here because pclntab spells a
+// method symbol as pkg.(*T).Method, and `_` is absent because the old pattern
+// omitted it. Widening this to match Go identifiers would flip
+// vulnerable_code_not_present verdicts, so leave it matching the regexp.
 func isIdentStart(b byte) bool {
 	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '('
 }
