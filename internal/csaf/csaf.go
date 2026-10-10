@@ -296,6 +296,7 @@ type Remediation struct {
 // Score is one CVSS rating for the vulnerability, scoped to products.
 type Score struct {
 	CVSSV3     CVSSV3   `json:"cvss_v3"`
+	CVSSV4     CVSSV4   `json:"cvss_v4"`
 	ProductIDs []string `json:"products,omitempty"`
 }
 
@@ -303,6 +304,16 @@ type Score struct {
 // the vector are read: internal/cvss scores v3 and nothing else, matching how
 // every other advisory in this tool is rated.
 type CVSSV3 struct {
+	BaseScore    float64 `json:"baseScore"`
+	VectorString string  `json:"vectorString"`
+}
+
+// CVSSV4 is the v4.0 rating inside a score entry, present on advisories that
+// have not also published a v3 score for the same finding. Same two fields as
+// CVSSV3, for the same reason: internal/cvss recomputes the base score from
+// the vector itself rather than trusting the publisher's BaseScore field, so
+// that field exists here only as a sanity check a caller may choose to use.
+type CVSSV4 struct {
 	BaseScore    float64 `json:"baseScore"`
 	VectorString string  `json:"vectorString"`
 }

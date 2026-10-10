@@ -69,16 +69,14 @@ func TestScoreMatchesPublishedValues(t *testing.T) {
 }
 
 // TestScoreDeclinesWhatItCannotScore covers the inputs that must produce no
-// severity rather than a wrong one. The CVSS:4.0 case is the one that matters
-// in practice: those records are already in OSV, and scoring them with the v3
-// formula would silently produce a plausible number for a vector whose metrics
-// do not mean the same thing.
+// severity rather than a wrong one. CVSS:4.0 is scored by v4.go now (see
+// v4_test.go for its own declines-what-it-cannot-score coverage); what
+// remains here is everything this package has never supported.
 func TestScoreDeclinesWhatItCannotScore(t *testing.T) {
 	unscorable := []struct {
 		name   string
 		vector string
 	}{
-		{"CVSS 4.0", "CVSS:4.0/AV:L/AC:L/AT:N/PR:L/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"},
 		{"CVSS 2.0", "AV:N/AC:L/Au:N/C:P/I:P/A:P"},
 		{"CVSS 2.0 with a prefix", "CVSS:2.0/AV:N/AC:L/Au:N/C:P/I:P/A:P"},
 		{"empty", ""},

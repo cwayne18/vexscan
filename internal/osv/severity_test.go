@@ -96,18 +96,18 @@ func TestNoSeverityAtAllIsUnknown(t *testing.T) {
 	}
 }
 
-// A CVSS 4.0 vector is deliberately not scored, and a record carrying only one
-// must report UNKNOWN rather than being run through the v3 formula.
-func TestCVSS4OnlyIsNotScored(t *testing.T) {
+// A CVSS 4.0 vector is scored on the same footing as a v3 one, and a record
+// carrying only one must report its own severity rather than UNKNOWN.
+func TestCVSS4OnlyIsScored(t *testing.T) {
 	body := `{"vulns":[{"id":"DEBIAN-CVE-2026-56391",
 	  "severity":[{"type":"CVSS_V4","score":"CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"}]}]}`
 	adv := queryOne(t, body, debianRef, "DEBIAN-CVE-2026-56391")
 
-	if adv.CVSSVector != "" {
-		t.Errorf("CVSSVector = %q, a 4.0 vector must not be stored as scorable", adv.CVSSVector)
+	if adv.CVSSVector != "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N" {
+		t.Errorf("CVSSVector = %q, a 4.0 vector must be stored as scorable", adv.CVSSVector)
 	}
-	if got := adv.Severity(); got != cvss.Unknown {
-		t.Errorf("Severity() = %s, want %s", got, cvss.Unknown)
+	if got := adv.Severity(); got != cvss.Critical {
+		t.Errorf("Severity() = %s, want %s", got, cvss.Critical)
 	}
 }
 
@@ -125,15 +125,18 @@ func TestV3IsPickedOutOfAMixedSeverityList(t *testing.T) {
 }
 
 // The vector string's own prefix decides the version, not the entry's type
-// field, so a 4.0 vector mislabelled as CVSS_V3 cannot be scored with the v3
-// formula.
+// field, so a 4.0 vector mislabelled as CVSS_V3 is still read, and scored, as
+// the 4.0 vector it actually is.
 func TestTheVectorPrefixWinsOverTheDeclaredType(t *testing.T) {
 	body := `{"vulns":[{"id":"GHSA-mistyped","severity":[
 	  {"type":"CVSS_V3","score":"CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"}]}]}`
 	adv := queryOne(t, body, debianRef, "GHSA-mistyped")
 
-	if adv.CVSSVector != "" {
-		t.Errorf("CVSSVector = %q, want empty", adv.CVSSVector)
+	if adv.CVSSVector != "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N" {
+		t.Errorf("CVSSVector = %q, want the mislabelled vector unchanged", adv.CVSSVector)
+	}
+	if score, ok := adv.CVSSScore(); !ok || score != 9.3 {
+		t.Errorf("CVSSScore() = %.1f, %v; want 9.3, true (scored as v4.0, not the v3 formula)", score, ok)
 	}
 }
 
@@ -169,7 +172,7 @@ func TestSeverityTakesTheMoreSevereSource(t *testing.T) {
 		{
 			// An unscorable vector must not drag a real label down to UNKNOWN.
 			name:   "only the label is usable",
-			vector: "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
+			vector: "not a CVSS vector",
 			label:  "HIGH",
 			want:   cvss.High,
 		},

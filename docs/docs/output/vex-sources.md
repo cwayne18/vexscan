@@ -239,11 +239,11 @@ that gives it a severity — which resolves the Go id to the `CVE-2026-xxxx` the
 vendor feed is keyed by. So `GO-2026-1234` picks up SUSE's score for its
 underlying CVE without you naming the CVE.
 
-SUSE's CSAF carries a CVSS v3 base score and vector per CVE
-(`vulnerabilities[].scores[].cvss_v3`). It is the first — and today only — vendor
-vexscan can score; a name it does not recognise (`--prefer-vendor debian`, which
-publishes no score) is reported on stderr and ignored rather than silently doing
-nothing.
+SUSE's CSAF carries a CVSS v3 or v4 base score and vector per CVE
+(`vulnerabilities[].scores[].cvss_v3` or `.cvss_v4`, v3 preferred when a CVE has
+both). It is the first — and today only — vendor vexscan can score; a name it
+does not recognise (`--prefer-vendor debian`, which publishes no score) is
+reported on stderr and ignored rather than silently doing nothing.
 
 Two properties are worth stating plainly, because this is the **one overlay that
 changes a finding's `severity` and `cvss`** where every other second opinion

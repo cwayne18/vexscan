@@ -1,15 +1,17 @@
-// Package cvss scores CVSS v3 base vectors.
+// Package cvss scores CVSS base vectors.
 //
 // It exists so a report can be sorted by something other than package name. It
 // is deliberately the smallest thing that does that job: base metrics only, no
-// temporal or environmental score, and no attempt to be a general CVSS library.
+// temporal score, and no attempt to be a general CVSS library.
 //
-// Only CVSS:3.0 and CVSS:3.1 are scored. v2 is long dead and appears in no
-// record this tool queries; v4.0 does appear, and is not scored on purpose --
-// its base score is not a formula but a 270-entry MacroVector lookup with an
-// interpolation step over it, which is a great deal of transcribed table to get
-// subtly wrong. An unscored vector reports no severity at all, which is true,
-// rather than a number that looks authoritative and is not.
+// CVSS:3.0, CVSS:3.1 and CVSS:4.0 are scored; v2 is not, since it is long dead
+// and appears in no record this tool queries. v4.0's base score (see v4.go) is
+// not a formula but a 270-entry MacroVector lookup with an interpolation step
+// over it, transcribed from FIRST's own reference calculator rather than from
+// the prose specification, for exactly the reason a from-scratch transcription
+// of a table that size would be risky: it is too easy to get subtly wrong. An
+// unscored vector reports no severity at all, which is true, rather than a
+// number that looks authoritative and is not.
 package cvss
 
 import (
@@ -71,14 +73,17 @@ var (
 	}
 )
 
-// Score returns the CVSS base score for a v3 vector.
+// Score returns the CVSS base score for a v3 or v4.0 vector.
 //
-// The second return is false for anything it will not score: another CVSS
-// version, a vector missing a base metric, or an unrecognized metric value.
-// Callers must treat that as "no severity", never as zero -- a 0.0 base score
-// is a real CVSS answer meaning no impact.
+// The second return is false for anything it will not score: an unsupported
+// CVSS version, a vector missing a base metric, or an unrecognized metric
+// value. Callers must treat that as "no severity", never as zero -- a 0.0
+// base score is a real CVSS answer meaning no impact.
 func Score(vector string) (float64, bool) {
 	vector = strings.TrimSpace(vector)
+	if strings.HasPrefix(vector, "CVSS:4.0/") {
+		return scoreV4(vector)
+	}
 	if !strings.HasPrefix(vector, "CVSS:3.0/") && !strings.HasPrefix(vector, "CVSS:3.1/") {
 		return 0, false
 	}

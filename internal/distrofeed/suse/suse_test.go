@@ -278,7 +278,11 @@ func TestBestVector(t *testing.T) {
 		{"single", scoresOf(7.5, "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"), "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"},
 		{"highest wins", scoresOf(4.0, "CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:L/I:N/A:N", 9.8, "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"),
 			"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"},
-		{"non-v3 ignored", scoresOf(9.9, "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"), ""},
+		{"v4 used when there is no v3", scoresOf(9.3, "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"),
+			"CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"},
+		{"v3 preferred over v4", scoresOf(9.3, "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N", 9.8, "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"),
+			"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"},
+		{"unrecognized version ignored", scoresOf(9.9, "CVSS:2.0/AV:N/AC:L/Au:N/C:C/I:C/A:C"), ""},
 	}
 	for _, c := range cases {
 		if got := bestVector(c.scores); got != c.want {
@@ -315,13 +319,18 @@ func TestMissingDocumentIsCached(t *testing.T) {
 }
 
 // scoresOf builds a scores slice from alternating (baseScore, vector) pairs, for
-// the table test above.
+// the table test above. The vector's prefix decides which of CVSSV3/CVSSV4 it
+// goes into, same as a real CSAF document only ever populates one of the two.
 func scoresOf(pairs ...any) []csaf.Score {
 	var out []csaf.Score
 	for i := 0; i+1 < len(pairs); i += 2 {
 		var s csaf.Score
-		s.CVSSV3.BaseScore = pairs[i].(float64)
-		s.CVSSV3.VectorString = pairs[i+1].(string)
+		score, vec := pairs[i].(float64), pairs[i+1].(string)
+		if strings.HasPrefix(vec, "CVSS:4.0/") {
+			s.CVSSV4.BaseScore, s.CVSSV4.VectorString = score, vec
+		} else {
+			s.CVSSV3.BaseScore, s.CVSSV3.VectorString = score, vec
+		}
 		out = append(out, s)
 	}
 	return out

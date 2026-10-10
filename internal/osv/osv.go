@@ -140,7 +140,7 @@ type Advisory struct {
 }
 
 // Severity is the rating to display for this advisory: the more severe of what
-// the publisher said and what its CVSS v3 vector computes to.
+// the publisher said and what its CVSS vector computes to.
 //
 // Taking the maximum is not indecision about a conflict. It is the only rule
 // available here that never demotes a finding on a metadata technicality. The
@@ -150,11 +150,11 @@ type Advisory struct {
 // avoids quietly lowering the severity of some real findings.
 //
 // Neither source is wrong. GitHub rates the advisory, increasingly against the
-// CVSS 4.0 vector it also publishes and this tool deliberately does not score,
-// while the v3 vector is a separate and older statement about the same flaw.
-// The computed score cannot simply be dropped in the label's favour either: a
-// Debian record carries a vector and no label at all, and scoring it is what
-// makes it comparable with a GHSA one in the same table.
+// CVSS 4.0 vector some records now carry instead of, or alongside, a v3 one,
+// while the label is a separate and sometimes older statement about the same
+// flaw. The computed score cannot simply be dropped in the label's favour
+// either: a Debian record carries a vector and no label at all, and scoring it
+// is what makes it comparable with a GHSA one in the same table.
 //
 // Erring upward costs a reader time on a finding milder than billed. Erring
 // downward costs them the finding.
@@ -773,20 +773,27 @@ func advisoryFor(ref Ref, v vuln) *Advisory {
 // cvssVector picks the scorable base vector out of a record's severity list.
 //
 // The list is keyed by scoring system and a record may hold several: a GHSA
-// commonly publishes CVSS_V3 and CVSS_V4 side by side. Only a v3 vector is
-// returned, because that is the only one internal/cvss will score, and the
-// entry's own type is not trusted to say which -- the vector string carries its
-// own version prefix, and honouring that rather than the label means a record
-// that files a 4.0 vector under a CVSS_V3 type cannot be scored with the wrong
-// formula.
+// commonly publishes CVSS_V3 and CVSS_V4 side by side. A v3 vector is
+// preferred when both are present, for no reason stronger than that v3 is
+// what most of this tool's other sources rate with, so sticking to it keeps
+// one version doing the comparing across records whenever there is a choice.
+// The entry's own type is not trusted to say which version a vector is,
+// either way -- the vector string carries its own version prefix, and
+// honouring that rather than the label means a record that files a 4.0
+// vector under a CVSS_V3 type is read as the 4.0 vector it actually is,
+// not scored with the wrong formula.
 func cvssVector(v vuln) string {
+	var v4 string
 	for _, s := range v.Severity {
 		vector := strings.TrimSpace(s.Score)
-		if strings.HasPrefix(vector, "CVSS:3.0/") || strings.HasPrefix(vector, "CVSS:3.1/") {
+		switch {
+		case strings.HasPrefix(vector, "CVSS:3.0/") || strings.HasPrefix(vector, "CVSS:3.1/"):
 			return vector
+		case v4 == "" && strings.HasPrefix(vector, "CVSS:4.0/"):
+			v4 = vector
 		}
 	}
-	return ""
+	return v4
 }
 
 // retry runs fn up to three times, backing off a second per attempt. A

@@ -16,13 +16,14 @@ downward costs them the finding.
 evidence that the problem is small, and in a report several hundred rows long
 anything sorted to the bottom stops being read.
 
-Two things report `UNKNOWN` that are worth knowing about:
+Two things are worth knowing about `UNKNOWN`:
 
-- **CVSS 4.0-only records are not scored.** A v4 base score is a 270-entry
-  MacroVector lookup with interpolation, not a formula. Records carrying only a
-  v4 vector report `UNKNOWN` rather than a number this tool made up. Most
-  advisories still publish v3 alongside; on `debian:12` 36 of 161 findings are
-  unrated, from a mix of v4-only and pre-CVSS records.
+- **Not every record carries a CVSS vector at all.** A pre-CVSS or
+  vendor-withdrawn record with no vector and no label still reports `UNKNOWN`
+  rather than a number this tool made up. (CVSS 3.0, 3.1 and 4.0 vectors are
+  all scored, including v4-only records — v4's base score is a 270-entry
+  MacroVector lookup with interpolation rather than a formula, ported from
+  FIRST's reference calculator.)
 - **`--repo` Go findings carry no severity at all.** That path resolves
   advisories inside govulncheck, which is run with `-format openvex`, and OpenVEX
   carries no severity field. Image mode goes entirely through the resolver and is
