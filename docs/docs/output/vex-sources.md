@@ -220,10 +220,20 @@ vexscan --image docker.io/rancher/k3s:v1.36.3-k3s1 --all --prefer-vendor suse
 It is the same idea as
 [`rke2-toolbox`](https://github.com/cwayne18/rke2-toolbox), which always favours
 SUSE's rating of a CVE and only falls back to another source when SUSE has not
-scored it. The flag is **ordered and repeatable** — `--prefer-vendor suse
---prefer-vendor debian` tries SUSE first, then Debian, then the OSV rating — and
-a name matches a vendor case-insensitively, so `suse` selects *SUSE Security
-Team*.
+scored it. The flag is **ordered and repeatable**, and each name is tried in turn
+*per finding* — not once for the whole run — so a vendor further down the list is
+a real fallback, not an all-or-nothing switch:
+
+```sh
+# SUSE's own rating where SUSE has a CSAF document, NVD's where SUSE does not
+# (e.g. SUSE has published nothing yet for this CVE), OSV's rating for anything
+# neither scored.
+vexscan --image docker.io/rancher/k3s:v1.36.3-k3s1 --all \
+  --prefer-vendor suse --prefer-vendor nvd
+```
+
+A name matches a vendor case-insensitively, so `suse` selects *SUSE Security
+Team* and `nvd` selects *NVD*.
 
 **It is keyed by CVE, not by package.** A vendor rates a CVE once, and that
 rating is as true of a Go module or an npm package that bundles the flaw as of an

@@ -164,6 +164,26 @@ func TestPreferVendorEarliestListedWins(t *testing.T) {
 	}
 }
 
+// When the first-listed vendor has no record at all for a finding's CVE --
+// SUSE publishing no CSAF document for it, say -- the next vendor in the list
+// is tried instead of the OSV rating standing unchanged. This is what makes
+// `--prefer-vendor suse --prefer-vendor nvd` a real fallback chain: SUSE first,
+// NVD for whatever SUSE did not score.
+func TestPreferVendorFallsBackToNextVendorWhenFirstHasNoScore(t *testing.T) {
+	findings := []Finding{sevFinding("CVE-2026-78660", "UNKNOWN", "")}
+	suse := &fakeScorer{name: "SUSE Security Team", scores: map[string]string{}}
+	nvd := &fakeScorer{name: "NVD", scores: map[string]string{"CVE-2026-78660": vectorHigh}}
+
+	preferVendorScores(context.Background(), []distrofeed.Scorer{suse, nvd}, findings, nil, quiet)
+
+	if findings[0].Severity != "HIGH" {
+		t.Errorf("severity = %q, want HIGH (fell back to NVD when SUSE had no record)", findings[0].Severity)
+	}
+	if !strings.Contains(preferEvidence(findings[0]), "NVD") {
+		t.Errorf("evidence = %q, want it naming NVD as the vendor that scored it", preferEvidence(findings[0]))
+	}
+}
+
 // A bundle finding relating to several CVEs takes the most severe of the
 // vendor's own scores among them -- fail towards severe within one vendor.
 func TestPreferVendorBundleTakesHighest(t *testing.T) {
