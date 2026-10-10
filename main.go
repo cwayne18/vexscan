@@ -21,6 +21,7 @@ import (
 	"github.com/cwayne18/vexscan/internal/cvss"
 	"github.com/cwayne18/vexscan/internal/distrofeed"
 	"github.com/cwayne18/vexscan/internal/distrofeed/debian"
+	"github.com/cwayne18/vexscan/internal/distrofeed/nvd"
 	"github.com/cwayne18/vexscan/internal/distrofeed/suse"
 	"github.com/cwayne18/vexscan/internal/elfgraph"
 	"github.com/cwayne18/vexscan/internal/envx"
@@ -104,7 +105,7 @@ func main() {
 		noPager     = flag.Bool("no-pager", false, "never page the output, even when stdout is a terminal")
 		distroFeeds = flag.Bool("distro-feeds", false, "also consult the opt-in distribution feeds (Debian today); SUSE's CSAF-VEX runs by default for SUSE images, pass --distro-feeds=false to consult none (network)")
 	)
-	flag.Var(&preferVendors, "prefer-vendor", "favour this vendor's own CVSS score over the OSV-derived one, e.g. 'suse'; repeatable for priority, can lower a rating (network)")
+	flag.Var(&preferVendors, "prefer-vendor", "favour this vendor's own CVSS score over the OSV-derived one: 'suse' or 'nvd'; repeatable for priority, can lower a rating (network; nvd is one request per CVE and is slow without NVD_API_KEY set)")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -654,8 +655,12 @@ func triageLoader(on bool) *triage.Loader {
 // document once and both the score pass and the verdict pass share it.
 //
 // A --prefer-vendor name for a vendor that publishes no score vexscan can read is
-// reported and dropped rather than silently ignored: today only SUSE does, so
+// reported and dropped rather than silently ignored: today SUSE and NVD do, so
 // `--prefer-vendor debian` says so instead of quietly changing nothing.
+//
+// NVD is not a feed provider the way SUSE and Debian are -- it names no package
+// not-affected, it only scores -- so it has no instance shared with the feeds
+// list below; it only ever appears in scorers.
 func distroSources(feedsOn, suseByDefault bool, prefer []string) ([]distrofeed.Provider, []distrofeed.Scorer) {
 	// One instance per vendor, shared between the two lists.
 	suseP := suse.New()
@@ -671,8 +676,10 @@ func distroSources(feedsOn, suseByDefault bool, prefer []string) ([]distrofeed.P
 		switch key {
 		case "suse":
 			scorers = append(scorers, suseP)
+		case "nvd":
+			scorers = append(scorers, nvd.New())
 		default:
-			fmt.Fprintf(os.Stderr, "warning: --prefer-vendor %q is not a vendor vexscan can score today (known: suse); ignoring it\n", name)
+			fmt.Fprintf(os.Stderr, "warning: --prefer-vendor %q is not a vendor vexscan can score today (known: suse, nvd); ignoring it\n", name)
 		}
 	}
 

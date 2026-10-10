@@ -241,9 +241,11 @@ underlying CVE without you naming the CVE.
 
 SUSE's CSAF carries a CVSS v3 or v4 base score and vector per CVE
 (`vulnerabilities[].scores[].cvss_v3` or `.cvss_v4`, v3 preferred when a CVE has
-both). It is the first — and today only — vendor vexscan can score; a name it
-does not recognise (`--prefer-vendor debian`, which publishes no score) is
-reported on stderr and ignored rather than silently doing nothing.
+both). `--prefer-vendor nvd` is the second vendor vexscan can score, reading
+the score directly from [NVD's own CVE
+API](https://nvd.nist.gov/developers/vulnerabilities) rather than from OSV (see
+below). A name neither recognises (`--prefer-vendor debian`, which publishes no
+score) is reported on stderr and ignored rather than silently doing nothing.
 
 Two properties are worth stating plainly, because this is the **one overlay that
 changes a finding's `severity` and `cvss`** where every other second opinion
@@ -270,3 +272,34 @@ A finding whose CVE the preferred vendor did not score keeps its OSV rating — 
 flag only ever *adds* a vendor's opinion where they have one, and never blanks a
 rating on its absence.
 
+#### NVD (`--prefer-vendor nvd`)
+
+SUSE's score comes from a document the project already reads, so scoring with it
+costs nothing OSV wasn't already going to make this tool fetch. NVD is different:
+it is not a vendor whose feed lives alongside the others, it is the source OSV's
+own CVSS is usually *derived from* in the first place — except when it is not.
+A CNA sometimes publishes no CVSS of its own (the Go security team's advisories at
+[pkg.go.dev/vuln](https://pkg.go.dev/vuln) never carry one), and NVD then fills
+the gap itself, through an Authorized Data Publisher such as CISA or its own
+analysts. That filled-in score exists only inside NVD's database; OSV does not
+mirror it, so the finding stays `UNKNOWN` everywhere this tool otherwise looks.
+`--prefer-vendor nvd` queries [NVD's CVE API](https://nvd.nist.gov/developers/vulnerabilities)
+directly to reach it.
+
+Unlike SUSE's CSAF, NVD's API has no bulk form for "these specific CVE ids" — it
+is **one HTTP request per CVE** — and NVD rate-limits requests without an API
+key to 5 per rolling 30 seconds (50 with one). A scan with many distinct CVEs and
+no key can take minutes; set `NVD_API_KEY` (or `VEXSCAN_NVD_API_KEY`) to a
+[free NVD API key](https://nvd.nist.gov/developers/request-an-api-key) to raise
+the limit tenfold. There is no `--prefer-vendor`-adjacent flag for the key itself,
+the same reasoning `--llm`'s own token has: a credential typed on a command line
+ends up readable in a process list and a shell history that an API key in the
+environment does not.
+
+A CVE can carry several ratings inside NVD itself — v3.0, v3.1 and v4.0 metrics,
+each with Primary and Secondary entries from different sources — and NVD does not
+always have a Primary one at all: CVE-2026-78660's only CVSS entry is a Secondary
+one from CISA's enrichment, not from the CNA. `--prefer-vendor nvd` picks whichever
+published vector has the **highest base score**, the same fail-towards-severe rule
+every other "more than one rating exists" case in this tool follows, rather than
+require a Primary entry that is not guaranteed to exist.
