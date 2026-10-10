@@ -149,21 +149,32 @@ func parseDocument(r io.Reader, url string) (*advisory, error) {
 	return adv, nil
 }
 
-// bestVector returns the CVSS v3 vector to use for a CVE from its scores array.
-// SUSE publishes a single rating per CVE across its products, so there is
-// normally one entry; should a document ever carry several, the highest base
-// score wins, the same fail-towards-severe rule the rest of this tool uses when
-// two sources rate one vulnerability differently.
+// bestVector returns the CVSS vector to use for a CVE from its scores array,
+// preferring v3.0/v3.1 and falling back to v4.0. SUSE publishes a single
+// rating per CVE across its products, so there is normally one entry; should a
+// document ever carry several, the highest base score wins, the same
+// fail-towards-severe rule the rest of this tool uses when two sources rate
+// one vulnerability differently.
+//
+// v3 is preferred over v4 when a score entry somehow carries both, only
+// because v3 is what every other vendor feed in this tool rates with; there is
+// no reason to think SUSE would ever publish a v4 score alongside a v3 one for
+// the same entry.
 func bestVector(scores []csaf.Score) string {
 	var best string
 	var bestScore float64 = -1
 	for _, s := range scores {
 		vec := strings.TrimSpace(s.CVSSV3.VectorString)
+		score := s.CVSSV3.BaseScore
 		if !strings.HasPrefix(vec, "CVSS:3.0/") && !strings.HasPrefix(vec, "CVSS:3.1/") {
-			continue
+			vec = strings.TrimSpace(s.CVSSV4.VectorString)
+			score = s.CVSSV4.BaseScore
+			if !strings.HasPrefix(vec, "CVSS:4.0/") {
+				continue
+			}
 		}
-		if s.CVSSV3.BaseScore > bestScore {
-			best, bestScore = vec, s.CVSSV3.BaseScore
+		if score > bestScore {
+			best, bestScore = vec, score
 		}
 	}
 	return best
