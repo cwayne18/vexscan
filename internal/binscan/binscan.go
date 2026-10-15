@@ -143,6 +143,21 @@ func (b Binary) ModuleVersion(module string) string {
 // NormalizeGoVersion turns a build-info Go version string ("go1.24.0", or
 // "go1.24.0 X:boringcrypto") into the numeric version OSV expects ("1.24.0").
 // It returns "" for development builds whose version is not a released tag.
+//
+// A toolchain built with a GOEXPERIMENT names it in the version, and there are
+// two spellings. runtime/debug writes it as a separate field ("go1.24.0
+// X:boringcrypto"), which Fields already drops. A toolchain that bakes the
+// experiment into its own tag writes it with a hyphen instead
+// ("go1.26.9-X:boringcrypto"), which is what the Rancher FIPS builds ship, and
+// that one has to be cut here. Left on, the ":" makes the version unparseable
+// as semver, so OSV cannot range-match it and answers with every advisory ever
+// filed against stdlib -- 1.26.9 then reports the CVEs it already contains the
+// fixes for, as undetermined, with the 1.27 branch named as the upgrade.
+//
+// Cutting at the hyphen is safe in the direction that matters. Upstream's own
+// prereleases carry no separator ("go1.26rc1"), so a hyphenated suffix is a
+// vendor annotation, and a toolchain tagged 1.26.9 is built from 1.26.9's
+// source whatever the vendor appended to it.
 func NormalizeGoVersion(v string) string {
 	fields := strings.Fields(v)
 	if len(fields) == 0 {
@@ -152,6 +167,7 @@ func NormalizeGoVersion(v string) string {
 	if !strings.HasPrefix(ver, "go") {
 		return "" // e.g. "devel ..." — no released stdlib version to match
 	}
+	ver, _, _ = strings.Cut(ver, "-")
 	return strings.TrimPrefix(ver, "go")
 }
 

@@ -70,6 +70,10 @@ func TestNormalizeGoVersion(t *testing.T) {
 		"go1.24.0":                "1.24.0",
 		"go1.21.5":                "1.21.5",
 		"go1.24.0 X:boringcrypto": "1.24.0",
+		// The hyphenated spelling a toolchain that bakes the experiment into
+		// its own tag reports, as the Rancher FIPS builds do.
+		"go1.26.9-X:boringcrypto": "1.26.9",
+		"go1.26.9-fips":           "1.26.9",
 		"devel go1.26-abc":        "",
 		"":                        "",
 	}
