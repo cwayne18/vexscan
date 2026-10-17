@@ -1,6 +1,7 @@
 package suse
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -68,15 +69,25 @@ func (p *Provider) fetchAll(ctx context.Context, cves []string) (map[string]*adv
 	return docs, nil
 }
 
-// fetchOne fetches and parses one CVE's document. A 404 returns (nil, nil): no
-// record is a decline, not a failure. A document fetched once in a scan is
-// cached, so the score pass and the verdict pass share a single download.
+// fetchOne fetches and parses one CVE's document. A 404, and an index that
+// does not list the CVE at all, both return (nil, nil): no record is a
+// decline, not a failure. A document fetched once in a scan is cached, so the
+// score pass and the verdict pass share a single download.
 func (p *Provider) fetchOne(ctx context.Context, cve string) (*advisory, error) {
 	key := strings.ToUpper(cve)
 	if c, ok := p.cached(key); ok {
 		return c.adv, nil
 	}
-	url := p.docURL(cve)
+	url, ok, err := p.docURL(ctx, cve)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		// The index is the feed's own statement of what it carries, so a CVE
+		// missing from it needs no request to decline.
+		p.store(key, nil)
+		return nil, nil
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -306,8 +317,122 @@ func onlyCVEs(ids []string) []string {
 
 func rpmverGreater(a, b string) bool { return rpmver.Compare(a, b) > 0 }
 
-func (p *Provider) docURL(cve string) string {
-	return p.base() + "/" + strings.ToLower(cve) + ".json"
+// indexFile is the feed's own listing of every document it carries, one
+// base-relative path per line.
+const indexFile = "index.txt"
+
+// docURL resolves a CVE to its document URL. ok is false when the feed's index
+// says there is no document for it, which is a decline rather than an error.
+//
+// The path is looked up rather than built because it is not derivable from the
+// CVE id. SUSE reorganised the feed into year directories on 2026-10-15, and
+// the year is the one the document was first published in, not the one in the
+// id: cve-1999-0003.json lives under 2023/, which is when SUSE began
+// publishing CSAF-VEX at all, and cve-2021-3711.json is there too. Deriving
+// the directory from the id would get every pre-2023 CVE wrong, along with any
+// CVE whose document SUSE first cut in a later year than its id.
+func (p *Provider) docURL(ctx context.Context, cve string) (string, bool, error) {
+	idx, err := p.index(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	if idx == nil {
+		// A feed with no index: a mirror, or an offline copy of the flat
+		// layout the real feed used before 2026-10-15. See index.
+		return p.base() + "/" + strings.ToLower(cve) + ".json", true, nil
+	}
+	rel, ok := idx[strings.ToUpper(cve)]
+	if !ok {
+		return "", false, nil
+	}
+	return p.base() + "/" + rel, true, nil
+}
+
+// index returns the feed's CVE-to-path map, fetched at most once per Provider.
+//
+// A nil map with a nil error means this feed publishes no index, and the
+// caller falls back to the flat layout. That fallback is for mirrors and
+// offline copies, and it is deliberately the only silent one: any other
+// failure is returned, because an index that could not be read must never read
+// as a feed with nothing in it. That is the shape of the outage this replaced
+// -- every document 404ing is indistinguishable, one CVE at a time, from a
+// vendor who simply has no record.
+func (p *Provider) index(ctx context.Context) (map[string]string, error) {
+	p.idxMu.Lock()
+	defer p.idxMu.Unlock()
+	if p.idxDone {
+		return p.idxPaths, nil
+	}
+	url := p.base() + "/" + indexFile
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := p.client().Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		p.idxDone = true
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch %s: %s", url, resp.Status)
+	}
+	paths, junk, err := parseIndex(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", url, err)
+	}
+	if len(paths) == 0 && junk > 0 {
+		// Nothing recognised, out of a body that had content: this is not an
+		// empty feed, it is an index in a shape this does not understand -- an
+		// error page served with a 200, most likely. Saying so beats declining
+		// every CVE in the scan without a word. A blank index is left alone,
+		// since a feed carrying nothing is a thing a mirror can legitimately
+		// be.
+		return nil, fmt.Errorf("parse %s: no document paths among %d line(s)", url, junk)
+	}
+	p.idxPaths, p.idxDone = paths, true
+	return paths, nil
+}
+
+// parseIndex reads the index into a map of uppercase CVE id to the document's
+// base-relative path. It also counts the non-blank lines that named no CVE
+// document, which is how the caller tells an index it cannot read from a feed
+// with nothing in it. Those lines are skipped rather than rejected, so a
+// header or a sibling file in the listing -- the feed carries a changes.csv --
+// costs nothing.
+func parseIndex(r io.Reader) (paths map[string]string, junk int, err error) {
+	paths = map[string]string{}
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		// A path that climbs out of the base, or is absolute, is not something
+		// the feed should be steering a fetch to.
+		if strings.Contains(line, "..") || strings.HasPrefix(line, "/") {
+			junk++
+			continue
+		}
+		name := line
+		if i := strings.LastIndex(name, "/"); i >= 0 {
+			name = name[i+1:]
+		}
+		name = strings.ToUpper(strings.TrimSuffix(name, ".json"))
+		if !cveRE.MatchString(name) {
+			junk++
+			continue
+		}
+		paths[name] = line
+	}
+	if err := sc.Err(); err != nil {
+		return nil, 0, err
+	}
+	return paths, junk, nil
 }
 
 func (p *Provider) base() string {

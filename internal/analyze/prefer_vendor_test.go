@@ -2,6 +2,7 @@ package analyze
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -74,6 +75,26 @@ func TestPreferVendorLowerScoreWins(t *testing.T) {
 	}
 	if !strings.Contains(detail, "SUSE") || !strings.Contains(detail, "HIGH") || !strings.Contains(detail, "CRITICAL") {
 		t.Errorf("evidence detail = %q, want it to name the vendor, the rating, and what it displaced", detail)
+	}
+}
+
+// The guarantee bought by a day of silence: a pass that scored nothing says
+// so. When SUSE reorganised its feed every document 404ed, and a 404 is a
+// legitimate "no record" one CVE at a time, so the scan downgraded every
+// finding to its OSV rating without a word. The ratings are left alone -- that
+// part is correct -- but the reader has to be told it happened.
+func TestPreferVendorSaysWhenNothingScored(t *testing.T) {
+	findings := []Finding{sevFinding("CVE-2023-0464", "CRITICAL", vectorCritical)}
+
+	var log strings.Builder
+	logf := func(format string, args ...any) { fmt.Fprintf(&log, format+"\n", args...) }
+	preferVendorScores(context.Background(), []distrofeed.Scorer{suseScorer(nil)}, findings, nil, logf)
+
+	if !strings.Contains(log.String(), "no preferred vendor scored") {
+		t.Fatalf("a pass that rated nothing must say so; log was:\n%s", log.String())
+	}
+	if findings[0].Severity != "CRITICAL" {
+		t.Errorf("severity = %q, want the OSV rating left untouched", findings[0].Severity)
 	}
 }
 

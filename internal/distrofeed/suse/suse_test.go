@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -55,15 +56,64 @@ const csafFixture = `{
   ]
 }`
 
-// serve maps /cve-xxxx-yyyy.json to a body, and counts hits so a test can assert
-// only the CVEs it asked about were fetched.
+// serveDir is the directory the test feed files its documents under. It is
+// deliberately not any fixture CVE's own year: the real feed keys the
+// directory on when SUSE first published the document, so cve-2023-0464.json
+// living under 2099/ is what proves the path is read from the index rather
+// than guessed from the id.
+const serveDir = "2099"
+
+// serve publishes docs under serveDir, along with the index.txt the real feed
+// carries, so every test exercises the indexed lookup. Document fetches are
+// counted so a test can assert only the CVEs it asked about were fetched; the
+// one index request is not, since it is not a per-CVE cost.
 func serve(t *testing.T, docs map[string]string, hits *int32) string {
 	t.Helper()
+	paths := make(map[string]string, len(docs))
+	index := make([]string, 0, len(docs))
+	for name, body := range docs {
+		rel := serveDir + "/" + name
+		paths[rel] = body
+		index = append(index, rel)
+	}
+	sort.Strings(index)
+	listing := strings.Join(index, "\n") + "\n"
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/")
+		if name == indexFile {
+			w.Write([]byte(listing))
+			return
+		}
 		if hits != nil {
 			atomic.AddInt32(hits, 1)
 		}
+		body, ok := paths[name]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// serveFlat publishes docs at the flat top-level layout the feed used before
+// 2026-10-15, with no index at all: a mirror, or an offline copy. The index
+// request 404s, which is how the provider knows to fall back; it is not
+// counted, for the same reason it is not counted in serve.
+func serveFlat(t *testing.T, docs map[string]string, hits *int32) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		name := strings.TrimPrefix(r.URL.Path, "/")
+		if name == indexFile {
+			http.NotFound(w, r)
+			return
+		}
+		if hits != nil {
+			atomic.AddInt32(hits, 1)
+		}
 		body, ok := docs[name]
 		if !ok {
 			http.NotFound(w, r)
@@ -266,6 +316,112 @@ func TestScoresIgnoresNonCVEAndUnscored(t *testing.T) {
 	}
 }
 
+// The regression this file exists to pin. SUSE moved every document into a
+// directory named for the year it first published the document -- not the year
+// in the CVE id -- so a path built from the id 404s. A 404 is a legitimate "no
+// record", so the whole feed went quiet without a single error, and
+// --prefer-vendor suse silently stopped rating anything.
+//
+// serve files the 2023 fixture under 2099/, so this passes only if the path
+// came out of the index.
+func TestDocumentPathComesFromIndex(t *testing.T) {
+	p := &Provider{BaseURL: serve(t, map[string]string{"cve-2023-0464.json": scoredCSAF}, nil)}
+	got, err := p.Scores(context.Background(), []string{"CVE-2023-0464"})
+	if err != nil {
+		t.Fatalf("Scores: %v", err)
+	}
+	if got["CVE-2023-0464"] == "" {
+		t.Fatal("no score: the document path was not read from the index")
+	}
+}
+
+// The index is fetched once however many CVEs are asked about, and a CVE the
+// index does not list costs no request at all.
+func TestIndexFetchedOnceAndUnlistedCVECostsNoRequest(t *testing.T) {
+	var hits int32
+	p := &Provider{BaseURL: serve(t, docs(), &hits)}
+	_, err := p.Scores(context.Background(), []string{"CVE-2023-0464", "CVE-2099-9999", "CVE-2099-9998"})
+	if err != nil {
+		t.Fatalf("Scores: %v", err)
+	}
+	if hits != 1 {
+		t.Errorf("fetched %d documents, want 1 (only the listed CVE; the index is not a document fetch)", hits)
+	}
+}
+
+// A feed with no index is a mirror or an offline copy of the pre-2026-10-15
+// flat layout, and still works.
+func TestFlatFeedWithoutIndexStillWorks(t *testing.T) {
+	p := &Provider{BaseURL: serveFlat(t, map[string]string{"cve-2023-0464.json": scoredCSAF}, nil)}
+	got, err := p.Scores(context.Background(), []string{"CVE-2023-0464"})
+	if err != nil {
+		t.Fatalf("Scores: %v", err)
+	}
+	if got["CVE-2023-0464"] == "" {
+		t.Fatal("a feed with no index should fall back to the flat layout")
+	}
+}
+
+// An index that cannot be read is an error, never an empty feed. This is the
+// distinction the outage turned on: declining every CVE in the scan without a
+// word is the one answer that must not be possible.
+func TestUnreadableIndexIsAnError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		code int
+		body string
+	}{
+		{"server error", http.StatusInternalServerError, "nope"},
+		{"unparseable", http.StatusOK, "<html>not an index</html>"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, indexFile) {
+					w.WriteHeader(tc.code)
+					w.Write([]byte(tc.body))
+					return
+				}
+				http.NotFound(w, r)
+			}))
+			t.Cleanup(srv.Close)
+			if _, err := (&Provider{BaseURL: srv.URL}).Scores(context.Background(), []string{"CVE-2023-0464"}); err == nil {
+				t.Fatal("an unreadable index must be an error, not a feed with nothing in it")
+			}
+		})
+	}
+}
+
+func TestParseIndex(t *testing.T) {
+	in := strings.Join([]string{
+		"2023/cve-1999-0003.json",
+		"2024/cve-2024-5535.json",
+		"",
+		"changes.csv",            // a sibling file, not a document
+		"../escape/cve-1-1.json", // must never steer a fetch out of the base
+		"/abs/cve-2023-1.json",
+		"2026/not-a-cve.json",
+	}, "\n")
+	got, junk, err := parseIndex(strings.NewReader(in))
+	if err != nil {
+		t.Fatalf("parseIndex: %v", err)
+	}
+	if junk != 4 {
+		t.Errorf("junk = %d, want 4 (the sibling file, the two unsafe paths and the non-CVE)", junk)
+	}
+	want := map[string]string{
+		"CVE-1999-0003": "2023/cve-1999-0003.json",
+		"CVE-2024-5535": "2024/cve-2024-5535.json",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("parsed %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("got[%q] = %q, want %q", k, got[k], v)
+		}
+	}
+}
+
 // bestVector takes the highest base score and ignores anything that is not a
 // CVSS v3 vector, matching how the rest of the tool rates a vulnerability.
 func TestBestVector(t *testing.T) {
@@ -305,16 +461,30 @@ func TestDocumentIsCached(t *testing.T) {
 	}
 }
 
-// A 404 is cached too: a CVE SUSE has no record for is not re-requested on a
-// second pass.
-func TestMissingDocumentIsCached(t *testing.T) {
+// On a flat feed a 404 is still the only way to learn there is no record, and
+// it is cached: a CVE SUSE has no document for is not re-requested on a second
+// pass.
+func TestMissingDocumentIsCachedOnFlatFeed(t *testing.T) {
 	var hits int32
-	p := &Provider{BaseURL: serve(t, map[string]string{}, &hits)}
+	p := &Provider{BaseURL: serveFlat(t, map[string]string{}, &hits)}
 	q := pkgQuery(bookwormCPE(), "bash", "5.2-1", "CVE-2099-9999")
 	lookup(t, p, q)
 	lookup(t, p, q)
 	if hits != 1 {
 		t.Errorf("fetched %d times, want 1 (a cached 404 should not be re-requested)", hits)
+	}
+}
+
+// On an indexed feed the same CVE costs no request at all, on either pass: the
+// index already said the feed does not carry it.
+func TestMissingDocumentCostsNoRequestWhenIndexed(t *testing.T) {
+	var hits int32
+	p := &Provider{BaseURL: serve(t, docs(), &hits)}
+	q := pkgQuery(bookwormCPE(), "bash", "5.2-1", "CVE-2099-9999")
+	lookup(t, p, q)
+	lookup(t, p, q)
+	if hits != 0 {
+		t.Errorf("fetched %d times, want 0 (the index already declined it)", hits)
 	}
 }
 
