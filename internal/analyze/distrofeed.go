@@ -289,9 +289,18 @@ func preferVendorScores(ctx context.Context, scorers []distrofeed.Scorer, findin
 			break
 		}
 	}
+	// A flag that changed nothing says so. Silence here reads as "the vendor
+	// had nothing to add", and that is indistinguishable from the vendor's
+	// feed having moved out from under us -- which is exactly what happened
+	// when SUSE reorganised its CSAF-VEX paths and every document 404ed, each
+	// 404 a legitimate "no record" on its own. One line turns a scan-wide
+	// silent downgrade into something a reader can see.
 	if overridden > 0 {
 		logf("prefer-vendor: %d finding(s) rated from a preferred vendor's own CVSS score", overridden)
+		return
 	}
+	logf("prefer-vendor: no preferred vendor scored any of the %d CVE(s) asked about", len(query))
+	logf("  (every finding keeps its OSV-derived rating)")
 }
 
 // bestVendorVector returns the vendor's CVSS vector and label for a finding,

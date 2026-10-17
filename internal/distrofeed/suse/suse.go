@@ -39,10 +39,10 @@ import (
 	"github.com/cwayne18/vexscan/internal/rpmver"
 )
 
-// DefaultBaseURL is the directory of per-CVE CSAF-VEX documents. A document is
-// DefaultBaseURL + "/cve-YYYY-NNNN.json". Point BaseURL at a mirror or an
-// offline copy to reroute the whole feed, the same escape hatch the other
-// providers offer.
+// DefaultBaseURL is the root of the CSAF-VEX feed. A document's path below it
+// is read from the feed's own index (see indexFile); it is not derivable from
+// the CVE id. Point BaseURL at a mirror or an offline copy to reroute the whole
+// feed, the same escape hatch the other providers offer.
 const DefaultBaseURL = "https://ftp.suse.com/pub/projects/security/csaf-vex"
 
 // author is recorded on every statement this provider emits.
@@ -67,6 +67,17 @@ type Provider struct {
 	// transient error is not, so it can be retried on the next pass.
 	mu   sync.Mutex
 	docs map[string]cachedDoc
+
+	// idxMu guards the feed index, fetched at most once per Provider. It is
+	// separate from mu so the one index download does not block the document
+	// cache, and it is a mutex rather than a sync.Once because a failed fetch
+	// must stay retryable: caching "the index could not be read" for the rest
+	// of the run would turn one dropped connection into a scan-wide silence.
+	// idxDone distinguishes a loaded index from one never fetched, so a feed
+	// that legitimately has none (idxPaths nil) is not re-requested per CVE.
+	idxMu    sync.Mutex
+	idxDone  bool
+	idxPaths map[string]string
 }
 
 // cachedDoc is one memoised fetch. adv is nil for a 404 (SUSE has no record),
