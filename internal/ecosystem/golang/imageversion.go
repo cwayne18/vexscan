@@ -42,6 +42,53 @@ func isDevelVersion(v string) bool {
 // anchor keeps it from touching an ordinary semver prerelease like "-rc1".
 var dockerK3sSuffix = regexp.MustCompile(`-(k3s\d+|rke2r?\d+)$`)
 
+// dockerRelSuffix matches a distro packaging release on the end of a *Docker*
+// tag. SUSE ships KubeVirt 1.8.4 as "1.8.4-11.14": 1.8.4 is the upstream
+// version the binary was built from and 11.14 is SUSE's package release, the
+// same two-part spelling an RPM uses.
+//
+// Semver reads that suffix as a *prerelease*, and a prerelease sorts BELOW the
+// release it hangs off: "v1.8.4-11.14" < "v1.8.4". So an advisory fixed in the
+// very version the tag names still matches a build that already contains the
+// fix. Rewriting the suffix as build metadata is what the k3s/rke2 rule above
+// already does for the same reason, and semver ignores build metadata in
+// precedence, so "v1.8.4+11.14" compares equal to the version the tag names.
+//
+// Measured against api.osv.dev at real fix boundaries, asking the same question
+// three ways -- the extra rows are advisories already fixed at that version:
+//
+//	kubevirt.io/kubevirt @ 1.6.1   v1.6.1 13   v1.6.1-11.14 22   v1.6.1+11.14 13
+//	kubevirt.io/kubevirt @ 1.5.3   v1.5.3 15   v1.5.3-11.14 23   v1.5.3+11.14 15
+//	github.com/k3s-io/k3s @ 1.33.10  v.. 2     v..-11.14     3   v..+11.14     2
+//
+// Note what this does *not* fix. The image that exposed it,
+// virt-operator:1.8.4-11.14, reports five kubevirt.io/kubevirt findings, and
+// the rewrite clears none of them: 1.8.4 sits above every published kubevirt
+// fix, and those five advisories carry no fixed version at all, so no ordering
+// could separate them. The bug is real and this corrects it; that image is
+// simply not where it bites.
+//
+// Note the direction. This reads *up*, from below-1.8.4 to equal-1.8.4, and up
+// is the direction that can hide a real finding -- so it is the one rule here
+// that is not purely conservative, and it is fenced on both sides.
+//
+// Letters are excluded, which keeps it off every ordinary prerelease: "-rc1",
+// "-beta.2" and "-build20260724" are all left exactly as they are.
+//
+// A dot inside the suffix is *required*, which is the fence that matters. The
+// genuinely ambiguous spelling is a bare number: "v1.2.3-1" is a packaging
+// release in Debian's hands and a first prerelease in someone else's, and
+// nothing in the tag says which. Demanding the two-part "RELEASE.BUILD" shape
+// an RPM actually uses -- "11.14" -- takes the case that is unambiguous and
+// leaves the coin-flip alone. A bare "-1" therefore keeps sorting below the
+// release: over-reporting, the safe direction, and the same answer this code
+// gave before the rule existed.
+//
+// Then tagAuthority has already established that the tag states *this module's*
+// version before any of this runs, so the blast radius is a project's own
+// images rather than every image with a Go binary in it.
+var dockerRelSuffix = regexp.MustCompile(`-(\d+(?:\.\d+)+)$`)
+
 // imageTag returns the tag portion of an image reference, or "" if it carries
 // none. A digest ("@sha256:...") is stripped first, and the registry host and
 // port are skipped by isolating the final path component before splitting on
@@ -186,13 +233,22 @@ func normalizeSemver(s string) (string, bool) {
 // or reports that it is not one.
 //
 // "latest", a bare digest, an empty tag and a date-stamp all yield ok=false and
-// no guess. The k3s/rke2 suffix is converted back to its '+' form so it matches
-// the versions those advisories are actually filed under.
+// no guess. Two suffixes are converted back to the '+' form before the version
+// is read: the k3s/rke2 build marker, so it matches the versions those
+// advisories are filed under, and a distro packaging release, so it stops
+// sorting as a prerelease below the upstream version it is appended to. See
+// dockerK3sSuffix and dockerRelSuffix.
+//
+// The k3s rewrite runs first and the two cannot both fire: "+k3s1" leaves no
+// trailing "-digits" for the second to match, and a packaging release carries
+// no letters for the first.
 func normalizeTagVersion(tag string) (string, bool) {
 	if tag == "" || tag == "latest" {
 		return "", false
 	}
-	return normalizeSemver(dockerK3sSuffix.ReplaceAllString(tag, "+$1"))
+	v := dockerK3sSuffix.ReplaceAllString(tag, "+$1")
+	v = dockerRelSuffix.ReplaceAllString(v, "+$1")
+	return normalizeSemver(v)
 }
 
 // moduleVersionFromImageTag derives a comparable Go module version for
