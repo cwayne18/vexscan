@@ -86,6 +86,108 @@ func TestModuleVersionFromImageTag(t *testing.T) {
 	}
 }
 
+func TestNormalizeTagVersion(t *testing.T) {
+	tests := []struct {
+		tag, want string
+		ok        bool
+	}{
+		// A distro packaging release becomes build metadata, so it stops
+		// sorting as a prerelease below the upstream version it names.
+		{"1.8.4-11.14", "v1.8.4+11.14", true},
+		{"v1.8.4-11.14", "v1.8.4+11.14", true},
+		{"1.8.4-11.14.2", "v1.8.4+11.14.2", true},
+		// A bare number is deliberately NOT rewritten. "-1" is a packaging
+		// release to one project and a first prerelease to another, and the tag
+		// does not say which; left alone it keeps sorting below the release,
+		// which over-reports rather than hiding a finding.
+		{"1.8.4-3", "v1.8.4-3", true},
+		{"v1.2.3-1", "v1.2.3-1", true},
+		// k3s/rke2 keep their own rewrite, which runs first.
+		{"v1.36.3-k3s1", "v1.36.3+k3s1", true},
+		{"v1.31.5-rke2r1", "v1.31.5+rke2r1", true},
+		// Real prereleases carry letters and are left exactly as they are.
+		// Reading one of these as the release would be the under-report
+		// direction, which is the whole hazard of the packaging-release rule.
+		{"v1.2.3-rc1", "v1.2.3-rc1", true},
+		{"v1.2.3-beta.2", "v1.2.3-beta.2", true},
+		{"v1.34.10-rke2r1-build20260724", "v1.34.10-rke2r1-build20260724", true},
+		// A packaging release hung off something that is not a full
+		// MAJOR.MINOR.PATCH core is still not a version. bci-micro's
+		// "16.0-22.17" is the case to keep refusing.
+		{"16.0-22.17", "", false},
+		{"1.0-1", "", false},
+		// Refusals the rule must not have disturbed.
+		{"", "", false},
+		{"latest", "", false},
+		{"20240101", "", false},
+	}
+	for _, tt := range tests {
+		got, ok := normalizeTagVersion(tt.tag)
+		if got != tt.want || ok != tt.ok {
+			t.Errorf("normalizeTagVersion(%q) = (%q, %v), want (%q, %v)",
+				tt.tag, got, ok, tt.want, tt.ok)
+		}
+	}
+}
+
+// The fence on dockerRelSuffix, stated as its consequence rather than its
+// spelling. A bare numeric suffix is ambiguous -- a packaging release to one
+// project, a first prerelease to another -- so it is left alone and keeps
+// sorting below the release. That over-reports, which is the direction this
+// tool is allowed to be wrong in.
+func TestBareNumericSuffixStaysConservative(t *testing.T) {
+	got, ok := normalizeTagVersion("1.2.3-1")
+	if !ok || got != "v1.2.3-1" {
+		t.Fatalf(`normalizeTagVersion("1.2.3-1") = (%q, %v), want ("v1.2.3-1", true)`, got, ok)
+	}
+	if c := semver.Compare(got, "v1.2.3"); c >= 0 {
+		t.Errorf("semver.Compare(%q, v1.2.3) = %d, want < 0: an ambiguous suffix must not read up", got, c)
+	}
+}
+
+// The SUSE KubeVirt case, end to end on the reference that produced it.
+//
+// The image's entrypoint is /usr/bin/virt-operator, so tagAuthority accepts the
+// tag outright; the only question left is how to read it. "1.8.4-11.14" is
+// upstream KubeVirt 1.8.4 with SUSE's package release 11.14, and reading that
+// release as a semver prerelease placed the module *below* v1.8.4, where an
+// advisory fixed in 1.8.4 still matches. The binary's own -ldflags agree with
+// the upstream reading: gitVersion=v1.8.4.
+//
+// The ordering is asserted rather than the finding count, because on this
+// particular image the rewrite clears nothing -- 1.8.4 is above every published
+// kubevirt fix. The advisories it does suppress sit at a fix boundary, which
+// 1.8.4 is not; see dockerRelSuffix for the measurements.
+func TestDistroPackagingReleaseDoesNotSortBelowTheRelease(t *testing.T) {
+	const (
+		mod = "kubevirt.io/kubevirt"
+		ref = "registry.suse.com/suse/sles/16.0/virt-operator:1.8.4-11.14"
+	)
+	// Guard the fixture before asserting the fix: if the old spelling ever
+	// stops sorting below v1.8.4, this test is no longer reproducing the bug
+	// and its passing would mean nothing.
+	if semver.Compare("v1.8.4-11.14", "v1.8.4") >= 0 {
+		t.Fatal("fixture no longer reproduces the bug: v1.8.4-11.14 must sort below v1.8.4")
+	}
+
+	got, tag, why := moduleVersionFromImageTag(mod, ref, true)
+	if tag != "1.8.4-11.14" {
+		t.Fatalf("tag = %q, want 1.8.4-11.14", tag)
+	}
+	if why == "" {
+		t.Fatal("no authority recorded, but the image's own command runs this binary")
+	}
+	if got != "v1.8.4+11.14" {
+		t.Fatalf("version = %q, want v1.8.4+11.14", got)
+	}
+	// The spelling is incidental; the ordering is the fix. Build metadata is
+	// ignored in precedence, so the tag now compares equal to the upstream
+	// version it names and an advisory fixed in 1.8.4 no longer matches.
+	if c := semver.Compare(got, "v1.8.4"); c != 0 {
+		t.Errorf("semver.Compare(%q, v1.8.4) = %d, want 0", got, c)
+	}
+}
+
 // The k3s and rke2 references this fallback was written for, spelled the ways
 // they actually appear -- upstream, mirrored, retagged, and with a registry
 // port in the way. The build suffix is the authority in every one of them, so
