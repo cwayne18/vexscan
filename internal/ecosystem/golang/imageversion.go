@@ -190,7 +190,9 @@ func tagAuthority(modulePath, ref, version string, runsModule bool) string {
 	if strings.EqualFold(repo, name) {
 		return fmt.Sprintf("the image is named after the module (%s)", name)
 	}
-	for _, tok := range strings.Split(repo, "-") {
+	// SplitSeq rather than Split: the loop returns on the first match, so
+	// materializing the whole slice allocates for tokens that are never read.
+	for tok := range strings.SplitSeq(repo, "-") {
 		if strings.EqualFold(tok, name) {
 			return fmt.Sprintf("the image name contains the module name (%s)", name)
 		}
