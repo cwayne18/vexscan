@@ -1172,7 +1172,7 @@ func runTree(ctx context.Context, opts Options) (*Result, error) {
 	// found a caller is a fact about the closure and not about the flags.
 	recordInertAssertions(result, plugins)
 	result.Triage = triageOverlay(ctx, opts.Triage, result.Findings, sets.All, logf)
-	llmOverlay(ctx, llmClient, result.Findings, "", logf)
+	llmOverlay(ctx, llmClient, result.Findings, "", run.resolver.prose(), logf)
 	sortFindings(result.Findings)
 	result.Corrections = run.resolver.corrections()
 	result.Descriptor = run.resolver.descriptor()
@@ -1505,7 +1505,7 @@ func runRepo(ctx context.Context, opts Options) (*Result, error) {
 	result.Findings, result.WithheldUnfixed = fixedOnlyFilter(result.Findings, opts.FixedOnly)
 	result.VEXHubs = vexOverlay(ctx, opts.VEXHubs, result.Findings, run.resolver.aliases(), logf)
 	result.Triage = triageOverlay(ctx, opts.Triage, result.Findings, sets.All, logf)
-	llmOverlay(ctx, llmClient, result.Findings, "source tree", logf)
+	llmOverlay(ctx, llmClient, result.Findings, "source tree", run.resolver.prose(), logf)
 	sortFindings(result.Findings)
 	result.Corrections = run.resolver.corrections()
 	result.Descriptor = run.resolver.descriptor()
@@ -1825,6 +1825,55 @@ func (r *advisoryResolver) severities() map[string]severity {
 					continue
 				}
 				out[key] = s
+			}
+		}
+	}
+	return out
+}
+
+// advisoryProse is the advisory text an exploitability assessment needs, and
+// which a Finding does not carry: the report has never had a use for the prose,
+// so it was dropped after the deterministic tests read it.
+type advisoryProse struct {
+	summary string
+	details string
+}
+
+// prose flattens the advisory text the resolver fetched into a lookup from
+// advisory id to its summary and details.
+//
+// This exists because llmOverlay works from Findings, which record what and
+// where a finding is but not what the advisory says. Without it the LLM
+// assessment was sent a bare identifier -- see llm.Request.Summary.
+//
+// Keyed by id and every alias, exactly as severities() is, so the overlay can
+// join on whichever name the finding ended up carrying (CVE, ID or GoID).
+//
+// Like severities() this costs no network traffic: the prose was in the records
+// already fetched to decide the findings existed.
+func (r *advisoryResolver) prose() map[string]advisoryProse {
+	out := map[string]advisoryProse{}
+	for _, set := range r.cache {
+		for _, adv := range set {
+			if adv == nil {
+				continue
+			}
+			p := advisoryProse{summary: adv.Summary, details: adv.Details}
+			if p.summary == "" && p.details == "" {
+				continue
+			}
+			for _, key := range append([]string{adv.ID}, adv.Aliases...) {
+				if key == "" {
+					continue
+				}
+				// A key can arrive from more than one component's query. Keep
+				// the fuller text rather than letting map iteration order
+				// decide, so a repeated scan sends the model the same evidence
+				// and cannot produce two different verdicts for one advisory.
+				if prev, ok := out[key]; ok && len(prev.summary)+len(prev.details) >= len(p.summary)+len(p.details) {
+					continue
+				}
+				out[key] = p
 			}
 		}
 	}
@@ -2161,7 +2210,7 @@ func newLLM(opts Options) (*llm.Client, error) {
 // own, because repo mode assesses a source tree rather than an artifact.
 // A failed assessment is logged and skipped: losing an advisory opinion must
 // never lose the deterministic finding underneath it.
-func llmOverlay(ctx context.Context, client *llm.Client, findings []Finding, location string, logf func(string, ...any)) {
+func llmOverlay(ctx context.Context, client *llm.Client, findings []Finding, location string, prose map[string]advisoryProse, logf func(string, ...any)) {
 	if client == nil {
 		return
 	}
@@ -2174,6 +2223,12 @@ func llmOverlay(ctx context.Context, client *llm.Client, findings []Finding, loc
 		if binary == "" {
 			binary = location
 		}
+		// Joined on the same three names severityOverlay uses, because a
+		// finding is named by whichever of them the advisory supplied. A miss
+		// is normal rather than an error -- some records carry no prose -- and
+		// the empty text is passed through so the user message can say so
+		// outright instead of leaving a gap the model fills from memory.
+		p := proseFor(prose, f)
 		v, err := client.Assess(ctx, llm.Request{
 			Ecosystem: f.Ecosystem,
 			CVE:       f.CVE,
@@ -2182,6 +2237,8 @@ func llmOverlay(ctx context.Context, client *llm.Client, findings []Finding, loc
 			Packages:  f.Packages,
 			Binary:    binary,
 			Reachable: f.Reachability,
+			Summary:   p.summary,
+			Details:   p.details,
 		})
 		if err != nil {
 			logf("  ! LLM assess failed for %s: %v", f.CVE, err)
@@ -2189,6 +2246,20 @@ func llmOverlay(ctx context.Context, client *llm.Client, findings []Finding, loc
 		}
 		f.LLM = v
 	}
+}
+
+// proseFor looks a finding's advisory text up under each name it might carry,
+// returning the zero value when the record published none.
+func proseFor(prose map[string]advisoryProse, f *Finding) advisoryProse {
+	for _, key := range []string{f.CVE, f.ID, f.GoID} {
+		if key == "" {
+			continue
+		}
+		if p, ok := prose[key]; ok {
+			return p
+		}
+	}
+	return advisoryProse{}
 }
 
 // guardCleanStatuses runs Finding.Validate over every finding, enforcing the

@@ -10,6 +10,88 @@ import (
 	"time"
 )
 
+// Every ecosystem's user message has to carry the advisory text. The Go branch
+// is the one that produced the reported bug, but a model asked about an OS
+// package it has never heard of is in exactly the same position.
+func TestUserMessageCarriesTheAdvisoryText(t *testing.T) {
+	// "" is Go, per promptFor: a caller that forgets the field gets the old
+	// behaviour, and the old behaviour must carry evidence too.
+	for _, eco := range []string{"golang", "os", "pypi", "npm", "maven", ""} {
+		got := userMessage(Request{
+			Ecosystem: eco,
+			CVE:       "CVE-2026-78661",
+			Module:    "golang.org/x/net",
+			Version:   "v0.60.0",
+			Binary:    "/usr/local/bin/kube-controller-manager",
+			Reachable: "linked",
+			Summary:   "Unbounded recursion in html.Parse",
+			Details:   "A deeply nested document causes stack exhaustion.",
+		})
+		for _, want := range []string{
+			"Advisory text:",
+			"Unbounded recursion in html.Parse",
+			"A deeply nested document causes stack exhaustion.",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("ecosystem %q is missing %q:\n%s", eco, want, got)
+			}
+		}
+		// The instruction stays last. A model handed the question before the
+		// evidence answers from whatever it had when it read the question.
+		if !strings.HasSuffix(got, "Assess exploitability.") {
+			t.Errorf("ecosystem %q: the instruction must come last:\n%s", eco, got)
+		}
+	}
+}
+
+// An advisory with no prose must say so. Silence here is what let a model
+// treat a missing advisory as one it was expected to recall.
+func TestUserMessageStatesAMissingAdvisory(t *testing.T) {
+	got := userMessage(Request{Ecosystem: "golang", CVE: "CVE-1", Module: "m"})
+	if !strings.Contains(got, "No advisory text is available") {
+		t.Errorf("a prose-less advisory must be stated outright:\n%s", got)
+	}
+	if strings.Contains(got, "Advisory text:") {
+		t.Errorf("there is no text, so the heading must not appear:\n%s", got)
+	}
+}
+
+func TestAdvisoryBlock(t *testing.T) {
+	// Either half alone is enough, and the blank line between them must not
+	// survive as leading or trailing whitespace when one is empty.
+	if got := advisoryBlock("just a summary", ""); got != "Advisory text:\njust a summary" {
+		t.Errorf("summary only = %q", got)
+	}
+	if got := advisoryBlock("", "just details"); got != "Advisory text:\njust details" {
+		t.Errorf("details only = %q", got)
+	}
+	if got := advisoryBlock("  ", "\n\t"); !strings.Contains(got, "No advisory text") {
+		t.Errorf("whitespace is not text, got %q", got)
+	}
+
+	// Truncation is marked, so a model reading a sentence that stops mid-word
+	// can tell that is what happened rather than treating it as the whole
+	// advisory.
+	long := advisoryBlock("s", strings.Repeat("x", maxAdvisoryText*2))
+	if !strings.Contains(long, "[advisory text truncated]") {
+		t.Error("an over-long advisory must be marked as truncated")
+	}
+	if len(long) > maxAdvisoryText+100 {
+		t.Errorf("truncated block is %d bytes, want ~%d", len(long), maxAdvisoryText)
+	}
+}
+
+// The evidence rule is what makes the added text authoritative rather than
+// just more context beside a half-remembered identifier, so no ecosystem may
+// be left out of it.
+func TestEveryPromptCarriesTheEvidenceRule(t *testing.T) {
+	for _, eco := range []string{"golang", "os", "pypi", "npm", "maven", ""} {
+		if !strings.Contains(promptFor(eco), evidenceRule) {
+			t.Errorf("ecosystem %q has no evidence rule in its system prompt", eco)
+		}
+	}
+}
+
 func testClient(endpoint string) *Client {
 	return NewClientWithTransport(&HTTPTransport{
 		HTTP:     &http.Client{Timeout: 5 * time.Second},
@@ -154,12 +236,28 @@ func TestGoPromptIsUnreachableFromAnotherEcosystem(t *testing.T) {
 		t.Error("the OS prompt does not say what it is looking at")
 	}
 
+	// Pinned in full, because the Go wording is the one every historical
+	// verdict was produced against. The advisory line is the one deliberate
+	// addition: it arrived with Request.Summary/Details, which exist because
+	// this message used to name a CVE and then say nothing about it. Here the
+	// request carries no prose, so the line states that rather than omitting
+	// itself -- see advisoryBlock.
 	r := Request{CVE: "CVE-1", Module: "golang.org/x/net", Version: "v0.7.0",
 		Packages: []string{"http2"}, Binary: "/app", Reachable: "linked"}
 	want := "CVE: CVE-1\nModule: golang.org/x/net@v0.7.0\nVulnerable packages: http2\n" +
-		"Binary: /app\nStatic analysis says the vulnerable code is: linked\nAssess exploitability."
+		"Binary: /app\nStatic analysis says the vulnerable code is: linked\n" +
+		"No advisory text is available for this identifier.\nAssess exploitability."
 	if got := userMessage(r); got != want {
 		t.Errorf("the Go user message changed:\ngot  %q\nwant %q", got, want)
+	}
+
+	// And with prose, the evidence lands between the facts and the question.
+	r.Summary = "Unbounded recursion in html.Parse"
+	withText := "CVE: CVE-1\nModule: golang.org/x/net@v0.7.0\nVulnerable packages: http2\n" +
+		"Binary: /app\nStatic analysis says the vulnerable code is: linked\n" +
+		"Advisory text:\nUnbounded recursion in html.Parse\nAssess exploitability."
+	if got := userMessage(r); got != withText {
+		t.Errorf("the Go user message with advisory text changed:\ngot  %q\nwant %q", got, withText)
 	}
 }
 

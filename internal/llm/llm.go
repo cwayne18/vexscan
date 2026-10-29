@@ -74,6 +74,25 @@ type Request struct {
 	Packages  []string
 	Binary    string
 	Reachable string // "linked" | "reachable" | "unknown"
+
+	// Summary and Details are the advisory prose, verbatim from OSV, exactly
+	// as MineRequest carries it.
+	//
+	// Without them this asks a model to rate the exploitability of a bare
+	// identifier. An advisory published after the model's training cutoff is
+	// one it has simply never seen, and nothing here fetches URLs, so the only
+	// honest answer available to it was a hedge -- "I can't verify the details
+	// of CVE-2026-78661, so confidence is low" -- on a finding whose advisory
+	// text vexscan was holding the whole time. Worse than the hedge is the
+	// alternative: a model with no evidence fills the gap from training priors,
+	// which is how an assessment of a finding in kube-controller-manager came
+	// back reasoning about kube-apiserver.
+	//
+	// Both may be empty. Some records carry no prose at all, and the user
+	// message says so outright rather than leaving a blank where evidence
+	// should be -- see advisoryBlock.
+	Summary string
+	Details string
 }
 
 // Config says which model to ask and how to reach it.
@@ -231,15 +250,38 @@ func minIntervalFromEnv() time.Duration {
 	return DefaultMinInterval
 }
 
-// goPrompt is the original prompt, kept verbatim. Changing a word of it would
-// move every Go verdict the tool has ever produced, so new ecosystems get new
-// prompts rather than a shared one that has been generalized into vagueness.
+// goPrompt was the original prompt and was kept verbatim for a long time,
+// because changing a word of it moves every Go verdict the tool has ever
+// produced. New ecosystems therefore got new prompts rather than a shared one
+// generalized into vagueness.
+//
+// The evidence paragraph below is the one deliberate exception. It went in
+// with Request.Summary/Details, and the two are a single change: the user
+// message had never carried the advisory text, so the model was being asked to
+// rate an identifier it had often never seen. That moves Go verdicts by
+// construction -- it is the point -- and the instruction is what stops the
+// added text from being treated as merely more context alongside a
+// half-remembered CVE. The same paragraph is appended, word for word, to all
+// five prompts; an ecosystem where the model is allowed to answer from
+// recollection would be the odd one out.
 const goPrompt = `You are a security analyst assessing Go dependency vulnerabilities (VEX triage).
 You are given a CVE whose vulnerable package has been confirmed to be linked into (and possibly reachable from) a shipped Go binary.
 Judge how plausibly the vulnerability is actually EXPLOITABLE in a typical deployment of this binary.
 Consider: whether the vulnerable functions are likely invoked with attacker-controlled input, network exposure, and typical usage of the package.
+` + evidenceRule + `
 Respond with ONLY a JSON object, no prose, of the form:
 {"exploitable":"likely|unlikely|unknown","confidence":"low|medium|high","rationale":"one or two sentences"}`
+
+// evidenceRule tells the model which part of the message is evidence.
+//
+// Both halves earn their place. The first stops it answering from recollection
+// of the identifier, which for a recent CVE means answering from nothing. The
+// second gives it somewhere to land when the text is absent or says nothing
+// about exploitability: without an explicit out, a model asked to rate a
+// vulnerability it knows nothing about will produce a confident-sounding
+// rationale assembled from what the package is generally used for, which is
+// the failure this is meant to end rather than a milder version of it.
+const evidenceRule = `The advisory text in the message is authoritative. Base your answer on it rather than on any recollection of the identifier, which may name an advisory published after your training data ends and which you cannot look up. If no advisory text is given, or it does not settle the question, answer "unknown" rather than inferring a plausible-sounding answer from the package's usual role.`
 
 // osPrompt asks the same question about an OS package.
 //
@@ -255,6 +297,7 @@ You are given a CVE against an installed OS package (deb, rpm or apk) whose shar
 Judge how plausibly the vulnerability is actually EXPLOITABLE in a typical deployment of this image.
 Consider: whether the vulnerable code path is reachable from the image's own workload rather than only from a command-line tool that happens to be installed, whether the input it parses could be attacker-controlled, and whether exploitation requires local access, a specific configuration, or a non-default feature.
 Note that a library being loaded says nothing about which of its functions are called.
+` + evidenceRule + `
 Respond with ONLY a JSON object, no prose, of the form:
 {"exploitable":"likely|unlikely|unknown","confidence":"low|medium|high","rationale":"one or two sentences"}`
 
@@ -273,6 +316,7 @@ You are given a CVE against an installed Python distribution whose modules the c
 Judge how plausibly the vulnerability is actually EXPLOITABLE in a typical deployment of this image.
 Consider: whether the vulnerable API is likely called with attacker-controlled input rather than only from a command-line tool or a test path, whether an application would use the affected entry point at all (many Python advisories affect one unsafe function that has a safe documented default beside it), and whether exploitation requires a specific configuration or a non-default feature.
 Note that Python removes no dead code, so a distribution being installed and imported says nothing about which of its functions are called.
+` + evidenceRule + `
 Respond with ONLY a JSON object, no prose, of the form:
 {"exploitable":"likely|unlikely|unknown","confidence":"low|medium|high","rationale":"one or two sentences"}`
 
@@ -289,6 +333,7 @@ You are given a CVE against an installed npm package whose modules the code the 
 Judge how plausibly the vulnerability is actually EXPLOITABLE in a typical deployment of this image.
 Consider: whether the vulnerable API is likely called with attacker-controlled input rather than only from a build script, a CLI tool or a test path, whether the package is a deep transitive dependency reached only through one narrow call path, and whether exploitation requires a specific configuration, a non-default option, or a prototype-pollution sink the application does not have.
 Note that npm removes no dead code, so a package being installed and required says nothing about which of its functions are called.
+` + evidenceRule + `
 Respond with ONLY a JSON object, no prose, of the form:
 {"exploitable":"likely|unlikely|unknown","confidence":"low|medium|high","rationale":"one or two sentences"}`
 
@@ -313,6 +358,7 @@ You are given a CVE against a Maven artifact (a jar, war or ear) that is present
 Judge how plausibly the vulnerability is actually EXPLOITABLE in a typical deployment of this image.
 Consider: whether the vulnerable class is likely instantiated or invoked with attacker-controlled input rather than only from a build tool, an optional integration or a test path; whether exploitation requires a non-default configuration, a specific feature to be enabled, or the application to deserialize untrusted data; and whether the artifact is a deep transitive dependency of a framework rather than something the application uses directly.
 Note that this scan has established only that the artifact is present. Java loads classes lazily and this scan has no call graph, so nothing here says any of its code runs.
+` + evidenceRule + `
 Respond with ONLY a JSON object, no prose, of the form:
 {"exploitable":"likely|unlikely|unknown","confidence":"low|medium|high","rationale":"one or two sentences"}`
 
@@ -336,25 +382,58 @@ func promptFor(ecosystem string) string {
 	}
 }
 
+// maxAdvisoryText bounds how much advisory prose is sent.
+//
+// This is one call per affected finding, and OSV details run to several KB on
+// the records that embed a full writeup. The cap is generous enough that a
+// normal advisory arrives whole -- the great majority are a few hundred bytes
+// -- and exists for the outliers. Truncation is marked rather than silent, so
+// a model that finds the text cut off mid-sentence can see that is what
+// happened and answer "unknown" rather than reading the fragment as the whole
+// story.
+const maxAdvisoryText = 4000
+
+// advisoryBlock renders the advisory prose for the user message.
+//
+// The empty case is stated rather than omitted. A missing block would leave
+// the model to guess whether it was given everything, which is the situation
+// this whole field exists to end; saying the text is unavailable lets the
+// prompt's instruction to answer "unknown" actually bind.
+func advisoryBlock(summary, details string) string {
+	text := strings.TrimSpace(strings.TrimSpace(summary) + "\n\n" + strings.TrimSpace(details))
+	if text == "" {
+		return "No advisory text is available for this identifier."
+	}
+	if len(text) > maxAdvisoryText {
+		text = text[:maxAdvisoryText] + "\n[advisory text truncated]"
+	}
+	return "Advisory text:\n" + text
+}
+
 // userMessage states the facts for one assessment.
 //
 // The Go wording is preserved exactly, for the same reason as the prompt. The
 // OS wording differs only in its labels: "Module" and "Binary" are the wrong
 // nouns for a package installed into an image, and a prompt that uses the
 // wrong noun invites the model to answer about the wrong thing.
+//
+// The advisory block goes last, immediately before the instruction, because it
+// is the only part that is evidence rather than a label: everything above it
+// says where the finding is, and it says what the finding is.
 func userMessage(r Request) string {
 	reach := r.Reachable
 	if reach == "" {
 		reach = "unknown"
 	}
+	adv := advisoryBlock(r.Summary, r.Details)
 	if strings.EqualFold(r.Ecosystem, "os") {
 		where := r.Binary
 		if where == "" {
 			where = "the image"
 		}
 		return fmt.Sprintf(
-			"CVE: %s\nPackage: %s %s\nImage: %s\nStatic analysis says the vulnerable code is: %s\nAssess exploitability.",
-			r.CVE, r.Module, r.Version, where, reach,
+			"CVE: %s\nPackage: %s %s\nImage: %s\nStatic analysis says the vulnerable code is: %s\n%s\nAssess exploitability.",
+			r.CVE, r.Module, r.Version, where, reach, adv,
 		)
 	}
 	if strings.EqualFold(r.Ecosystem, "pypi") {
@@ -363,8 +442,8 @@ func userMessage(r Request) string {
 			where = "the image"
 		}
 		return fmt.Sprintf(
-			"CVE: %s\nDistribution: %s %s\nImage: %s\nStatic analysis says the vulnerable code is: %s\nAssess exploitability.",
-			r.CVE, r.Module, r.Version, where, reach,
+			"CVE: %s\nDistribution: %s %s\nImage: %s\nStatic analysis says the vulnerable code is: %s\n%s\nAssess exploitability.",
+			r.CVE, r.Module, r.Version, where, reach, adv,
 		)
 	}
 	if strings.EqualFold(r.Ecosystem, "npm") {
@@ -373,13 +452,13 @@ func userMessage(r Request) string {
 			where = "the image"
 		}
 		return fmt.Sprintf(
-			"CVE: %s\nPackage: %s %s\nImage: %s\nStatic analysis says the vulnerable code is: %s\nAssess exploitability.",
-			r.CVE, r.Module, r.Version, where, reach,
+			"CVE: %s\nPackage: %s %s\nImage: %s\nStatic analysis says the vulnerable code is: %s\n%s\nAssess exploitability.",
+			r.CVE, r.Module, r.Version, where, reach, adv,
 		)
 	}
 	return fmt.Sprintf(
-		"CVE: %s\nModule: %s@%s\nVulnerable packages: %s\nBinary: %s\nStatic analysis says the vulnerable code is: %s\nAssess exploitability.",
-		r.CVE, r.Module, r.Version, strings.Join(r.Packages, ", "), r.Binary, reach,
+		"CVE: %s\nModule: %s@%s\nVulnerable packages: %s\nBinary: %s\nStatic analysis says the vulnerable code is: %s\n%s\nAssess exploitability.",
+		r.CVE, r.Module, r.Version, strings.Join(r.Packages, ", "), r.Binary, reach, adv,
 	)
 }
 
