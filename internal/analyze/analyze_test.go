@@ -85,7 +85,7 @@ func TestLLMOverlayOnlyAsksAboutAffectedFindings(t *testing.T) {
 		{CVE: "CVE-4", Module: "m", Binary: "/a", Status: StatusLinked, Reachability: "linked"},
 		{CVE: "CVE-5", Module: "m", Status: StatusReachable, Reachability: "reachable"},
 	}
-	llmOverlay(context.Background(), client, findings, "source tree", func(string, ...any) {})
+	llmOverlay(context.Background(), client, findings, "source tree", nil, func(string, ...any) {})
 
 	for i, f := range findings {
 		wantVerdict := f.Affected()
@@ -105,7 +105,7 @@ func TestLLMOverlayNamesTheSourceTreeWhenThereIsNoBinary(t *testing.T) {
 		{CVE: "CVE-1", Module: "m", Version: "v1", Binary: "/usr/bin/app", Status: StatusLinked, Reachability: "linked"},
 		{CVE: "CVE-2", Module: "m", Version: "v1", Status: StatusReachable, Reachability: "reachable"},
 	}
-	llmOverlay(context.Background(), client, findings, "source tree", func(string, ...any) {})
+	llmOverlay(context.Background(), client, findings, "source tree", nil, func(string, ...any) {})
 
 	asked := rec.questions()
 	if len(asked) != 2 {
@@ -128,7 +128,7 @@ func TestLLMOverlayKeepsFindingsWhenTheModelFails(t *testing.T) {
 
 	var logged int
 	findings := []Finding{{CVE: "CVE-1", Module: "m", Status: StatusLinked, Reachability: "linked"}}
-	llmOverlay(context.Background(), client, findings, "", func(string, ...any) { logged++ })
+	llmOverlay(context.Background(), client, findings, "", nil, func(string, ...any) { logged++ })
 
 	if findings[0].Status != StatusLinked {
 		t.Errorf("status changed to %s", findings[0].Status)
@@ -143,9 +143,83 @@ func TestLLMOverlayKeepsFindingsWhenTheModelFails(t *testing.T) {
 
 func TestLLMOverlayWithoutAClientIsANoop(t *testing.T) {
 	findings := []Finding{{CVE: "CVE-1", Status: StatusLinked}}
-	llmOverlay(context.Background(), nil, findings, "", func(string, ...any) {})
+	llmOverlay(context.Background(), nil, findings, "", nil, func(string, ...any) {})
 	if findings[0].LLM != nil {
 		t.Error("no client means no verdict")
+	}
+}
+
+// The bug this overlay's prose argument exists for. The model was sent a bare
+// identifier and nothing describing it, so for any advisory published after
+// its training data it could only hedge -- "I can't verify the details of
+// CVE-2026-78661, so confidence is low" -- while vexscan held the advisory
+// text the whole time.
+func TestLLMOverlaySendsTheAdvisoryText(t *testing.T) {
+	client, rec := newLLMServer(t, http.StatusOK, okVerdict)
+
+	findings := []Finding{{
+		CVE: "CVE-2026-78661", GoID: "GO-2026-6860",
+		Module: "golang.org/x/net", Version: "v0.60.0",
+		Packages: []string{"golang.org/x/net/html"},
+		Binary:   "/usr/local/bin/kube-controller-manager",
+		Status:   StatusLinked, Reachability: "linked",
+	}}
+	prose := map[string]advisoryProse{
+		"CVE-2026-78661": {
+			summary: "Unbounded recursion in html.Parse",
+			details: "A deeply nested document causes stack exhaustion.",
+		},
+	}
+	llmOverlay(context.Background(), client, findings, "", prose, func(string, ...any) {})
+
+	asked := rec.questions()
+	if len(asked) != 1 {
+		t.Fatalf("asked %d questions, want 1", len(asked))
+	}
+	for _, want := range []string{
+		"Advisory text:",
+		"Unbounded recursion in html.Parse",
+		"A deeply nested document causes stack exhaustion.",
+	} {
+		if !strings.Contains(asked[0], want) {
+			t.Errorf("prompt is missing %q, got:\n%s", want, asked[0])
+		}
+	}
+}
+
+// A finding named by its GO id rather than its CVE must still find its text:
+// the overlay joins on whichever name the advisory supplied, as severityOverlay
+// does.
+func TestLLMOverlayFindsAdvisoryTextByGoID(t *testing.T) {
+	client, rec := newLLMServer(t, http.StatusOK, okVerdict)
+
+	findings := []Finding{{
+		CVE: "CVE-2026-78661", GoID: "GO-2026-6860",
+		Module: "golang.org/x/net", Status: StatusLinked, Reachability: "linked",
+	}}
+	prose := map[string]advisoryProse{"GO-2026-6860": {summary: "keyed by the Go id"}}
+	llmOverlay(context.Background(), client, findings, "", prose, func(string, ...any) {})
+
+	if asked := rec.questions(); len(asked) != 1 || !strings.Contains(asked[0], "keyed by the Go id") {
+		t.Errorf("prompt did not pick up the text keyed by GoID, got:\n%v", asked)
+	}
+}
+
+// Some records publish no prose at all. The absence has to be stated, not left
+// as a gap: a model given no evidence and no acknowledgement of that produces a
+// confident-sounding rationale from the package's reputation instead.
+func TestLLMOverlaySaysWhenThereIsNoAdvisoryText(t *testing.T) {
+	client, rec := newLLMServer(t, http.StatusOK, okVerdict)
+
+	findings := []Finding{{CVE: "CVE-1", Module: "m", Status: StatusLinked, Reachability: "linked"}}
+	llmOverlay(context.Background(), client, findings, "", nil, func(string, ...any) {})
+
+	asked := rec.questions()
+	if len(asked) != 1 {
+		t.Fatalf("asked %d questions, want 1", len(asked))
+	}
+	if !strings.Contains(asked[0], "No advisory text is available") {
+		t.Errorf("prompt should say the text is missing, got:\n%s", asked[0])
 	}
 }
 
