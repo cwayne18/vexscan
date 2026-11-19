@@ -207,6 +207,7 @@ type prepared struct {
 	release   string // narrows a bare-family ecosystem; see osv.Release.ProductRelease
 	distro    string // os-release ID, for the purl namespace
 	dbs       []pkgdb.Result
+	native    []pkgdb.Package
 
 	// metadataOnly means the inventory was handed in rather than read out of a
 	// tree, so there is no filesystem to test presence against. Every verdict
@@ -360,6 +361,16 @@ func (p *Plugin) prepare(img *target.Image) (*prepared, error) {
 		return nil, err
 	}
 	pr.dbs = dbs
+	var installed []pkgdb.Package
+	for _, db := range dbs {
+		installed = append(installed, db.Packages...)
+	}
+	var format pkgdb.Format
+	if len(dbs) > 0 {
+		format = dbs[0].Format
+	}
+	pr.native = discoverNginxVersion(img.FS, format)
+	pr.native = filterUninstalledNginx(pr.native, installed)
 
 	p.prep = pr
 	return pr, nil
@@ -393,6 +404,14 @@ func (p *Plugin) InventoryImage(_ context.Context, img *target.Image, subjects [
 			out = append(out, pr.component(pkg))
 		}
 	}
+	for _, pkg := range pr.native {
+		s, ok := selects(subjects, pkg)
+		if !ok {
+			continue
+		}
+		matched[s] = true
+		out = append(out, pr.component(pkg))
+	}
 
 	// A package the user named that no database lists is a finding, not a
 	// silence -- but only when the subject was aimed at this plugin. A bare
@@ -420,6 +439,15 @@ func (p *Plugin) InventoryImage(_ context.Context, img *target.Image, subjects [
 
 	p.Logf("Found %d OS packages to check (%s).", len(out), pr.ecosystem)
 	return out, nil
+}
+
+func filterUninstalledNginx(native, installed []pkgdb.Package) []pkgdb.Package {
+	for _, pkg := range installed {
+		if pkg.Name == "nginx" {
+			return nil
+		}
+	}
+	return native
 }
 
 // component builds the OSV coordinates for one installed package.
