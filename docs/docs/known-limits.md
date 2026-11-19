@@ -32,6 +32,13 @@ known entrypoint. Concretely:
   images.
 - `glibc` is reachable from everything and always will be. Do not expect the
   closure to rule out a libc CVE.
+- **Source-built nginx is inventoried from its executable.** Images such as
+  ingress-nginx compile nginx into `/usr/local/nginx` instead of installing an
+  `nginx` package, so the apk database alone cannot identify its version. The
+  OS plugin recognizes an ELF named `nginx`, reads its embedded
+  `MAJOR.MINOR.PATCH` version, and uses the executable as the package evidence.
+  Conflicting nginx binaries are ignored rather than assigned an arbitrary
+  version.
 - **`--rootfs` has no entrypoint to start from**, so it begins where a base
   image ends up: everything is a root. `--roots` is the way out, and naming the
   wrong thing does not help. See
