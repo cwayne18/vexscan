@@ -473,4 +473,3 @@ func claimStatement(c Claim) Statement {
 		Timestamp:       c.Timestamp,
 	}
 }
-

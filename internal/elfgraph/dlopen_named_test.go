@@ -24,14 +24,14 @@ func dlopenTree(t *testing.T) (target.RootFS, fakeELF) {
 	two.Dlopen = true
 	two.Soname = "libtwo.so.2"
 	return tree(t, map[string]string{
-			"/usr/bin/app":         "",
-			"/usr/lib/libone.so.1": "",
-			"/usr/lib/libtwo.so.2": "",
-		}), fakeELF{
-			"/usr/bin/app":         exe("libone.so.1", "libtwo.so.2"),
-			"/usr/lib/libone.so.1": one,
-			"/usr/lib/libtwo.so.2": two,
-		}
+		"/usr/bin/app":         "",
+		"/usr/lib/libone.so.1": "",
+		"/usr/lib/libtwo.so.2": "",
+	}), fakeELF{
+		"/usr/bin/app":         exe("libone.so.1", "libtwo.so.2"),
+		"/usr/lib/libone.so.1": one,
+		"/usr/lib/libtwo.so.2": two,
+	}
 }
 
 func dlopenTaints(g *Graph) map[string]Taint {

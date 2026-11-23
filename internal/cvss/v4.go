@@ -304,11 +304,11 @@ var v4Lookup = map[string]float64{
 // treats them as one class: EQ6 (the environmental requirements) only matters
 // relative to which impact metrics EQ3 already set to High.
 var v4MaxComposed = struct {
-	eq1     map[string][]string
-	eq2     map[string][]string
-	eq3eq6  map[string]map[string][]string
-	eq4     map[string][]string
-	eq5     map[string][]string
+	eq1    map[string][]string
+	eq2    map[string][]string
+	eq3eq6 map[string]map[string][]string
+	eq4    map[string][]string
+	eq5    map[string][]string
 }{
 	eq1: map[string][]string{
 		"0": {"AV:N/PR:N/UI:N/"},
