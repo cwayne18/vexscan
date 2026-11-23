@@ -14,18 +14,18 @@ import (
 func overrideTree(t *testing.T) (target.RootFS, fakeELF) {
 	t.Helper()
 	return tree(t, map[string]string{
-			"/bin/bash":               "",
-			"/usr/bin/tini":           "",
-			"/usr/bin/server":         "",
-			"/usr/lib/libshell.so.1":  "",
-			"/usr/lib/libserver.so.1": "",
-		}), fakeELF{
-			"/bin/bash":               exe("libshell.so.1"),
-			"/usr/bin/tini":           exe(),
-			"/usr/bin/server":         exe("libserver.so.1"),
-			"/usr/lib/libshell.so.1":  lib(),
-			"/usr/lib/libserver.so.1": lib(),
-		}
+		"/bin/bash":               "",
+		"/usr/bin/tini":           "",
+		"/usr/bin/server":         "",
+		"/usr/lib/libshell.so.1":  "",
+		"/usr/lib/libserver.so.1": "",
+	}), fakeELF{
+		"/bin/bash":               exe("libshell.so.1"),
+		"/usr/bin/tini":           exe(),
+		"/usr/bin/server":         exe("libserver.so.1"),
+		"/usr/lib/libshell.so.1":  lib(),
+		"/usr/lib/libserver.so.1": lib(),
+	}
 }
 
 // bashConfig is the image as built: bash is the entrypoint, and /usr/bin/server
