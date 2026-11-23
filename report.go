@@ -260,6 +260,7 @@ func writeCaveats(dst *strings.Builder, res *analyze.Result, pal palette) {
 	writeMetadataCaveat(b, res)
 	writeGovulncheckCaveat(b, res)
 	writeUncomparableCaveat(b, res)
+	writeSourceBuiltCaveat(b, res)
 	writeTriageCaveats(b, res)
 }
 
@@ -368,6 +369,56 @@ func writeUncomparableCaveat(b *strings.Builder, res *analyze.Result) {
 	fmt.Fprintf(b, "      Affected module(s): %s\n", strings.Join(modules, ", "))
 	b.WriteString("      These are neither confirmed nor cleared. To decide them, check the\n")
 	b.WriteString("      module's real version in the source the image was built from.\n")
+}
+
+// writeSourceBuiltCaveat explains the rows that are undetermined because the
+// package was compiled into the image rather than installed into it.
+//
+// Separate from writeUncomparableCaveat, and not folded into it, because the
+// two say different things to a reader who wants to act. There the version was
+// unreadable; here it is perfectly readable and belongs to a different project
+// from the advisory. Someone told "uncomparable" would go looking for a
+// malformed version in a build that stamped a clean one.
+//
+// It has to be said out loud for the reason that one does: the demotion is
+// otherwise invisible, and a reader who sees nginx drop out of AFFECTED
+// without explanation cannot tell whether the tool got careful or got worse.
+// Naming the package and the path is what makes it checkable -- the binary is
+// right there in the image to look at.
+func writeSourceBuiltCaveat(b *strings.Builder, res *analyze.Result) {
+	n := 0
+	seen := map[string]bool{}
+	var pkgs []string
+	for _, f := range res.Findings {
+		if f.Reason != ecosystem.ReasonSourceBuiltPackage {
+			continue
+		}
+		n++
+		name := f.Package
+		if name == "" {
+			name = f.Module
+		}
+		if name != "" && !seen[name] {
+			seen[name] = true
+			pkgs = append(pkgs, name)
+		}
+	}
+	if n == 0 {
+		return
+	}
+	fmt.Fprintf(b, "NOTE: %d finding(s) are undetermined because the package was built from source\n", n)
+	b.WriteString("      into this image rather than installed by its package manager, so the\n")
+	b.WriteString("      distribution's advisories are not statements about it: an upstream version\n")
+	b.WriteString("      cannot be ordered against a distribution package revision, and a vendor\n")
+	b.WriteString("      that backported the fix without changing the version reads the same as one\n")
+	b.WriteString("      that shipped no fix at all.\n")
+	const maxPkgs = 8
+	if len(pkgs) > maxPkgs {
+		pkgs = append(pkgs[:maxPkgs:maxPkgs], fmt.Sprintf("(+%d more)", len(pkgs)-maxPkgs))
+	}
+	fmt.Fprintf(b, "      Affected package(s): %s\n", strings.Join(pkgs, ", "))
+	b.WriteString("      These are neither confirmed nor cleared. A VEX statement from whoever\n")
+	b.WriteString("      built the binary is what can decide them; see --vexhub.\n")
 }
 
 // writeRuntimeAssertion names what the user told this scan about how the target

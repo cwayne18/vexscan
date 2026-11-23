@@ -7,8 +7,18 @@ import (
 	"path"
 	"regexp"
 
+	"github.com/cwayne18/vexscan/internal/ecosystem"
 	"github.com/cwayne18/vexscan/internal/pkgdb"
 	"github.com/cwayne18/vexscan/internal/target"
+)
+
+// OriginSourceBuiltPackage and ReasonSourceBuiltPackage mark a finding
+// demoted because the package was read out of an executable rather than
+// installed, so the distribution's advisories are not about it. They alias the
+// canonical constants in the ecosystem package, where the report reads them.
+const (
+	OriginSourceBuiltPackage = ecosystem.OriginSourceBuiltPackage
+	ReasonSourceBuiltPackage = ecosystem.ReasonSourceBuiltPackage
 )
 
 var nginxVersionRE = regexp.MustCompile(`nginx/([0-9]+\.[0-9]+\.[0-9]+)`)

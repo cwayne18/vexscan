@@ -196,6 +196,25 @@ type state struct {
 	// filed against the name -- which is what makes "you asked about openssl and
 	// this image has none" a statement about specific CVEs rather than silence.
 	absent bool
+
+	// sourceBuilt marks a component discovered by reading an executable rather
+	// than a package database -- today, only nginx. See discoverNginx.
+	//
+	// The version is real, and the presence tests are as good as any other
+	// package's, so the component is worth having. What it must not do is
+	// inherit the distribution's advisory stream, and by default it does:
+	// the component is built with the image's own ecosystem and format, so an
+	// nginx that Rancher compiled into /usr/local gets range-matched against
+	// SUSE-SU advisories about SUSE's nginx rpm. That comparison is wrong twice
+	// over. The versions live in different spaces -- upstream "1.27.1" against
+	// an rpm EVR "1.27.2-160000.7.1", which means "upstream 1.27.2 plus SUSE's
+	// patches" -- and the advisory is a statement about a package this image
+	// does not install, whose patch history says nothing about a binary built
+	// from upstream source somewhere else.
+	//
+	// So an affected verdict against one of these is demoted. See
+	// sourceBuiltVerdict for what survives and why.
+	sourceBuilt bool
 }
 
 // prepared is the per-image work done once and shared by every component: the
@@ -410,7 +429,7 @@ func (p *Plugin) InventoryImage(_ context.Context, img *target.Image, subjects [
 			continue
 		}
 		matched[s] = true
-		out = append(out, pr.component(pkg))
+		out = append(out, pr.nativeComponent(pkg))
 	}
 
 	// A package the user named that no database lists is a finding, not a
@@ -464,6 +483,20 @@ func (pr *prepared) component(pkg pkgdb.Package) ecosystem.Component {
 		Locations: []string{pkg.DB},
 		Extra:     &state{pkg: pkg, meta: pr.meta[metaKey(pkg)]},
 	}
+}
+
+// nativeComponent builds a component for a package read out of an executable
+// rather than a package database, marking it so the analysis phase knows the
+// distribution's advisories are not statements about it. See state.sourceBuilt.
+//
+// It shares component's coordinates deliberately. The ecosystem, the purl and
+// the name are still the best guess available at what this thing is, and a
+// reader looking for nginx should find a row for nginx; what changes is only
+// how much weight an advisory match is allowed to carry.
+func (pr *prepared) nativeComponent(pkg pkgdb.Package) ecosystem.Component {
+	c := pr.component(pkg)
+	c.Extra.(*state).sourceBuilt = true
+	return c
 }
 
 // osvVersion is the package version as the ecosystem's OSV records spell it.
@@ -721,11 +754,56 @@ func (p *Plugin) AnalyzeImage(_ context.Context, img *target.Image, items []ecos
 		st := item.Component.Extra.(*state)
 		ev := p.evaluator(pr, g, st)
 		for _, req := range item.Requests() {
-			out = append(out, ev.evaluate(item.Component, req))
+			f := ev.evaluate(item.Component, req)
+			if st.sourceBuilt {
+				f = sourceBuiltVerdict(f, pr.ecosystem, st.pkg)
+			}
+			out = append(out, f)
 		}
 	}
 	p.suggestRoots(g, out)
 	return out, nil
+}
+
+// sourceBuiltVerdict demotes an affected verdict reached by comparing a
+// source-built package's version against the distribution's advisories.
+//
+// Only the affected verdicts move, for the same reason uncomparableVersion
+// leaves the others alone: a not_present finding was decided by reading the
+// filesystem and the ELF closure, which are facts about this image whoever
+// built the binary. Those stay exactly as they were. What cannot stand is
+// "affected", because the only thing establishing it was an ordering between
+// an upstream version and a distro package revision that do not share a
+// numbering system, drawn from an advisory about a package this image does not
+// install.
+//
+// Undetermined rather than not_affected, and the distinction is the whole
+// point. Rancher does backport these fixes -- CVE-2026-42533 is carried as
+// 44_nginx-1.27.1-CVE-2026-42533.patch with the version string untouched --
+// but nothing in the artifact proves the patch is in this build, and a scanner
+// that assumed it would be inventing a clean. The honest answer is that this
+// comparison cannot decide, which is what undetermined says. A vendor VEX
+// statement is the thing that can clear it; see --vexhub.
+func sourceBuiltVerdict(f ecosystem.Finding, eco string, pkg pkgdb.Package) ecosystem.Finding {
+	if !f.Affected() {
+		return f
+	}
+	where := pkg.DB
+	if len(pkg.Files) > 0 {
+		where = pkg.Files[0]
+	}
+	f.Status = ecosystem.StatusUndetermined
+	f.Reason = ReasonSourceBuiltPackage
+	f.Evidence = append(f.Evidence, ecosystem.Evidence{
+		Origin: OriginSourceBuiltPackage,
+		Detail: fmt.Sprintf(
+			"%s %s was read out of %s, not installed by this image's package manager, "+
+				"so it is not the %s package this advisory is about; an upstream version cannot be "+
+				"ordered against a distribution package revision, and a vendor that backported the "+
+				"fix without changing the version would look identical to one that did not",
+			pkg.Name, pkg.Version, where, eco),
+	})
+	return f
 }
 
 // readRelease parses the image's os-release.
