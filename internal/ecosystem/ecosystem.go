@@ -84,6 +84,26 @@ const (
 	// than as it having stopped claiming something it could not support.
 	OriginUncomparableVersion = "uncomparable-version"
 	ReasonUncomparableVersion = "version_not_range_matchable"
+
+	// OriginSourceBuiltPackage marks a finding against a package the os plugin
+	// read out of an executable rather than a package database, and
+	// ReasonSourceBuiltPackage is the reason it was demoted to undetermined.
+	//
+	// Distinct from OriginUncomparableVersion, which it otherwise resembles,
+	// because the two failures are not the same and the fix for them is not
+	// the same. An uncomparable version is one OSV could not order at all;
+	// this one orders perfectly well and the ordering means nothing, because
+	// the two sides came from different projects. ingress-nginx compiles nginx
+	// into /usr/local, so an upstream "1.27.1" gets compared against a
+	// SUSE-SU advisory naming the rpm revision "1.27.2-160000.7.1" -- a real
+	// comparison between numbers that were never on the same scale, about a
+	// package the image does not install. A reader told only "uncomparable"
+	// would go looking for a malformed version and find a well-formed one.
+	//
+	// Here rather than in the os plugin for the reason the others are: the
+	// plugin writes it and the report counts it.
+	OriginSourceBuiltPackage = "source-built-package"
+	ReasonSourceBuiltPackage = "not_the_distribution_package"
 )
 
 // SBOMFinding is the verdict for a component that a bill of materials named.
